@@ -64,11 +64,29 @@ jj-status-daemon query --repo /path/to/repo
 # Start the daemon explicitly
 jj-status-daemon daemon
 
+# Start the daemon with a specific socket path
+jj-status-daemon daemon --socket /tmp/my-custom.sock
+
 # Shut down the daemon
 jj-status-daemon shutdown
 ```
 
 When run outside a jj repository (and no `--repo` flag is passed), the client exits silently with exit code 0, making it safe for unconditional prompt use.
+
+### Socket path
+
+Both client and daemon resolve the Unix socket path using:
+
+1. `JJ_STATUS_DAEMON_SOCKET_PATH` environment variable (if set)
+2. Default: `/tmp/jj-status-daemon-$USER.sock`
+
+The daemon also accepts a `--socket` CLI flag, which takes priority over the environment variable. When the client auto-starts the daemon, it always passes its resolved socket path via `--socket` to ensure both sides agree.
+
+To use a custom socket path, set the environment variable in your shell profile (e.g. `.zshrc` or `.bashrc`):
+
+```sh
+export JJ_STATUS_DAEMON_SOCKET_PATH="/tmp/my-custom-jj.sock"
+```
 
 ## Configuration
 
@@ -86,9 +104,6 @@ bookmark_search_depth = 10
 
 # Enable ANSI color output (default: true)
 color = true
-
-# Custom Unix socket path (default: /tmp/jj-status-daemon-$USER.sock)
-# socket_path = "/tmp/my-custom.sock"
 
 # Status format template (Tera syntax, see below)
 # format = "..."

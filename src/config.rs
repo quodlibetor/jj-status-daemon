@@ -14,7 +14,6 @@ pub struct Config {
     pub bookmark_search_depth: u32,
     #[serde(default = "default_color")]
     pub color: bool,
-    pub socket_path: Option<String>,
 }
 
 fn default_idle_timeout_secs() -> u64 {
@@ -41,19 +40,22 @@ impl Default for Config {
             format: default_format(),
             bookmark_search_depth: default_bookmark_search_depth(),
             color: default_color(),
-            socket_path: None,
         }
     }
 }
 
-impl Config {
-    pub fn socket_path(&self) -> PathBuf {
-        if let Some(ref path) = self.socket_path {
+/// Resolve the daemon socket path.
+///
+/// Checks `JJ_STATUS_DAEMON_SOCKET_PATH` env var first, then falls back
+/// to `/tmp/jj-status-daemon-$USER.sock`.
+pub fn socket_path() -> PathBuf {
+    if let Ok(path) = std::env::var("JJ_STATUS_DAEMON_SOCKET_PATH") {
+        if !path.is_empty() {
             return PathBuf::from(path);
         }
-        let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-        PathBuf::from(format!("/tmp/jj-status-daemon-{user}.sock"))
     }
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    PathBuf::from(format!("/tmp/jj-status-daemon-{user}.sock"))
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -83,24 +85,6 @@ mod tests {
         assert_eq!(config.debounce_ms, 200);
         assert_eq!(config.bookmark_search_depth, 10);
         assert!(config.format.contains("change_id"));
-        assert!(config.socket_path.is_none());
-    }
-
-    #[test]
-    fn test_socket_path_default() {
-        let config = Config::default();
-        let path = config.socket_path();
-        assert!(path.to_string_lossy().contains("jj-status-daemon"));
-        assert!(path.to_string_lossy().ends_with(".sock"));
-    }
-
-    #[test]
-    fn test_socket_path_custom() {
-        let config = Config {
-            socket_path: Some("/custom/path.sock".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(config.socket_path(), PathBuf::from("/custom/path.sock"));
     }
 
     #[test]
@@ -108,19 +92,14 @@ mod tests {
         let toml_str = r#"
 idle_timeout_secs = 7200
 debounce_ms = 500
-format = "{change_id}"
+format = "{{ change_id }}"
 bookmark_search_depth = 5
-socket_path = "/tmp/test.sock"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.idle_timeout_secs, 7200);
         assert_eq!(config.debounce_ms, 500);
-        assert_eq!(config.format, "{change_id}");
+        assert_eq!(config.format, "{{ change_id }}");
         assert_eq!(config.bookmark_search_depth, 5);
-        assert_eq!(
-            config.socket_path,
-            Some("/tmp/test.sock".to_string())
-        );
     }
 
     #[test]

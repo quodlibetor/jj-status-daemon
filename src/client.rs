@@ -4,7 +4,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::{Duration, timeout};
 
-use crate::config::Config;
+use crate::config;
 use crate::protocol::{Request, Response};
 
 async fn send_request(socket_path: &Path, request: &Request) -> Result<Response> {
@@ -25,11 +25,12 @@ async fn send_request(socket_path: &Path, request: &Request) -> Result<Response>
     Ok(response)
 }
 
-fn start_daemon(_config: &Config) -> Result<()> {
+fn start_daemon(socket_path: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("failed to get current exe")?;
 
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("daemon");
+    cmd.args(["daemon", "--socket"]);
+    cmd.arg(socket_path);
 
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -39,8 +40,8 @@ fn start_daemon(_config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub async fn query(repo_path: &Path, config: &Config) -> Result<String> {
-    let socket_path = config.socket_path();
+pub async fn query(repo_path: &Path) -> Result<String> {
+    let socket_path = config::socket_path();
     let request = Request::Query {
         repo_path: repo_path.to_string_lossy().to_string(),
     };
@@ -55,7 +56,7 @@ pub async fn query(repo_path: &Path, config: &Config) -> Result<String> {
     }
 
     // Daemon not running, start it
-    start_daemon(config)?;
+    start_daemon(&socket_path)?;
 
     // Retry with backoff
     for i in 0..10 {
@@ -72,8 +73,8 @@ pub async fn query(repo_path: &Path, config: &Config) -> Result<String> {
     anyhow::bail!("failed to connect to daemon after starting it")
 }
 
-pub async fn shutdown(config: &Config) -> Result<()> {
-    let socket_path = config.socket_path();
+pub async fn shutdown() -> Result<()> {
+    let socket_path = config::socket_path();
     let response = timeout(
         Duration::from_secs(5),
         send_request(&socket_path, &Request::Shutdown),
@@ -92,6 +93,7 @@ pub async fn shutdown(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::daemon::run_daemon;
     use tempfile::TempDir;
     use tokio::process::Command;
@@ -111,24 +113,27 @@ mod tests {
     #[tokio::test]
     async fn test_client_connects_to_running_daemon() {
         let dir = create_jj_repo().await;
-        let socket_path = std::env::temp_dir().join(format!(
+        let sock = std::env::temp_dir().join(format!(
             "jj-client-test-{}.sock",
             std::process::id()
         ));
-        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&sock);
+
+        // Point both daemon and client at the same test socket
+        unsafe { std::env::set_var("JJ_STATUS_DAEMON_SOCKET_PATH", &sock) };
 
         let config = Config {
-            socket_path: Some(socket_path.to_string_lossy().to_string()),
             color: false,
             ..Default::default()
         };
 
-        let _daemon = tokio::spawn(run_daemon(config.clone()));
+        let _daemon = tokio::spawn(run_daemon(config, sock.clone()));
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let result = query(dir.path(), &config).await.unwrap();
+        let result = query(dir.path()).await.unwrap();
         assert!(!result.is_empty());
 
-        shutdown(&config).await.ok();
+        shutdown().await.ok();
+        unsafe { std::env::remove_var("JJ_STATUS_DAEMON_SOCKET_PATH") };
     }
 }

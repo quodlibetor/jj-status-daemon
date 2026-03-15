@@ -19,8 +19,7 @@ struct DaemonState {
     config: Config,
 }
 
-pub async fn run_daemon(config: Config) -> Result<()> {
-    let socket_path = config.socket_path();
+pub async fn run_daemon(config: Config, socket_path: PathBuf) -> Result<()> {
 
     // Clean up stale socket
     if socket_path.exists() {
@@ -257,12 +256,11 @@ mod tests {
         let socket_path = temp_socket_path("serves");
         let _ = std::fs::remove_file(&socket_path);
         let config = Config {
-            socket_path: Some(socket_path.to_string_lossy().to_string()),
             color: false,
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config));
+        let daemon = tokio::spawn(run_daemon(config, socket_path.clone()));
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let resp = send_request(
@@ -291,12 +289,11 @@ mod tests {
         let socket_path = temp_socket_path("shutdown");
         let _ = std::fs::remove_file(&socket_path);
         let config = Config {
-            socket_path: Some(socket_path.to_string_lossy().to_string()),
             color: false,
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config));
+        let daemon = tokio::spawn(run_daemon(config, socket_path.clone()));
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let resp = send_request(&socket_path, &Request::Shutdown).await;
@@ -314,12 +311,11 @@ mod tests {
         std::fs::write(&socket_path, "").unwrap();
 
         let config = Config {
-            socket_path: Some(socket_path.to_string_lossy().to_string()),
             color: false,
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config));
+        let daemon = tokio::spawn(run_daemon(config, socket_path.clone()));
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let dir = create_jj_repo().await;
@@ -342,13 +338,13 @@ mod tests {
         let socket_path = temp_socket_path("cache");
         let _ = std::fs::remove_file(&socket_path);
         let config = Config {
-            socket_path: Some(socket_path.to_string_lossy().to_string()),
             debounce_ms: 100,
+            color: false,
             format: "{{ change_id }} {{ description }}{% if empty %} EMPTY{% endif %}".to_string(),
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config));
+        let daemon = tokio::spawn(run_daemon(config, socket_path.clone()));
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // First query
@@ -374,7 +370,7 @@ mod tests {
             .unwrap();
 
         // Wait for debounce + refresh
-        tokio::time::sleep(Duration::from_millis(2000)).await;
+        tokio::time::sleep(Duration::from_millis(5000)).await;
 
         // Second query - should reflect the change
         let resp = send_request(
@@ -391,6 +387,141 @@ mod tests {
 
         assert!(second.contains("changed"),
             "expected cache to update with description, got: {second:?}");
+
+        let _ = send_request(&socket_path, &Request::Shutdown).await;
+        daemon.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_daemon_multi_repo_concurrent() {
+        // Create two repos with different bookmarks
+        let dir_a = create_jj_repo().await;
+        let dir_b = create_jj_repo().await;
+
+        Command::new("jj")
+            .args(["bookmark", "create", "main", "-r", "@"])
+            .current_dir(dir_a.path())
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("jj")
+            .args(["bookmark", "create", "develop", "-r", "@"])
+            .current_dir(dir_b.path())
+            .output()
+            .await
+            .unwrap();
+
+        let socket_path = temp_socket_path("multi");
+        let _ = std::fs::remove_file(&socket_path);
+        let config = Config {
+            color: false,
+            debounce_ms: 100,
+            format: "{{ change_id }} {{ description }}{% for b in bookmarks %} {{ b.name }}{% endfor %}{% if empty %} EMPTY{% endif %}".to_string(),
+            ..Default::default()
+        };
+
+        let daemon = tokio::spawn(run_daemon(config, socket_path.clone()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let req_a = Request::Query {
+            repo_path: dir_a.path().to_string_lossy().to_string(),
+        };
+        let req_b = Request::Query {
+            repo_path: dir_b.path().to_string_lossy().to_string(),
+        };
+
+        // Round 1: initial concurrent queries
+        let (resp_a, resp_b) = tokio::join!(
+            send_request(&socket_path, &req_a),
+            send_request(&socket_path, &req_b),
+        );
+        let status_a = match resp_a {
+            Response::Status { formatted } => formatted,
+            other => panic!("expected Status for repo A, got {other:?}"),
+        };
+        let status_b = match resp_b {
+            Response::Status { formatted } => formatted,
+            other => panic!("expected Status for repo B, got {other:?}"),
+        };
+        assert!(status_a.contains("main"), "repo A round 1: expected 'main', got: {status_a:?}");
+        assert!(!status_a.contains("develop"), "repo A round 1: should not have 'develop', got: {status_a:?}");
+        assert!(status_b.contains("develop"), "repo B round 1: expected 'develop', got: {status_b:?}");
+        assert!(!status_b.contains("main"), "repo B round 1: should not have 'main', got: {status_b:?}");
+        assert!(status_a.contains("EMPTY"), "repo A round 1: expected EMPTY, got: {status_a:?}");
+        assert!(status_b.contains("EMPTY"), "repo B round 1: expected EMPTY, got: {status_b:?}");
+
+        // Mutate both repos: describe repo A, write a file in repo B
+        Command::new("jj")
+            .args(["describe", "-m", "alpha-change"])
+            .current_dir(dir_a.path())
+            .output()
+            .await
+            .unwrap();
+
+        tokio::fs::write(dir_b.path().join("hello.txt"), "world\n").await.unwrap();
+
+        // Wait for watchers + debounce + refresh (two repos refresh sequentially)
+        tokio::time::sleep(Duration::from_millis(5000)).await;
+
+        // Round 2: concurrent queries after mutations
+        let (resp_a, resp_b) = tokio::join!(
+            send_request(&socket_path, &req_a),
+            send_request(&socket_path, &req_b),
+        );
+        let status_a = match resp_a {
+            Response::Status { formatted } => formatted,
+            other => panic!("expected Status for repo A round 2, got {other:?}"),
+        };
+        let status_b = match resp_b {
+            Response::Status { formatted } => formatted,
+            other => panic!("expected Status for repo B round 2, got {other:?}"),
+        };
+        assert!(status_a.contains("alpha-change"), "repo A round 2: expected 'alpha-change', got: {status_a:?}");
+        assert!(status_a.contains("main"), "repo A round 2: expected 'main', got: {status_a:?}");
+        assert!(!status_a.contains("develop"), "repo A round 2: should not have 'develop', got: {status_a:?}");
+        assert!(status_b.contains("develop"), "repo B round 2: expected 'develop', got: {status_b:?}");
+        assert!(!status_b.contains("main"), "repo B round 2: should not have 'main', got: {status_b:?}");
+        assert!(!status_b.contains("EMPTY"), "repo B round 2: should not be EMPTY after file write, got: {status_b:?}");
+
+        // Mutate again: describe repo B, add a bookmark to repo A
+        Command::new("jj")
+            .args(["describe", "-m", "beta-change"])
+            .current_dir(dir_b.path())
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("jj")
+            .args(["bookmark", "create", "feature", "-r", "@"])
+            .current_dir(dir_a.path())
+            .output()
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(5000)).await;
+
+        // Round 3: verify both caches updated independently
+        let (resp_a, resp_b) = tokio::join!(
+            send_request(&socket_path, &req_a),
+            send_request(&socket_path, &req_b),
+        );
+        let status_a = match resp_a {
+            Response::Status { formatted } => formatted,
+            other => panic!("expected Status for repo A round 3, got {other:?}"),
+        };
+        let status_b = match resp_b {
+            Response::Status { formatted } => formatted,
+            other => panic!("expected Status for repo B round 3, got {other:?}"),
+        };
+        assert!(status_a.contains("main"), "repo A round 3: expected 'main', got: {status_a:?}");
+        assert!(status_a.contains("feature"), "repo A round 3: expected 'feature', got: {status_a:?}");
+        assert!(status_a.contains("alpha-change"), "repo A round 3: expected 'alpha-change', got: {status_a:?}");
+        assert!(!status_a.contains("develop"), "repo A round 3: should not have 'develop', got: {status_a:?}");
+        assert!(status_b.contains("beta-change"), "repo B round 3: expected 'beta-change', got: {status_b:?}");
+        assert!(status_b.contains("develop"), "repo B round 3: expected 'develop', got: {status_b:?}");
+        assert!(!status_b.contains("main"), "repo B round 3: should not have 'main', got: {status_b:?}");
+        assert!(!status_b.contains("feature"), "repo B round 3: should not have 'feature', got: {status_b:?}");
 
         let _ = send_request(&socket_path, &Request::Shutdown).await;
         daemon.await.unwrap().unwrap();
