@@ -136,7 +136,7 @@ async fn handle_connection(
             } else {
                 match query_jj_status(&repo_path, &config, false).await {
                     Ok(status) => {
-                        let formatted = format_status(&status, &config.format);
+                        let formatted = format_status(&status, &config.format, config.color);
                         state.lock().await.cache.insert(repo_path, formatted.clone());
                         formatted
                     }
@@ -200,7 +200,7 @@ async fn refresh_task(
             let ignore_wc = !needs_snapshot;
             match query_jj_status(&repo_path, &config, ignore_wc).await {
                 Ok(status) => {
-                    let formatted = format_status(&status, &config.format);
+                    let formatted = format_status(&status, &config.format, config.color);
                     state.lock().await.cache.insert(repo_path, formatted);
                 }
                 Err(e) => {
@@ -258,6 +258,7 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
         let config = Config {
             socket_path: Some(socket_path.to_string_lossy().to_string()),
+            color: false,
             ..Default::default()
         };
 
@@ -291,6 +292,7 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
         let config = Config {
             socket_path: Some(socket_path.to_string_lossy().to_string()),
+            color: false,
             ..Default::default()
         };
 
@@ -313,6 +315,7 @@ mod tests {
 
         let config = Config {
             socket_path: Some(socket_path.to_string_lossy().to_string()),
+            color: false,
             ..Default::default()
         };
 
@@ -341,7 +344,7 @@ mod tests {
         let config = Config {
             socket_path: Some(socket_path.to_string_lossy().to_string()),
             debounce_ms: 100,
-            format: "{change_id} {description} {state}".to_string(),
+            format: "{{ change_id }} {{ description }}{% if empty %} EMPTY{% endif %}".to_string(),
             ..Default::default()
         };
 

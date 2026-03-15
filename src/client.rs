@@ -119,6 +119,7 @@ mod tests {
 
         let config = Config {
             socket_path: Some(socket_path.to_string_lossy().to_string()),
+            color: false,
             ..Default::default()
         };
 

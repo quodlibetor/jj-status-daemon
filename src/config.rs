@@ -12,6 +12,8 @@ pub struct Config {
     pub format: String,
     #[serde(default = "default_bookmark_search_depth")]
     pub bookmark_search_depth: u32,
+    #[serde(default = "default_color")]
+    pub color: bool,
     pub socket_path: Option<String>,
 }
 
@@ -22,10 +24,13 @@ fn default_debounce_ms() -> u64 {
     200
 }
 fn default_format() -> String {
-    "{change_id} {bookmarks}{metrics} {state}".to_string()
+    crate::jj::DEFAULT_FORMAT.to_string()
 }
 fn default_bookmark_search_depth() -> u32 {
     10
+}
+fn default_color() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -35,6 +40,7 @@ impl Default for Config {
             debounce_ms: default_debounce_ms(),
             format: default_format(),
             bookmark_search_depth: default_bookmark_search_depth(),
+            color: default_color(),
             socket_path: None,
         }
     }
@@ -76,7 +82,7 @@ mod tests {
         assert_eq!(config.idle_timeout_secs, 3600);
         assert_eq!(config.debounce_ms, 200);
         assert_eq!(config.bookmark_search_depth, 10);
-        assert!(config.format.contains("{change_id}"));
+        assert!(config.format.contains("change_id"));
         assert!(config.socket_path.is_none());
     }
 
