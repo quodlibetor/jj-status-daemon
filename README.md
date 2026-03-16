@@ -1,4 +1,4 @@
-# jj-status-daemon
+# vcs-status-daemon
 
 A background daemon that pre-caches [Jujutsu](https://github.com/jj-vcs/jj) and Git repository status, so shell prompts can retrieve it in milliseconds instead of waiting for `jj` or `git` to run on every prompt.
 
@@ -6,18 +6,16 @@ A background daemon that pre-caches [Jujutsu](https://github.com/jj-vcs/jj) and 
 
 ## Problem
 
-Jujutsu can be slow in large repositories. Shell prompt integrations (like starship-jj) that call `jj` on every prompt add noticeable latency. This daemon watches for repository changes via filesystem notifications and keeps a formatted status string in memory, ready to serve instantly.
-
-It also supports plain Git repositories, so you can use a single tool for both.
+VCS tools like `jj` and `git` can be slow in large repositories. Shell prompt integrations that call them on every prompt add noticeable latency. This daemon watches for repository changes via filesystem notifications and keeps a formatted status string in memory, ready to serve instantly — giving you a single, fast status tool for both Jujutsu and Git repos.
 
 ## Architecture
 
 ```
-Shell prompt calls:   jj-status-daemon         (client mode, the default)
+Shell prompt calls:   vcs-status-daemon         (client mode, the default)
                           |
                           | connects to Unix domain socket
                           v
-                      jj-status-daemon daemon   (background server)
+                      vcs-status-daemon daemon   (background server)
                           |
                           +-- detects VCS type (jj wins if both .jj/ and .git/ exist)
                           +-- watches repo via filesystem notifications (notify)
@@ -47,7 +45,7 @@ Add to your shell prompt (e.g. in `.zshrc` or `.bashrc`):
 
 ```sh
 # Exits silently with no output when not in a jj/git repo
-export PS1='$(jj-status-daemon) $ '
+export PS1='$(vcs-status-daemon) $ '
 ```
 
 Or with starship, in `starship.toml`:
@@ -65,8 +63,8 @@ disabled = true
 [git_state]
 disabled = true
 
-[custom.jj]
-command = "jj-status-daemon"
+[custom.vcs]
+command = "vcs-status-daemon"
 when = true
 ```
 
@@ -74,19 +72,19 @@ when = true
 
 ```sh
 # Query status for the current directory (default, auto-starts daemon)
-jj-status-daemon
+vcs-status-daemon
 
 # Query a specific path
-jj-status-daemon query --repo /path/to/repo
+vcs-status-daemon query --repo /path/to/repo
 
 # Start the daemon explicitly
-jj-status-daemon daemon
+vcs-status-daemon daemon
 
 # Start the daemon with a specific socket path
-jj-status-daemon daemon --socket /tmp/my-custom.sock
+vcs-status-daemon daemon --socket /tmp/my-custom.sock
 
 # Shut down the daemon
-jj-status-daemon shutdown
+vcs-status-daemon shutdown
 ```
 
 The client sends its current directory to the daemon, which walks up the directory tree to find a repo root (`.jj/` or `.git/`). The mapping from directory to repo root is cached. When run outside a recognized repository, the client exits silently with exit code 0, making it safe for unconditional prompt use.
@@ -95,14 +93,14 @@ The client sends its current directory to the daemon, which walks up the directo
 
 Both client and daemon resolve the Unix socket path using:
 
-1. `JJ_STATUS_DAEMON_SOCKET_PATH` environment variable (if set)
-2. Default: `/tmp/jj-status-daemon-$USER.sock`
+1. `VCS_STATUS_DAEMON_SOCKET_PATH` environment variable (if set)
+2. Default: `/tmp/vcs-status-daemon-$USER.sock`
 
 The daemon also accepts a `--socket` CLI flag, which takes priority over the environment variable. When the client auto-starts the daemon, it always passes its resolved socket path via `--socket` to ensure both sides agree.
 
 ## Configuration
 
-Configuration is loaded from `~/.config/jj-status-daemon/config.toml`. All fields are optional and have sensible defaults.
+Configuration is loaded from `~/.config/vcs-status-daemon/config.toml`. All fields are optional and have sensible defaults.
 
 ```toml
 # How long the daemon stays alive with no queries (seconds, default: 3600)

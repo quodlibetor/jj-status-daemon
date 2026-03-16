@@ -1,10 +1,10 @@
 [package]
-name = "jj-status-daemon"
+name = "vcs-status-daemon"
 version = "0.0.2"
 edition = "2024"
-repository = "https://github.com/quodlibetor/jj-status-daemon"
-homepage = "https://github.com/quodlibetor/jj-status-daemon"
-description = "A tool that caches jj status so your shell prompt can be fast"
+repository = "https://github.com/quodlibetor/vcs-status-daemon"
+homepage = "https://github.com/quodlibetor/vcs-status-daemon"
+description = "A tool that caches VCS (jj/git) status so your shell prompt can be fast"
 
 [dependencies]
 anyhow = "1"

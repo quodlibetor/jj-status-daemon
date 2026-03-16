@@ -117,7 +117,7 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
 
         // Point both daemon and client at the same test socket
-        unsafe { std::env::set_var("JJ_STATUS_DAEMON_SOCKET_PATH", &sock) };
+        unsafe { std::env::set_var("VCS_STATUS_DAEMON_SOCKET_PATH", &sock) };
 
         let config = Config {
             color: false,
@@ -131,6 +131,6 @@ mod tests {
         assert!(!result.is_empty());
 
         shutdown().await.ok();
-        unsafe { std::env::remove_var("JJ_STATUS_DAEMON_SOCKET_PATH") };
+        unsafe { std::env::remove_var("VCS_STATUS_DAEMON_SOCKET_PATH") };
     }
 }

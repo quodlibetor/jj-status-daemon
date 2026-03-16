@@ -76,16 +76,16 @@ impl Default for Config {
 
 /// Resolve the daemon socket path.
 ///
-/// Checks `JJ_STATUS_DAEMON_SOCKET_PATH` env var first, then falls back
-/// to `/tmp/jj-status-daemon-$USER.sock`.
+/// Checks `VCS_STATUS_DAEMON_SOCKET_PATH` env var first, then falls back
+/// to `/tmp/vcs-status-daemon-$USER.sock`.
 pub fn socket_path() -> PathBuf {
-    if let Ok(path) = std::env::var("JJ_STATUS_DAEMON_SOCKET_PATH")
+    if let Ok(path) = std::env::var("VCS_STATUS_DAEMON_SOCKET_PATH")
         && !path.is_empty()
     {
         return PathBuf::from(path);
     }
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-    PathBuf::from(format!("/tmp/jj-status-daemon-{user}.sock"))
+    PathBuf::from(format!("/tmp/vcs-status-daemon-{user}.sock"))
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -94,26 +94,27 @@ pub fn config_path() -> Option<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         let xdg_path = home
             .join(".config")
-            .join("jj-status-daemon")
+            .join("vcs-status-daemon")
             .join("config.toml");
         if xdg_path.exists() {
             return Some(xdg_path);
         }
     }
-    dirs::config_dir().map(|d| d.join("jj-status-daemon").join("config.toml"))
+    dirs::config_dir().map(|d| d.join("vcs-status-daemon").join("config.toml"))
 }
 
 /// The path where `config init` will write. Prefers ~/.config/ on all platforms.
 pub fn config_init_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
     Ok(home
         .join(".config")
-        .join("jj-status-daemon")
+        .join("vcs-status-daemon")
         .join("config.toml"))
 }
 
-pub const DEFAULT_CONFIG_TOML: &str = r##"# jj-status-daemon configuration
-# See https://github.com/quodlibetor/jj-status-daemon for full documentation.
+pub const DEFAULT_CONFIG_TOML: &str = r##"# vcs-status-daemon configuration
+# See https://github.com/quodlibetor/vcs-status-daemon for full documentation.
 
 # How long (in seconds) the daemon stays alive without any queries.
 # idle_timeout_secs = 3600

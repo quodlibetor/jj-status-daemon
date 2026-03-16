@@ -89,17 +89,16 @@ pub async fn query_git_status(repo_path: &Path, _config: &Config) -> Result<Repo
         }
     };
 
-    let (branch, commit, description, unstaged_out, staged_out, total_out, empty, conflict) =
-        tokio::join!(
-            branch_fut,
-            commit_fut,
-            description_fut,
-            unstaged_fut,
-            staged_fut,
-            total_fut,
-            empty_fut,
-            conflict_fut
-        );
+    let (branch, commit, description, unstaged_out, staged_out, total_out, empty, conflict) = tokio::join!(
+        branch_fut,
+        commit_fut,
+        description_fut,
+        unstaged_fut,
+        staged_fut,
+        total_fut,
+        empty_fut,
+        conflict_fut
+    );
 
     status.branch = branch.unwrap_or_default();
     status.commit_id = commit.unwrap_or_default();
@@ -208,7 +207,11 @@ mod tests {
     #[tokio::test]
     async fn test_git_description() {
         let dir = create_git_repo().await;
-        git_cmd(dir.path(), &["commit", "--allow-empty", "-m", "my cool feature"]).await;
+        git_cmd(
+            dir.path(),
+            &["commit", "--allow-empty", "-m", "my cool feature"],
+        )
+        .await;
         let config = Config {
             color: false,
             ..Default::default()

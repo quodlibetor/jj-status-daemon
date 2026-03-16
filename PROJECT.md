@@ -1,4 +1,4 @@
-# jj-status-daemon -- jj status line daemon
+# vcs-status-daemon -- VCS status line daemon
 
 This is to be a tool that makes it possible to get jujutsu status information in milliseconds as part of a shell prompt.
 

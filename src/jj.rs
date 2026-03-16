@@ -701,12 +701,18 @@ format = '''
         };
         let formatted = format_status(&status, NERDFONT_FORMAT, false);
         assert!(formatted.contains("󱗆"), "expected jj icon: {formatted:?}");
-        assert!(formatted.contains("mrtu"), "expected change_id: {formatted:?}");
+        assert!(
+            formatted.contains("mrtu"),
+            "expected change_id: {formatted:?}"
+        );
         assert!(
             formatted.contains(" main"),
             "expected bookmark icon: {formatted:?}"
         );
-        assert!(formatted.contains("+10"), "expected additions: {formatted:?}");
+        assert!(
+            formatted.contains("+10"),
+            "expected additions: {formatted:?}"
+        );
     }
 
     #[test]

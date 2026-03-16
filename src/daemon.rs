@@ -41,10 +41,10 @@ fn find_repo_root(start: &Path) -> Option<(PathBuf, VcsKind)> {
 }
 
 pub fn init_logging() {
-    let file_appender = tracing_appender::rolling::never("/tmp", "jj-status-daemon.log");
+    let file_appender = tracing_appender::rolling::never("/tmp", "vcs-status-daemon.log");
 
-    let filter = EnvFilter::try_from_env("JJ_STATUS_DAEMON_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter =
+        EnvFilter::try_from_env("VCS_STATUS_DAEMON_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -54,7 +54,6 @@ pub fn init_logging() {
 }
 
 pub async fn run_daemon(config: Config, socket_path: PathBuf) -> Result<()> {
-
     tracing::info!(
         template_name = %config.template_name,
         has_format_override = config.format.is_some(),
@@ -205,7 +204,8 @@ async fn handle_connection(
                 };
                 match result {
                     Ok(status) => {
-                        let formatted = format_status(&status, &config.resolved_format(), config.color);
+                        let formatted =
+                            format_status(&status, &config.resolved_format(), config.color);
                         state
                             .lock()
                             .await
@@ -252,10 +252,7 @@ async fn send_response(
 }
 
 /// Tracks per-repo: (vcs_kind, working_copy_changed)
-fn collect_change(
-    pending: &mut HashMap<PathBuf, (VcsKind, bool)>,
-    event: WatchEvent,
-) {
+fn collect_change(pending: &mut HashMap<PathBuf, (VcsKind, bool)>, event: WatchEvent) {
     match event {
         WatchEvent::Change {
             repo_path,
@@ -265,9 +262,7 @@ fn collect_change(
             if working_copy_changed {
                 pending.insert(repo_path, (vcs_kind, true));
             } else {
-                pending
-                    .entry(repo_path)
-                    .or_insert((vcs_kind, false));
+                pending.entry(repo_path).or_insert((vcs_kind, false));
             }
         }
         WatchEvent::Flush(_) => {} // handled by caller
@@ -278,10 +273,8 @@ async fn process_pending(
     state: &Arc<Mutex<DaemonState>>,
     pending: &mut HashMap<PathBuf, (VcsKind, bool)>,
 ) {
-    let repos: Vec<(PathBuf, VcsKind, bool)> = pending
-        .drain()
-        .map(|(p, (v, wc))| (p, v, wc))
-        .collect();
+    let repos: Vec<(PathBuf, VcsKind, bool)> =
+        pending.drain().map(|(p, (v, wc))| (p, v, wc)).collect();
     for (repo_path, vcs_kind, needs_snapshot) in repos {
         let config = state.lock().await.config.clone();
         let result = match vcs_kind {
@@ -630,7 +623,9 @@ mod tests {
         let config = Config {
             debounce_ms: 100,
             color: false,
-            format: Some("{{ change_id }} {{ description }}{% if empty %} EMPTY{% endif %}".to_string()),
+            format: Some(
+                "{{ change_id }} {{ description }}{% if empty %} EMPTY{% endif %}".to_string(),
+            ),
             ..Default::default()
         };
 
@@ -701,7 +696,12 @@ mod tests {
             }
         };
         run(vec!["init".into()]).await;
-        run(vec!["config".into(), "user.email".into(), "test@test.com".into()]).await;
+        run(vec![
+            "config".into(),
+            "user.email".into(),
+            "test@test.com".into(),
+        ])
+        .await;
         run(vec!["config".into(), "user.name".into(), "Test".into()]).await;
         std::fs::write(dir.path().join("README"), "init\n").unwrap();
         run(vec!["add".into(), ".".into()]).await;

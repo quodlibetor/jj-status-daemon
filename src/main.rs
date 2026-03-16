@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "jj-status-daemon")]
+#[command(name = "vcs-status-daemon")]
 #[command(about = "Fast jj status for shell prompts")]
 struct Cli {
     #[command(subcommand)]
@@ -128,9 +128,7 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
                 std::fs::write(&path, config::DEFAULT_CONFIG_TOML)?;
             }
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-            let status = std::process::Command::new(&editor)
-                .arg(&path)
-                .status()?;
+            let status = std::process::Command::new(&editor).arg(&path).status()?;
             if !status.success() {
                 anyhow::bail!("{editor} exited with {status}");
             }
