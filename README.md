@@ -2,7 +2,8 @@
 
 A background daemon that pre-caches [Jujutsu](https://github.com/jj-vcs/jj) and Git repository status, so shell prompts can retrieve it in milliseconds instead of waiting for `jj` or `git` to run on every prompt.
 
-> This project is entirely AI generated but it seems to work
+> [!WARNING]
+> This project is entirely AI generated but it seems to work 🤖 🤷
 
 ## Problem
 
