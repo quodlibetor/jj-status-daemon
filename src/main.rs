@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod daemon;
+mod git;
 mod jj;
 mod protocol;
 mod watcher;

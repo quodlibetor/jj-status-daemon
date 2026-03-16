@@ -8,24 +8,29 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::{Duration, Instant};
 
 use crate::config::Config;
+use crate::git::query_git_status;
 use crate::jj::{format_status, query_jj_status};
-use crate::protocol::{Request, Response};
+use crate::protocol::{Request, Response, VcsKind};
 use crate::watcher::{RepoWatcher, WatchEvent, watch_repo};
 
 struct DaemonState {
     cache: HashMap<PathBuf, String>,
     watchers: HashMap<PathBuf, RepoWatcher>,
-    /// Maps arbitrary directories to their jj repo root. Negatives are not cached.
-    dir_to_repo: HashMap<PathBuf, PathBuf>,
+    /// Maps arbitrary directories to their repo root and VCS kind. Negatives are not cached.
+    dir_to_repo: HashMap<PathBuf, (PathBuf, VcsKind)>,
     last_query: Instant,
     config: Config,
 }
 
-fn find_repo_root(start: &Path) -> Option<PathBuf> {
+/// Find the repo root and VCS kind. jj wins if both `.jj/` and `.git/` are present.
+fn find_repo_root(start: &Path) -> Option<(PathBuf, VcsKind)> {
     let mut dir = start.to_path_buf();
     loop {
         if dir.join(".jj").is_dir() {
-            return Some(dir);
+            return Some((dir, VcsKind::Jj));
+        }
+        if dir.join(".git").exists() {
+            return Some((dir, VcsKind::Git));
         }
         if !dir.pop() {
             return None;
@@ -129,22 +134,21 @@ async fn handle_connection(
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(&repo_path));
 
-            // Resolve the jj repo root from the given path
-            let (repo_path, cached, config) = {
+            // Resolve the repo root and VCS kind from the given path
+            let (repo_path, vcs_kind, cached, config) = {
                 let mut st = state.lock().await;
                 st.last_query = Instant::now();
 
-                let repo_root = if let Some(cached_root) = st.dir_to_repo.get(&query_path) {
-                    Some(cached_root.clone())
-                } else if let Some(root) = find_repo_root(&query_path) {
-                    st.dir_to_repo.insert(query_path, root.clone());
-                    Some(root)
+                let resolved = if let Some(entry) = st.dir_to_repo.get(&query_path) {
+                    Some(entry.clone())
+                } else if let Some(found) = find_repo_root(&query_path) {
+                    st.dir_to_repo.insert(query_path, found.clone());
+                    Some(found)
                 } else {
-                    // Not in a jj repo — don't cache negatives
                     None
                 };
 
-                let Some(repo_path) = repo_root else {
+                let Some((repo_path, vcs_kind)) = resolved else {
                     drop(st);
                     return send_response(
                         &mut writer,
@@ -156,20 +160,24 @@ async fn handle_connection(
                 };
 
                 if !st.watchers.contains_key(&repo_path)
-                    && let Ok(watcher) = watch_repo(&repo_path, watch_tx.clone())
+                    && let Ok(watcher) = watch_repo(&repo_path, vcs_kind, watch_tx.clone())
                 {
                     st.watchers.insert(repo_path.clone(), watcher);
                 }
 
                 let cached = st.cache.get(&repo_path).cloned();
                 let config = st.config.clone();
-                (repo_path, cached, config)
+                (repo_path, vcs_kind, cached, config)
             };
 
             let formatted = if let Some(cached) = cached {
                 cached
             } else {
-                match query_jj_status(&repo_path, &config, false).await {
+                let result = match vcs_kind {
+                    VcsKind::Jj => query_jj_status(&repo_path, &config, false).await,
+                    VcsKind::Git => query_git_status(&repo_path, &config).await,
+                };
+                match result {
                     Ok(status) => {
                         let formatted = format_status(&status, &config.format, config.color);
                         state
@@ -217,28 +225,47 @@ async fn send_response(
     Ok(())
 }
 
-fn collect_change(wc_changed: &mut HashMap<PathBuf, bool>, event: WatchEvent) {
+/// Tracks per-repo: (vcs_kind, working_copy_changed)
+fn collect_change(
+    pending: &mut HashMap<PathBuf, (VcsKind, bool)>,
+    event: WatchEvent,
+) {
     match event {
         WatchEvent::Change {
             repo_path,
+            vcs_kind,
             working_copy_changed,
         } => {
             if working_copy_changed {
-                wc_changed.insert(repo_path, true);
+                pending.insert(repo_path, (vcs_kind, true));
             } else {
-                wc_changed.entry(repo_path).or_insert(false);
+                pending
+                    .entry(repo_path)
+                    .or_insert((vcs_kind, false));
             }
         }
         WatchEvent::Flush(_) => {} // handled by caller
     }
 }
 
-async fn process_pending(state: &Arc<Mutex<DaemonState>>, wc_changed: &mut HashMap<PathBuf, bool>) {
-    let repos: Vec<(PathBuf, bool)> = wc_changed.drain().collect();
-    for (repo_path, needs_snapshot) in repos {
+async fn process_pending(
+    state: &Arc<Mutex<DaemonState>>,
+    pending: &mut HashMap<PathBuf, (VcsKind, bool)>,
+) {
+    let repos: Vec<(PathBuf, VcsKind, bool)> = pending
+        .drain()
+        .map(|(p, (v, wc))| (p, v, wc))
+        .collect();
+    for (repo_path, vcs_kind, needs_snapshot) in repos {
         let config = state.lock().await.config.clone();
-        let ignore_wc = !needs_snapshot;
-        match query_jj_status(&repo_path, &config, ignore_wc).await {
+        let result = match vcs_kind {
+            VcsKind::Jj => {
+                let ignore_wc = !needs_snapshot;
+                query_jj_status(&repo_path, &config, ignore_wc).await
+            }
+            VcsKind::Git => query_git_status(&repo_path, &config).await,
+        };
+        match result {
             Ok(status) => {
                 let formatted = format_status(&status, &config.format, config.color);
                 state.lock().await.cache.insert(repo_path, formatted);
@@ -254,7 +281,7 @@ async fn refresh_task(
     state: Arc<Mutex<DaemonState>>,
     mut watch_rx: mpsc::UnboundedReceiver<WatchEvent>,
 ) {
-    let mut wc_changed: HashMap<PathBuf, bool> = HashMap::new();
+    let mut wc_changed: HashMap<PathBuf, (VcsKind, bool)> = HashMap::new();
 
     loop {
         let Some(event) = watch_rx.recv().await else {
@@ -309,7 +336,10 @@ mod tests {
         let sub = dir.path().join("a").join("b");
         std::fs::create_dir_all(&sub).unwrap();
 
-        assert_eq!(find_repo_root(&sub), Some(dir.path().to_path_buf()));
+        assert_eq!(
+            find_repo_root(&sub),
+            Some((dir.path().to_path_buf(), VcsKind::Jj))
+        );
     }
 
     #[test]
@@ -318,7 +348,34 @@ mod tests {
         let jj_dir = dir.path().join(".jj");
         std::fs::create_dir(&jj_dir).unwrap();
 
-        assert_eq!(find_repo_root(dir.path()), Some(dir.path().to_path_buf()));
+        assert_eq!(
+            find_repo_root(dir.path()),
+            Some((dir.path().to_path_buf(), VcsKind::Jj))
+        );
+    }
+
+    #[test]
+    fn test_find_repo_root_git() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+
+        assert_eq!(
+            find_repo_root(dir.path()),
+            Some((dir.path().to_path_buf(), VcsKind::Git))
+        );
+    }
+
+    #[test]
+    fn test_find_repo_root_jj_wins() {
+        let dir = TempDir::new().unwrap();
+        // Both .jj and .git present — jj should win
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+
+        assert_eq!(
+            find_repo_root(dir.path()),
+            Some((dir.path().to_path_buf(), VcsKind::Jj))
+        );
     }
 
     #[test]
@@ -598,6 +655,69 @@ mod tests {
             second.contains("changed"),
             "expected cache to update with description, got: {second:?}"
         );
+
+        let _ = send_request(&socket_path, &Request::Shutdown).await;
+        daemon.await.unwrap().unwrap();
+    }
+
+    async fn create_git_repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let run = |args: Vec<String>| {
+            let dir_path = dir.path().to_path_buf();
+            async move {
+                let output = Command::new("git")
+                    .args(&args)
+                    .current_dir(&dir_path)
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(output.status.success(), "git {:?} failed", args);
+            }
+        };
+        run(vec!["init".into()]).await;
+        run(vec!["config".into(), "user.email".into(), "test@test.com".into()]).await;
+        run(vec!["config".into(), "user.name".into(), "Test".into()]).await;
+        std::fs::write(dir.path().join("README"), "init\n").unwrap();
+        run(vec!["add".into(), ".".into()]).await;
+        run(vec!["commit".into(), "-m".into(), "initial".into()]).await;
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_daemon_serves_git_status() {
+        let dir = create_git_repo().await;
+        let socket_path = temp_socket_path("git-serves");
+        let _ = std::fs::remove_file(&socket_path);
+        let config = Config {
+            color: false,
+            format: "{% if is_git %}GIT {{ branch }} {{ commit_id }}{% endif %}".to_string(),
+            ..Default::default()
+        };
+
+        let daemon = tokio::spawn(run_daemon(config, socket_path.clone()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = send_request(
+            &socket_path,
+            &Request::Query {
+                repo_path: dir.path().to_string_lossy().to_string(),
+            },
+        )
+        .await;
+
+        match resp {
+            Response::Status { formatted } => {
+                assert!(
+                    formatted.starts_with("GIT "),
+                    "expected git status, got: {formatted:?}"
+                );
+                assert!(
+                    formatted.contains("main") || formatted.contains("master"),
+                    "expected branch name, got: {formatted:?}"
+                );
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
 
         let _ = send_request(&socket_path, &Request::Shutdown).await;
         daemon.await.unwrap().unwrap();

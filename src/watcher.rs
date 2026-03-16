@@ -3,9 +3,12 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
+use crate::protocol::VcsKind;
+
 pub enum WatchEvent {
     Change {
         repo_path: PathBuf,
+        vcs_kind: VcsKind,
         working_copy_changed: bool,
     },
     Flush(tokio::sync::oneshot::Sender<()>),
@@ -15,10 +18,16 @@ pub struct RepoWatcher {
     _watcher: RecommendedWatcher,
 }
 
-pub fn watch_repo(repo_path: &Path, tx: mpsc::UnboundedSender<WatchEvent>) -> Result<RepoWatcher> {
-    let op_heads_dir = repo_path.join(".jj/repo/op_heads/heads");
+pub fn watch_repo(
+    repo_path: &Path,
+    vcs_kind: VcsKind,
+    tx: mpsc::UnboundedSender<WatchEvent>,
+) -> Result<RepoWatcher> {
     let repo_path_owned = repo_path.to_path_buf();
-    let jj_dir = repo_path.join(".jj");
+    let vcs_dir = match vcs_kind {
+        VcsKind::Jj => repo_path.join(".jj"),
+        VcsKind::Git => repo_path.join(".git"),
+    };
 
     let mut watcher =
         notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
@@ -29,11 +38,8 @@ pub fn watch_repo(repo_path: &Path, tx: mpsc::UnboundedSender<WatchEvent>) -> Re
                 return;
             }
 
-            // Determine if this is a working copy change or a .jj internal change
-            let working_copy_changed = event.paths.iter().any(|p| {
-                // If the changed path is not under .jj/, it's a working copy change
-                !p.starts_with(&jj_dir)
-            });
+            // Determine if this is a working copy change or a VCS internal change
+            let working_copy_changed = event.paths.iter().any(|p| !p.starts_with(&vcs_dir));
 
             // Filter out target/ directory changes
             let dominated_by_target = event.paths.iter().all(|p| {
@@ -47,15 +53,36 @@ pub fn watch_repo(repo_path: &Path, tx: mpsc::UnboundedSender<WatchEvent>) -> Re
 
             let _ = tx.send(WatchEvent::Change {
                 repo_path: repo_path_owned.clone(),
+                vcs_kind,
                 working_copy_changed,
             });
         })?;
 
-    // Watch op_heads for jj operations
-    if op_heads_dir.exists() {
-        watcher
-            .watch(&op_heads_dir, RecursiveMode::NonRecursive)
-            .context("failed to watch op_heads")?;
+    match vcs_kind {
+        VcsKind::Jj => {
+            // Watch op_heads for jj operations
+            let op_heads_dir = repo_path.join(".jj/repo/op_heads/heads");
+            if op_heads_dir.exists() {
+                watcher
+                    .watch(&op_heads_dir, RecursiveMode::NonRecursive)
+                    .context("failed to watch op_heads")?;
+            }
+        }
+        VcsKind::Git => {
+            // Watch .git/ for ref changes, HEAD, index
+            let git_dir = repo_path.join(".git");
+            if git_dir.is_dir() {
+                watcher
+                    .watch(&git_dir, RecursiveMode::NonRecursive)
+                    .context("failed to watch .git")?;
+                let refs_dir = git_dir.join("refs");
+                if refs_dir.is_dir() {
+                    watcher
+                        .watch(&refs_dir, RecursiveMode::Recursive)
+                        .context("failed to watch .git/refs")?;
+                }
+            }
+        }
     }
 
     // Watch working directory for file changes
@@ -89,7 +116,7 @@ mod tests {
     async fn test_watcher_detects_jj_op() {
         let dir = create_jj_repo().await;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let _watcher = watch_repo(dir.path(), tx).unwrap();
+        let _watcher = watch_repo(dir.path(), VcsKind::Jj, tx).unwrap();
 
         // Make a jj operation
         Command::new("jj")
@@ -114,7 +141,7 @@ mod tests {
     async fn test_watcher_detects_file_change() {
         let dir = create_jj_repo().await;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let _watcher = watch_repo(dir.path(), tx).unwrap();
+        let _watcher = watch_repo(dir.path(), VcsKind::Jj, tx).unwrap();
 
         // Write a file to working copy
         tokio::fs::write(dir.path().join("hello.txt"), "hello")
