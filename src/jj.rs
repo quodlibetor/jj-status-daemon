@@ -198,11 +198,14 @@ pub async fn query_jj_status(
     }
 
     // Parse bookmarks - each line corresponds to an ancestor at distance i
-    // Empty lines are significant (ancestor with no bookmarks), so don't skip them
+    // Empty lines are significant (ancestor with no bookmarks), so don't skip them.
+    // Deduplicate by name, keeping the closest (smallest distance) occurrence,
+    // since DAG merges can cause the same bookmark to appear at multiple distances.
+    let mut seen_bookmarks = std::collections::HashSet::new();
     for (distance, line) in bookmark_out.lines().enumerate() {
         let dist = distance as u32;
         for name in line.split_whitespace() {
-            if !name.is_empty() {
+            if !name.is_empty() && seen_bookmarks.insert(name.to_string()) {
                 let display = if dist == 0 {
                     name.to_string()
                 } else {
