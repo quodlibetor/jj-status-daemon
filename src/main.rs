@@ -2,6 +2,7 @@ mod client;
 mod config;
 mod daemon;
 mod git;
+mod init;
 mod jj;
 mod protocol;
 mod watcher;
@@ -38,6 +39,14 @@ enum Commands {
     },
     /// Shut down the daemon
     Shutdown,
+    /// Print shell integration code (use with eval)
+    Init {
+        /// Shell to generate code for
+        shell: init::Shell,
+        /// Check starship.toml for correct VCS_STATUS configuration
+        #[arg(long)]
+        starship: bool,
+    },
     /// Manage configuration
     Config {
         #[command(subcommand)]
@@ -66,7 +75,9 @@ fn try_fast_args() -> Option<Option<PathBuf>> {
     let s = first.to_str()?;
     match s {
         // Subcommands and help flags → fall through to clap
-        "daemon" | "shutdown" | "query" | "config" | "-h" | "--help" | "--version" => None,
+        "daemon" | "shutdown" | "query" | "config" | "init" | "-h" | "--help" | "--version" => {
+            None
+        }
         "--repo" => {
             let path = args.next().map(PathBuf::from);
             Some(path)
@@ -161,6 +172,9 @@ fn run_clap() -> anyhow::Result<()> {
         }
         Some(Commands::Shutdown) => {
             client::shutdown()?;
+        }
+        Some(Commands::Init { shell, starship }) => {
+            init::run(&shell, starship)?;
         }
         Some(Commands::Config { action }) => {
             run_config(action)?;

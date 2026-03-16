@@ -64,61 +64,36 @@ Or go to the [Releases](https://github.com/quodlibetor/vcs-status-daemon/release
 
 ### Shell prompt integration
 
-
-#### Simple (no shell function)
-
-Modern computers run vcs-status-daemon in under 5 ms, so you can just call it in a subshell, add it to the end of your PS1:
-
-```sh
-export PS1='$(vcs-status-daemon) $ '
-```
-
-#### Starship
-
-Starship is much slower at calling subprocesses than it is at using built-in tools, so putting the VCS status in an env var cuts out *tens* of milliseconds.
-
-<details>
-  <summary><strong>zsh</strong> -- define a shell function and add it to your prompt</summary>
-Add a `precmd` hook to your `.zshrc`, then have starship display it:
+Add the following to your shell rc file. This sets a `VCS_STATUS` environment variable before each prompt — use it in your prompt however you like.
 
 ```zsh
 # .zshrc
-_vcs_status_precmd() {
-  local cwd="${PWD:A}"
-  local cache="/tmp/vcs-status-daemon-$USER/cache/${cwd//\//%}"
-  if [[ -f "$cache" ]]; then
-    export VCS_STATUS="$(<"$cache")"
-  else
-    export VCS_STATUS="$(vcs-status-daemon)"
-  fi
-}
-precmd_functions+=(_vcs_status_precmd)
+eval "$(vcs-status-daemon init zsh)"
+PS1='%~ ${VCS_STATUS}%# '
 ```
-</details>
-
-<details>
-  <summary><strong>bash</strong> -- define a function and add it to your prompt</summary>
-
-For bash, use `PROMPT_COMMAND`:
 
 ```bash
 # .bashrc
-_vcs_status_precmd() {
-  local cwd
-  cwd=$(pwd -P)
-  local cache="/tmp/vcs-status-daemon-$USER/cache/${cwd//\//%}"
-  if [[ -f "$cache" ]]; then
-    export VCS_STATUS="$(<"$cache")"
-  else
-    export VCS_STATUS="$(vcs-status-daemon)"
-  fi
-}
-PROMPT_COMMAND="_vcs_status_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+eval "$(vcs-status-daemon init bash)"
+PS1='\w ${VCS_STATUS}\$ '
 ```
-</details>
+
+#### With starship
+
+```zsh
+# .zshrc
+eval "$(vcs-status-daemon init zsh --starship)"
+```
+
+```bash
+# .bashrc
+eval "$(vcs-status-daemon init bash --starship)"
+```
+
+The `--starship` flag warns if it can't find your `starship.toml` or if it's missing the `[env_var.VCS_STATUS]` section. Add this to your `starship.toml`:
 
 ```toml
-# starship.toml
+# Disable starship's built-in git modules (vcs-status-daemon handles both jj and git)
 [git_branch]
 disabled = true
 
@@ -131,25 +106,8 @@ disabled = true
 [git_state]
 disabled = true
 
-# This variable is defined by the _vcs_status_precmd defined in the shell rc file above
 [env_var.VCS_STATUS]
 format = "$env_value "
-```
-
-#### Plain shell prompt (no starship)
-
-```zsh
-# .zshrc
-vcs_status() {
-  local cwd="${PWD:A}"
-  local cache="/tmp/vcs-status-daemon-$USER/cache/${cwd//\//%}"
-  if [[ -f "$cache" ]]; then
-    printf '%s' "$(<"$cache")"
-  else
-    vcs-status-daemon
-  fi
-}
-PS1='$(vcs_status) $ '
 ```
 
 ### Commands
@@ -164,11 +122,20 @@ vcs-status-daemon query --repo /path/to/repo
 # Start the daemon explicitly
 vcs-status-daemon daemon
 
-# Start the daemon with a specific socket path
-vcs-status-daemon daemon --socket /tmp/my-custom.sock
+# Start the daemon with a custom runtime directory
+vcs-status-daemon daemon --dir /tmp/my-daemon
 
 # Shut down the daemon
 vcs-status-daemon shutdown
+
+# Generate shell integration code (sets $VCS_STATUS before each prompt)
+vcs-status-daemon init zsh [--starship]
+vcs-status-daemon init bash [--starship]
+
+# Manage config
+vcs-status-daemon config init    # write default config file
+vcs-status-daemon config edit    # open config in $EDITOR
+vcs-status-daemon config path    # print config file path
 ```
 
 The client sends its current directory to the daemon, which walks up the directory tree to find a repo root (`.jj/` or `.git/`). The mapping from directory to repo root is cached. When run outside a recognized repository, the client exits silently with exit code 0, making it safe for unconditional prompt use.
