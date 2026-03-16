@@ -1,6 +1,6 @@
 [package]
 name = "jj-status-daemon"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 repository = "https://github.com/quodlibetor/jj-status-daemon"
 homepage = "https://github.com/quodlibetor/jj-status-daemon"
