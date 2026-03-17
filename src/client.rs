@@ -54,9 +54,9 @@ fn try_cache_file(repo_path: &Path) -> Option<String> {
     std::fs::read_to_string(cache_path).ok()
 }
 
-pub fn query(repo_path: &Path) -> Result<String> {
+pub fn query(repo_path: &Path, use_cache: bool) -> Result<String> {
     // Fast path: read directly from cache file (no IPC)
-    if let Some(cached) = try_cache_file(repo_path) {
+    if use_cache && let Some(cached) = try_cache_file(repo_path) {
         return Ok(cached);
     }
 
@@ -136,7 +136,7 @@ mod tests {
         // Client calls are synchronous — run on a blocking thread so the
         // tokio executor can still drive the daemon task.
         let dir_path = dir.path().to_path_buf();
-        let result = tokio::task::spawn_blocking(move || query(&dir_path).unwrap())
+        let result = tokio::task::spawn_blocking(move || query(&dir_path, true).unwrap())
             .await
             .unwrap();
         assert!(!result.is_empty());

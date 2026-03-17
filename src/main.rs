@@ -11,6 +11,21 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+/// A yes/no flag for clap (accepts "yes"/"no", "true"/"false", "1"/"0").
+#[derive(Clone)]
+struct BoolFlag(bool);
+
+impl std::str::FromStr for BoolFlag {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "yes" | "true" | "1" => Ok(BoolFlag(true)),
+            "no" | "false" | "0" => Ok(BoolFlag(false)),
+            _ => Err(format!("expected yes/no, got '{s}'")),
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "vcs-status-daemon")]
 #[command(about = "Fast jj status for shell prompts")]
@@ -21,6 +36,10 @@ struct Cli {
     /// Path to the jj repository (default: auto-detect)
     #[arg(long)]
     repo: Option<PathBuf>,
+
+    /// Whether to check the file cache before querying the daemon
+    #[arg(long, default_value = "yes")]
+    use_cache: BoolFlag,
 }
 
 #[derive(Subcommand)]
@@ -36,6 +55,9 @@ enum Commands {
         /// Path to the jj repository
         #[arg(long)]
         repo: Option<PathBuf>,
+        /// Whether to check the file cache before querying the daemon
+        #[arg(long, default_value = "yes")]
+        use_cache: BoolFlag,
     },
     /// Shut down the daemon
     Shutdown,
@@ -65,28 +87,41 @@ enum ConfigAction {
 }
 
 /// Fast-path arg parsing for the common client case.
-/// Returns `Some(path)` for a direct query, or `None` to fall through to clap.
-fn try_fast_args() -> Option<Option<PathBuf>> {
+/// Returns `Some((path, use_cache))` for a direct query, or `None` to fall through to clap.
+fn try_fast_args() -> Option<(Option<PathBuf>, bool)> {
     let mut args = std::env::args_os().skip(1);
-    let first = match args.next() {
-        None => return Some(None), // no args → query cwd
-        Some(a) => a,
-    };
-    let s = first.to_str()?;
-    match s {
-        // Subcommands and help flags → fall through to clap
-        "daemon" | "shutdown" | "query" | "config" | "init" | "-h" | "--help" | "--version" => {
-            None
+    let mut repo = None;
+    let mut use_cache = true;
+
+    loop {
+        let arg = match args.next() {
+            None => break,
+            Some(a) => a,
+        };
+        let s = arg.to_str()?;
+        match s {
+            // Subcommands and help flags → fall through to clap
+            "daemon" | "shutdown" | "query" | "config" | "init" | "-h" | "--help"
+            | "--version" => return None,
+            "--repo" => {
+                repo = Some(PathBuf::from(args.next()?));
+            }
+            "--use-cache" => {
+                let val = args.next()?.to_str()?.to_string();
+                use_cache = matches!(val.as_str(), "yes" | "true" | "1");
+            }
+            _ if s.starts_with("--use-cache=") => {
+                let val = &s["--use-cache=".len()..];
+                use_cache = matches!(val, "yes" | "true" | "1");
+            }
+            _ => return None,
         }
-        "--repo" => {
-            let path = args.next().map(PathBuf::from);
-            Some(path)
-        }
-        _ => None,
     }
+
+    Some((repo, use_cache))
 }
 
-fn run_query(path: Option<PathBuf>) -> anyhow::Result<()> {
+fn run_query(path: Option<PathBuf>, use_cache: bool) -> anyhow::Result<()> {
     let path = match path {
         Some(p) => p,
         None => match std::env::current_dir() {
@@ -95,7 +130,7 @@ fn run_query(path: Option<PathBuf>) -> anyhow::Result<()> {
         },
     };
 
-    let status = client::query(&path)?;
+    let status = client::query(&path, use_cache)?;
     if !status.is_empty() {
         print!("{status}");
     }
@@ -104,8 +139,8 @@ fn run_query(path: Option<PathBuf>) -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     // Fast path: skip clap and tokio for the common no-subcommand client case
-    if let Some(repo) = try_fast_args() {
-        return run_query(repo);
+    if let Some((repo, use_cache)) = try_fast_args() {
+        return run_query(repo, use_cache);
     }
 
     // Slow path: full clap parsing, tokio runtime only started for daemon
@@ -179,11 +214,11 @@ fn run_clap() -> anyhow::Result<()> {
         Some(Commands::Config { action }) => {
             run_config(action)?;
         }
-        Some(Commands::Query { repo }) => {
-            run_query(repo.or(cli.repo))?;
+        Some(Commands::Query { repo, use_cache }) => {
+            run_query(repo.or(cli.repo), use_cache.0)?;
         }
         None => {
-            run_query(cli.repo)?;
+            run_query(cli.repo, cli.use_cache.0)?;
         }
     }
 
