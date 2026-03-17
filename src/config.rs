@@ -98,6 +98,10 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join("sock")
 }
 
+pub fn pid_path() -> PathBuf {
+    runtime_dir().join("pid")
+}
+
 /// Find the repo root and VCS kind. jj wins if both `.jj/` and `.git/` are present.
 pub fn find_repo_root(start: &Path) -> Option<(PathBuf, VcsKind)> {
     let mut dir = start.to_path_buf();

@@ -67,6 +67,10 @@ pub async fn run_daemon(config: Config, runtime_dir: PathBuf) -> Result<()> {
     let listener = UnixListener::bind(&socket_path)?;
     tracing::info!(path = %socket_path.display(), "daemon listening");
 
+    // Write pidfile so the client can force-kill us if graceful shutdown fails
+    let pid_path = runtime_dir.join("pid");
+    std::fs::write(&pid_path, std::process::id().to_string()).ok();
+
     let (watch_tx, watch_rx) = mpsc::unbounded_channel();
     let shutdown = Arc::new(Notify::new());
 
@@ -148,6 +152,7 @@ pub async fn run_daemon(config: Config, runtime_dir: PathBuf) -> Result<()> {
                 if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
                     tracing::warn!(path = %cache_dir.display(), error = %e, "failed to remove cache directory");
                 }
+                let _ = std::fs::remove_file(&pid_path);
                 return Ok(());
             }
         }

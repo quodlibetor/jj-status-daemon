@@ -61,6 +61,8 @@ enum Commands {
     },
     /// Shut down the daemon
     Shutdown,
+    /// Restart the daemon (graceful shutdown, then start)
+    Restart,
     /// Print shell integration code (use with eval)
     Init {
         /// Shell to generate code for
@@ -101,7 +103,7 @@ fn try_fast_args() -> Option<(Option<PathBuf>, bool)> {
         let s = arg.to_str()?;
         match s {
             // Subcommands and help flags → fall through to clap
-            "daemon" | "shutdown" | "query" | "config" | "init" | "-h" | "--help"
+            "daemon" | "shutdown" | "query" | "config" | "init" | "restart" | "-h" | "--help"
             | "--version" => return None,
             "--repo" => {
                 repo = Some(PathBuf::from(args.next()?));
@@ -207,6 +209,9 @@ fn run_clap() -> anyhow::Result<()> {
         }
         Some(Commands::Shutdown) => {
             client::shutdown()?;
+        }
+        Some(Commands::Restart) => {
+            client::restart()?;
         }
         Some(Commands::Init { shell, starship }) => {
             init::run(&shell, starship)?;

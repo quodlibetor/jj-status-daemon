@@ -97,6 +97,41 @@ pub fn shutdown() -> Result<()> {
     }
 }
 
+pub fn restart() -> Result<()> {
+    let socket_path = config::socket_path();
+    let pid_path = config::pid_path();
+
+    // Try graceful shutdown first
+    let _ = send_request(&socket_path, &Request::Shutdown);
+
+    // Wait for socket to disappear (up to 5 seconds)
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while socket_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // If socket still exists, force-kill via pidfile
+    if socket_path.exists() {
+        if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+            let pid = pid_str.trim();
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid])
+                .status();
+            // Wait briefly for the process to die
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // Clean up stale socket
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    // Clean up pidfile
+    let _ = std::fs::remove_file(&pid_path);
+
+    // Start a fresh daemon
+    start_daemon(&socket_path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
