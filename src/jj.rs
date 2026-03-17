@@ -340,6 +340,18 @@ pub fn format_status(status: &RepoStatus, template: &str, color: bool) -> String
     }
 }
 
+/// Validate a Tera template by rendering it with dummy data.
+/// Returns `Ok(())` if the template is valid, or `Err(message)` if not.
+pub fn validate_template(template: &str) -> Result<(), String> {
+    let status = RepoStatus::default();
+    let rendered = format_status(&status, template, false);
+    if rendered.starts_with("template error:") {
+        Err(rendered)
+    } else {
+        Ok(())
+    }
+}
+
 /// Built-in "ascii" template — works in any terminal.
 ///
 /// jj: `xlvlt main [3 +10-5]`

@@ -63,6 +63,18 @@ pub async fn run_daemon(config: Config, runtime_dir: PathBuf) -> Result<()> {
         "starting daemon"
     );
 
+    // Validate the template early so the user gets immediate feedback
+    let resolved = config.resolved_format();
+    if let Err(e) = crate::jj::validate_template(&resolved) {
+        let source = if config.format.is_some() {
+            "format".to_string()
+        } else {
+            format!("template \"{}\"", config.template_name)
+        };
+        eprintln!("warning: invalid {source}: {e}");
+        tracing::error!(source = %source, "invalid template: {e}");
+    }
+
     // Clean up stale socket
     if socket_path.exists() {
         if tokio::net::UnixStream::connect(&socket_path).await.is_err() {
