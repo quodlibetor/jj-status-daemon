@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::Path;
+use std::time::Duration;
 use tera::Tera;
 use tokio::process::Command;
 
 use crate::config::Config;
+
+const VCS_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Bookmark {
@@ -53,12 +56,22 @@ pub struct RepoStatus {
 }
 
 async fn run_jj(repo_path: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("jj")
-        .args(args)
-        .current_dir(repo_path)
-        .output()
-        .await
-        .context("failed to run jj")?;
+    let output = match tokio::time::timeout(
+        VCS_COMMAND_TIMEOUT,
+        Command::new("jj")
+            .args(args)
+            .current_dir(repo_path)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    {
+        Ok(result) => result.context("failed to run jj")?,
+        Err(_) => anyhow::bail!(
+            "jj command timed out after {}s",
+            VCS_COMMAND_TIMEOUT.as_secs()
+        ),
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

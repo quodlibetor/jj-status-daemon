@@ -128,8 +128,15 @@ pub async fn run_daemon(config: Config, runtime_dir: PathBuf) -> Result<()> {
                 let shutdown_conn = shutdown.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, state, watch_tx, shutdown_conn).await {
-                        tracing::warn!(error = %e, "connection error");
+                    match tokio::time::timeout(
+                        Duration::from_secs(60),
+                        handle_connection(stream, state, watch_tx, shutdown_conn),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!(error = %e, "connection error"),
+                        Err(_) => tracing::warn!("connection handler timed out"),
                     }
                 });
             }
