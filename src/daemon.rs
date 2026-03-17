@@ -136,6 +136,27 @@ pub async fn run_daemon(config: Config, runtime_dir: PathBuf) -> Result<()> {
         }
     });
 
+    // Periodic watcher health check: remove watchers for repos that no longer exist
+    let state_health = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            let mut st = state_health.lock().await;
+            let stale: Vec<PathBuf> = st
+                .watchers
+                .keys()
+                .filter(|p| !p.exists())
+                .cloned()
+                .collect();
+            for path in &stale {
+                tracing::info!(repo = %path.display(), "repo no longer exists, removing watcher");
+                st.watchers.remove(path);
+                st.cache.remove(path);
+                st.dir_to_repo.retain(|_, (root, _)| root != path);
+            }
+        }
+    });
+
     // Ctrl-C: clear cache files but keep running
     let state_int = state.clone();
     let cache_dir_int = cache_dir.clone();
