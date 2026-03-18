@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::git::query_git_status;
 use crate::jj::query_jj_status;
 use crate::protocol::{Request, Response, VcsKind};
+use crate::template::format_not_ready;
 use crate::template::format_status;
 use crate::watcher::{RepoWatcher, WatchEvent, watch_repo};
 
@@ -274,46 +275,51 @@ async fn handle_connection(
                 (repo_path, vcs_kind, cached, config, cache_dir)
             };
 
-            let formatted = if let Some(cached) = cached {
+            if let Some(cached) = cached {
                 tracing::debug!(repo = %repo_path.display(), "cache hit");
-                cached
-            } else {
-                tracing::debug!(repo = %repo_path.display(), vcs = ?vcs_kind, "cache miss, querying");
-                let result = match vcs_kind {
-                    VcsKind::Jj => query_jj_status(&repo_path, &config, false).await,
-                    VcsKind::Git => query_git_status(&repo_path, &config).await,
-                };
-                match result {
-                    Ok(status) => {
-                        let formatted =
-                            format_status(&status, &config.resolved_format(), config.color);
-                        write_cache_file(&cd, &repo_path, &formatted);
-                        state
-                            .lock()
-                            .await
-                            .cache
-                            .insert(repo_path.clone(), formatted.clone());
-                        formatted
-                    }
-                    Err(e) => {
-                        return send_response(
-                            &mut writer,
-                            Response::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await;
-                    }
+                // Ensure the queried directory has a hardlink to the repo root's cache file
+                if query_path != repo_path {
+                    link_cache_file(&cd, &repo_path, &query_path);
                 }
-            };
-
-            // Ensure the queried directory has a hardlink to the repo root's cache file
-            // so the client can read it directly next time without directory walking.
-            if query_path != repo_path {
-                link_cache_file(&cd, &repo_path, &query_path);
+                send_response(&mut writer, Response::Status { formatted: cached }).await
+            } else {
+                // Respond immediately with "not ready" and populate cache in the background
+                tracing::debug!(repo = %repo_path.display(), vcs = ?vcs_kind, "cache miss, returning not-ready");
+                let not_ready = format_not_ready(&config.resolved_not_ready_format(), config.color);
+                let state_bg = state.clone();
+                let query_path_bg = query_path.clone();
+                tokio::spawn(async move {
+                    let result = match vcs_kind {
+                        VcsKind::Jj => query_jj_status(&repo_path, &config, false).await,
+                        VcsKind::Git => query_git_status(&repo_path, &config).await,
+                    };
+                    match result {
+                        Ok(status) => {
+                            let formatted =
+                                format_status(&status, &config.resolved_format(), config.color);
+                            write_cache_file(&cd, &repo_path, &formatted);
+                            if query_path_bg != repo_path {
+                                link_cache_file(&cd, &repo_path, &query_path_bg);
+                            }
+                            state_bg
+                                .lock()
+                                .await
+                                .cache
+                                .insert(repo_path.clone(), formatted);
+                        }
+                        Err(e) => {
+                            tracing::error!(repo = %repo_path.display(), error = %e, "background status query failed");
+                        }
+                    }
+                });
+                send_response(
+                    &mut writer,
+                    Response::NotReady {
+                        formatted: not_ready,
+                    },
+                )
+                .await
             }
-
-            send_response(&mut writer, Response::Status { formatted }).await
         }
         Request::Flush => {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -580,6 +586,25 @@ mod tests {
         serde_json::from_str(line.trim()).unwrap()
     }
 
+    /// Query the daemon and wait until it returns a Status (retrying through NotReady).
+    async fn query_until_ready(socket_path: &std::path::Path, repo_path: &str) -> String {
+        let request = Request::Query {
+            repo_path: repo_path.to_string(),
+        };
+        for _ in 0..50 {
+            let resp = send_request(socket_path, &request).await;
+            match resp {
+                Response::Status { formatted } => return formatted,
+                Response::NotReady { .. } => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                other => panic!("expected Status or NotReady, got {other:?}"),
+            }
+        }
+        panic!("timed out waiting for Status response");
+    }
+
     fn temp_runtime_dir(suffix: &str) -> TempDir {
         TempDir::with_prefix(format!("vcs-test-{suffix}-")).unwrap()
     }
@@ -605,24 +630,52 @@ mod tests {
         let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let resp = send_request(
-            &socket_path,
-            &Request::Query {
-                repo_path: dir.path().to_string_lossy().to_string(),
-            },
-        )
-        .await;
-
-        match resp {
-            Response::Status { formatted } => {
-                assert!(!formatted.is_empty(), "expected non-empty status");
-            }
-            other => panic!("expected Status, got {other:?}"),
-        }
+        let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
+        assert!(!formatted.is_empty(), "expected non-empty status");
 
         // Shutdown
         let resp = send_request(&socket_path, &Request::Shutdown).await;
         assert_eq!(resp, Response::Ok);
+        daemon.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_daemon_returns_not_ready_then_status() {
+        let dir = create_jj_repo().await;
+        let rt = temp_runtime_dir("notready");
+        let socket_path = rt.path().join("sock");
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let query = Request::Query {
+            repo_path: dir.path().to_string_lossy().to_string(),
+        };
+
+        // First query should return NotReady (cache is cold)
+        let resp = send_request(&socket_path, &query).await;
+        assert!(
+            matches!(resp, Response::NotReady { .. }),
+            "first query should be NotReady, got {resp:?}"
+        );
+
+        // Wait for background population
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Second query should return Status (cache is warm)
+        let resp = send_request(&socket_path, &query).await;
+        match resp {
+            Response::Status { formatted } => {
+                assert!(!formatted.is_empty(), "expected non-empty cached status");
+            }
+            other => panic!("second query should be Status, got {other:?}"),
+        }
+
+        let _ = send_request(&socket_path, &Request::Shutdown).await;
         daemon.await.unwrap().unwrap();
     }
 
@@ -643,42 +696,18 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Query from a subdirectory — daemon should resolve the repo root
-        let resp = send_request(
-            &socket_path,
-            &Request::Query {
-                repo_path: sub.to_string_lossy().to_string(),
-            },
-        )
-        .await;
-
-        match resp {
-            Response::Status { formatted } => {
-                assert!(
-                    !formatted.is_empty(),
-                    "expected non-empty status from subdirectory query"
-                );
-            }
-            other => panic!("expected Status, got {other:?}"),
-        }
+        let formatted = query_until_ready(&socket_path, &sub.to_string_lossy()).await;
+        assert!(
+            !formatted.is_empty(),
+            "expected non-empty status from subdirectory query"
+        );
 
         // Query from the repo root should return the same result (cached via dir_to_repo)
-        let resp2 = send_request(
-            &socket_path,
-            &Request::Query {
-                repo_path: dir.path().to_string_lossy().to_string(),
-            },
-        )
-        .await;
-
-        match resp2 {
-            Response::Status { formatted } => {
-                assert!(
-                    !formatted.is_empty(),
-                    "expected non-empty status from root query"
-                );
-            }
-            other => panic!("expected Status, got {other:?}"),
-        }
+        let formatted2 = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
+        assert!(
+            !formatted2.is_empty(),
+            "expected non-empty status from root query"
+        );
 
         let _ = send_request(&socket_path, &Request::Shutdown).await;
         daemon.await.unwrap().unwrap();
@@ -701,18 +730,9 @@ mod tests {
         let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // Query from the subdirectory
-        let resp = send_request(
-            &socket_path,
-            &Request::Query {
-                repo_path: sub.to_string_lossy().to_string(),
-            },
-        )
-        .await;
-        assert!(
-            matches!(resp, Response::Status { .. }),
-            "expected Status, got {resp:?}"
-        );
+        // Query from the subdirectory and wait for cache to populate
+        let formatted = query_until_ready(&socket_path, &sub.to_string_lossy()).await;
+        assert!(!formatted.is_empty(), "expected non-empty status");
 
         // Both the repo root and subdirectory should have cache files
         let root_cache = cache_file_in(&cache_dir, dir.path());
@@ -815,15 +835,9 @@ mod tests {
         let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // Query to populate the cache file
-        let resp = send_request(
-            &socket_path,
-            &Request::Query {
-                repo_path: dir.path().to_string_lossy().to_string(),
-            },
-        )
-        .await;
-        assert!(matches!(resp, Response::Status { .. }));
+        // Query to populate the cache
+        let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
+        assert!(!formatted.is_empty());
 
         // Verify cache file was created
         assert!(
@@ -884,14 +898,8 @@ mod tests {
         let mut child = spawn_daemon_process(rt.path()).await;
 
         // Query to populate the cache
-        let resp = send_request(
-            &socket_path,
-            &Request::Query {
-                repo_path: dir.path().to_string_lossy().to_string(),
-            },
-        )
-        .await;
-        assert!(matches!(resp, Response::Status { .. }));
+        let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
+        assert!(!formatted.is_empty());
 
         assert!(
             cache_dir.exists(),
@@ -940,14 +948,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let dir = create_jj_repo().await;
-        let resp = send_request(
-            &socket_path,
-            &Request::Query {
-                repo_path: dir.path().to_string_lossy().to_string(),
-            },
-        )
-        .await;
-        assert!(matches!(resp, Response::Status { .. }));
+        let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
+        assert!(!formatted.is_empty());
 
         let _ = send_request(&socket_path, &Request::Shutdown).await;
         daemon.await.unwrap().unwrap();
@@ -970,18 +972,8 @@ mod tests {
         let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // First query
-        let resp = send_request(
-            &socket_path,
-            &Request::Query {
-                repo_path: dir.path().to_string_lossy().to_string(),
-            },
-        )
-        .await;
-        let first = match resp {
-            Response::Status { formatted } => formatted,
-            other => panic!("expected Status, got {other:?}"),
-        };
+        // First query — wait for cache to populate
+        let first = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
         assert!(
             !first.contains("changed"),
             "first should not contain 'changed': {first:?}"
@@ -1061,27 +1053,15 @@ mod tests {
         let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let resp = send_request(
-            &socket_path,
-            &Request::Query {
-                repo_path: dir.path().to_string_lossy().to_string(),
-            },
-        )
-        .await;
-
-        match resp {
-            Response::Status { formatted } => {
-                assert!(
-                    formatted.starts_with("GIT "),
-                    "expected git status, got: {formatted:?}"
-                );
-                assert!(
-                    formatted.contains("main") || formatted.contains("master"),
-                    "expected branch name, got: {formatted:?}"
-                );
-            }
-            other => panic!("expected Status, got {other:?}"),
-        }
+        let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
+        assert!(
+            formatted.starts_with("GIT "),
+            "expected git status, got: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("main") || formatted.contains("master"),
+            "expected branch name, got: {formatted:?}"
+        );
 
         let _ = send_request(&socket_path, &Request::Shutdown).await;
         daemon.await.unwrap().unwrap();
@@ -1126,19 +1106,13 @@ mod tests {
             repo_path: dir_b.path().to_string_lossy().to_string(),
         };
 
-        // Round 1: initial concurrent queries
-        let (resp_a, resp_b) = tokio::join!(
-            send_request(&socket_path, &req_a),
-            send_request(&socket_path, &req_b),
+        // Round 1: initial queries — wait for cache to populate
+        let path_a = dir_a.path().to_string_lossy().to_string();
+        let path_b = dir_b.path().to_string_lossy().to_string();
+        let (status_a, status_b) = tokio::join!(
+            query_until_ready(&socket_path, &path_a),
+            query_until_ready(&socket_path, &path_b),
         );
-        let status_a = match resp_a {
-            Response::Status { formatted } => formatted,
-            other => panic!("expected Status for repo A, got {other:?}"),
-        };
-        let status_b = match resp_b {
-            Response::Status { formatted } => formatted,
-            other => panic!("expected Status for repo B, got {other:?}"),
-        };
         assert!(
             status_a.contains("main"),
             "repo A round 1: expected 'main', got: {status_a:?}"

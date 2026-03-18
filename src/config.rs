@@ -17,6 +17,9 @@ pub struct Config {
     /// Name of a built-in or user-defined template (default: "ascii").
     #[serde(default = "default_template_name")]
     pub template_name: String,
+    /// Explicit not-ready template. If set, overrides the built-in not-ready template.
+    #[serde(default)]
+    pub not_ready_format: Option<String>,
     /// User-defined named templates.
     #[serde(default)]
     pub templates: HashMap<String, String>,
@@ -60,6 +63,16 @@ impl Config {
         // Unknown template_name — fall back to ascii
         crate::template::ASCII_FORMAT.to_string()
     }
+
+    /// Resolve the not-ready template string.
+    ///
+    /// Priority: `not_ready_format` field > built-in not-ready template matching `template_name`.
+    pub fn resolved_not_ready_format(&self) -> String {
+        if let Some(fmt) = &self.not_ready_format {
+            return fmt.clone();
+        }
+        crate::template::builtin_not_ready_template(&self.template_name).to_string()
+    }
 }
 
 impl Default for Config {
@@ -68,6 +81,7 @@ impl Default for Config {
             idle_timeout_secs: default_idle_timeout_secs(),
             debounce_ms: default_debounce_ms(),
             format: None,
+            not_ready_format: None,
             template_name: default_template_name(),
             templates: HashMap::new(),
             bookmark_search_depth: default_bookmark_search_depth(),
@@ -336,5 +350,27 @@ bookmark_search_depth = 5
     fn test_load_config_missing_file() {
         let config = load_config().unwrap();
         assert_eq!(config.idle_timeout_secs, 3600);
+    }
+
+    #[test]
+    fn test_not_ready_format_default() {
+        let config = Config::default();
+        let fmt = config.resolved_not_ready_format();
+        assert!(fmt.contains("…"), "default not-ready should contain …");
+    }
+
+    #[test]
+    fn test_not_ready_format_nerdfont() {
+        let toml_str = r#"template_name = "nerdfont""#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let fmt = config.resolved_not_ready_format();
+        assert!(fmt.contains("…"), "nerdfont not-ready should contain …");
+    }
+
+    #[test]
+    fn test_not_ready_format_custom() {
+        let toml_str = r#"not_ready_format = "{{ YELLOW }}wait{{ RST }}""#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.resolved_not_ready_format(), "{{ YELLOW }}wait{{ RST }}");
     }
 }

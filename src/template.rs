@@ -41,6 +41,11 @@ pub const NERDFONT_FORMAT: &str = "\
 {% if immutable %} {{ YELLOW }}{{ RST }}{% endif %}\
 {% if empty %} {{ DIM }}∅{{ RST }}{% endif %}";
 
+/// Built-in "not ready" template for when the daemon hasn't cached status yet.
+/// Only color variables are available — no repo status values.
+pub const NOT_READY_ASCII: &str = "{{ DIM }}…{{ RST }}";
+pub const NOT_READY_NERDFONT: &str = "{{ DIM }}…{{ RST }}";
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Bookmark {
     pub name: String,
@@ -199,6 +204,69 @@ pub fn builtin_template(name: &str) -> Option<&'static str> {
         "ascii" => Some(ASCII_FORMAT),
         "nerdfont" => Some(NERDFONT_FORMAT),
         _ => None,
+    }
+}
+
+/// Look up a built-in not-ready template by name.
+pub fn builtin_not_ready_template(name: &str) -> &'static str {
+    match name {
+        "nerdfont" => NOT_READY_NERDFONT,
+        _ => NOT_READY_ASCII,
+    }
+}
+
+/// Render a "not ready" template with only color variables available.
+pub fn format_not_ready(template: &str, color: bool) -> String {
+    let mut ctx = tera::Context::new();
+    if color {
+        ctx.insert("RST", "\x1b[0m");
+        ctx.insert("BOLD", "\x1b[1m");
+        ctx.insert("DIM", "\x1b[2m");
+        ctx.insert("BLACK", "\x1b[30m");
+        ctx.insert("RED", "\x1b[31m");
+        ctx.insert("GREEN", "\x1b[32m");
+        ctx.insert("YELLOW", "\x1b[33m");
+        ctx.insert("BLUE", "\x1b[34m");
+        ctx.insert("MAGENTA", "\x1b[35m");
+        ctx.insert("CYAN", "\x1b[36m");
+        ctx.insert("WHITE", "\x1b[37m");
+        ctx.insert("BRIGHT_BLACK", "\x1b[90m");
+        ctx.insert("BRIGHT_RED", "\x1b[91m");
+        ctx.insert("BRIGHT_GREEN", "\x1b[92m");
+        ctx.insert("BRIGHT_YELLOW", "\x1b[93m");
+        ctx.insert("BRIGHT_BLUE", "\x1b[94m");
+        ctx.insert("BRIGHT_MAGENTA", "\x1b[95m");
+        ctx.insert("BRIGHT_CYAN", "\x1b[96m");
+        ctx.insert("BRIGHT_WHITE", "\x1b[97m");
+    } else {
+        let empty = "";
+        for name in [
+            "RST",
+            "BOLD",
+            "DIM",
+            "BLACK",
+            "RED",
+            "GREEN",
+            "YELLOW",
+            "BLUE",
+            "MAGENTA",
+            "CYAN",
+            "WHITE",
+            "BRIGHT_BLACK",
+            "BRIGHT_RED",
+            "BRIGHT_GREEN",
+            "BRIGHT_YELLOW",
+            "BRIGHT_BLUE",
+            "BRIGHT_MAGENTA",
+            "BRIGHT_CYAN",
+            "BRIGHT_WHITE",
+        ] {
+            ctx.insert(name, empty);
+        }
+    }
+    match Tera::one_off(template, &ctx, false) {
+        Ok(rendered) => rendered.trim().to_string(),
+        Err(e) => format!("template error: {e}"),
     }
 }
 
@@ -462,6 +530,39 @@ format = '''
         assert!(
             !formatted.contains("EMPTY"),
             "nerdfont should use ∅ not EMPTY: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_not_ready_no_color() {
+        let formatted = format_not_ready(NOT_READY_ASCII, false);
+        assert_eq!(formatted, "…");
+    }
+
+    #[test]
+    fn test_format_not_ready_with_color() {
+        let formatted = format_not_ready(NOT_READY_ASCII, true);
+        assert!(formatted.contains("…"), "expected …: {formatted:?}");
+        assert!(
+            formatted.contains("\x1b["),
+            "expected ANSI codes: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_not_ready_custom_template() {
+        let tmpl = "{{ YELLOW }}loading{{ RST }}";
+        let formatted = format_not_ready(tmpl, false);
+        assert_eq!(formatted, "loading");
+
+        let formatted = format_not_ready(tmpl, true);
+        assert!(
+            formatted.contains("\x1b[33m"),
+            "expected yellow: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("loading"),
+            "expected text: {formatted:?}"
         );
     }
 }

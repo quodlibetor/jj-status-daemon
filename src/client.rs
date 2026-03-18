@@ -8,8 +8,20 @@ use crate::config;
 use crate::protocol::{Request, Response};
 
 fn send_request(socket_path: &Path, request: &Request) -> Result<Response> {
+    send_request_with_timeout(socket_path, request, Duration::from_millis(100))
+}
+
+fn send_request_slow(socket_path: &Path, request: &Request) -> Result<Response> {
+    send_request_with_timeout(socket_path, request, Duration::from_secs(5))
+}
+
+fn send_request_with_timeout(
+    socket_path: &Path,
+    request: &Request,
+    timeout: Duration,
+) -> Result<Response> {
     let stream = UnixStream::connect(socket_path).context("failed to connect to daemon")?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_read_timeout(Some(timeout)).ok();
     let mut writer = std::io::BufWriter::new(&stream);
     let mut json = serde_json::to_string(request)?;
     json.push('\n');
@@ -41,12 +53,15 @@ fn start_daemon(socket_path: &Path) -> Result<()> {
 
 fn extract_status(response: Response) -> Result<String> {
     match response {
-        Response::Status { formatted } => Ok(formatted),
+        Response::Status { formatted } | Response::NotReady { formatted } => Ok(formatted),
         Response::Error { message } => anyhow::bail!("{message}"),
         Response::Ok => Ok(String::new()),
         _ => Ok(String::new()),
     }
 }
+
+/// Hardcoded fallback when the daemon isn't reachable within the timeout.
+const NOT_READY_FALLBACK: &str = "…";
 
 pub fn query(repo_path: &Path) -> Result<String> {
     let socket_path = config::socket_path();
@@ -54,29 +69,21 @@ pub fn query(repo_path: &Path) -> Result<String> {
         repo_path: repo_path.to_string_lossy().to_string(),
     };
 
-    // Try connecting directly first
-    if let Ok(response) = send_request(&socket_path, &request) {
-        return extract_status(response);
-    }
-
-    // Daemon not running, start it
-    start_daemon(&socket_path)?;
-
-    // Retry with backoff
-    for i in 0..10 {
-        std::thread::sleep(Duration::from_millis(100 * (i + 1)));
-        if let Ok(response) = send_request(&socket_path, &request) {
-            return extract_status(response);
+    // Try connecting with a short timeout (100ms)
+    match send_request(&socket_path, &request) {
+        Ok(response) => extract_status(response),
+        Err(_) => {
+            // Daemon not reachable — ensure it's running, return fallback
+            let _ = start_daemon(&socket_path);
+            Ok(NOT_READY_FALLBACK.to_string())
         }
     }
-
-    anyhow::bail!("failed to connect to daemon after starting it")
 }
 
 pub fn shutdown() -> Result<()> {
     let socket_path = config::socket_path();
     let response =
-        send_request(&socket_path, &Request::Shutdown).context("failed to send shutdown")?;
+        send_request_slow(&socket_path, &Request::Shutdown).context("failed to send shutdown")?;
 
     match response {
         Response::Ok => Ok(()),
@@ -90,7 +97,7 @@ pub fn restart() -> Result<()> {
     let pid_path = config::pid_path();
 
     // Try graceful shutdown first
-    let _ = send_request(&socket_path, &Request::Shutdown);
+    let _ = send_request_slow(&socket_path, &Request::Shutdown);
 
     // Wait for socket to disappear (up to 5 seconds)
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -124,7 +131,7 @@ pub fn status() -> Result<()> {
     let socket_path = config::socket_path();
     let pid_path = config::pid_path();
 
-    match send_request(&socket_path, &Request::DaemonStatus) {
+    match send_request_slow(&socket_path, &Request::DaemonStatus) {
         Ok(Response::DaemonStatus {
             pid,
             uptime_secs,
@@ -286,5 +293,23 @@ mod tests {
         assert!(result.is_err());
         // But the pidfile still exists (stale)
         assert!(pid_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_query_returns_fallback_when_daemon_not_running() {
+        let rt = TempDir::with_prefix("vcs-test-fallback-").unwrap();
+        // Point client at a directory with no daemon
+        unsafe { std::env::set_var("VCS_STATUS_DAEMON_DIR", rt.path()) };
+
+        let dir = create_jj_repo().await;
+        let dir_path = dir.path().to_path_buf();
+        let result = tokio::task::spawn_blocking(move || query(&dir_path))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result, NOT_READY_FALLBACK, "should return fallback text");
+
+        unsafe { std::env::remove_var("VCS_STATUS_DAEMON_DIR") };
     }
 }

@@ -21,6 +21,9 @@ pub enum Response {
     Status {
         formatted: String,
     },
+    NotReady {
+        formatted: String,
+    },
     Error {
         message: String,
     },
