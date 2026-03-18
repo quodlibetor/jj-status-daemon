@@ -312,4 +312,77 @@ mod tests {
 
         unsafe { std::env::remove_var("VCS_STATUS_DAEMON_DIR") };
     }
+
+    #[tokio::test]
+    async fn test_auto_start_daemon_then_query() {
+        let exe = escargot::CargoBuild::new()
+            .bin("vcs-status-daemon")
+            .current_target()
+            .run()
+            .expect("failed to build vcs-status-daemon")
+            .path()
+            .to_path_buf();
+
+        let dir = create_jj_repo().await;
+        let rt = TempDir::with_prefix("vcs-test-autostart-").unwrap();
+        let socket_path = rt.path().join("sock");
+
+        // Verify: runtime dir exists but no socket, no cache
+        assert!(rt.path().exists());
+        assert!(!socket_path.exists());
+
+        // First query: should return fallback and auto-start daemon
+        let output = Command::new(&exe)
+            .args(["--repo", dir.path().to_str().unwrap()])
+            .env("VCS_STATUS_DAEMON_DIR", rt.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "first query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let first = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            first, NOT_READY_FALLBACK,
+            "first query should return fallback"
+        );
+
+        // Wait for daemon to start listening
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if socket_path.exists() {
+                break;
+            }
+        }
+        assert!(socket_path.exists(), "daemon should have created socket");
+
+        // Second query: daemon is running, should eventually return real status
+        // May need a few retries as daemon populates cache
+        let mut got_status = false;
+        for _ in 0..20 {
+            let output = Command::new(&exe)
+                .args(["--repo", dir.path().to_str().unwrap()])
+                .env("VCS_STATUS_DAEMON_DIR", rt.path())
+                .output()
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if text != NOT_READY_FALLBACK && !text.is_empty() {
+                got_status = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(
+            got_status,
+            "should eventually get real status from auto-started daemon"
+        );
+
+        // Clean up: shut down the daemon
+        let sp = socket_path.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || send_request_slow(&sp, &Request::Shutdown)).await;
+    }
 }
