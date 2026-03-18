@@ -685,6 +685,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_daemon_writes_cache_for_subdirectory() {
+        let dir = create_jj_repo().await;
+        let sub = dir.path().join("src").join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let rt = temp_runtime_dir("cache-subdir");
+        let socket_path = rt.path().join("sock");
+        let cache_dir = rt.path().join("cache");
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Query from the subdirectory
+        let resp = send_request(
+            &socket_path,
+            &Request::Query {
+                repo_path: sub.to_string_lossy().to_string(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(resp, Response::Status { .. }),
+            "expected Status, got {resp:?}"
+        );
+
+        // Both the repo root and subdirectory should have cache files
+        let root_cache = cache_file_in(&cache_dir, dir.path());
+        let sub_cache = cache_file_in(&cache_dir, &sub);
+        assert!(
+            root_cache.exists(),
+            "cache file missing for repo root: {}",
+            root_cache.display()
+        );
+        assert!(
+            sub_cache.exists(),
+            "cache file missing for subdirectory: {}",
+            sub_cache.display()
+        );
+
+        // They should be hardlinked (same inode)
+        use std::os::unix::fs::MetadataExt;
+        let root_ino = std::fs::metadata(&root_cache).unwrap().ino();
+        let sub_ino = std::fs::metadata(&sub_cache).unwrap().ino();
+        assert_eq!(
+            root_ino, sub_ino,
+            "cache files should be hardlinked (same inode)"
+        );
+
+        // Content should match and be non-empty
+        let content = std::fs::read_to_string(&root_cache).unwrap();
+        assert!(!content.is_empty(), "cache file should not be empty");
+
+        let _ = send_request(&socket_path, &Request::Shutdown).await;
+        daemon.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn test_daemon_not_a_repo() {
         let dir = TempDir::new().unwrap(); // no jj init
 

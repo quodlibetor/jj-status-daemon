@@ -118,21 +118,6 @@ pub fn find_repo_root(start: &Path) -> Option<(PathBuf, VcsKind)> {
     }
 }
 
-/// The cache directory: `<runtime_dir>/cache/`
-pub fn cache_dir() -> PathBuf {
-    runtime_dir().join("cache")
-}
-
-/// Encode a path as a flat filename: `/Users/bwm/repos/foo` → `%Users%bwm%repos%foo`
-fn path_to_cache_name(path: &Path) -> String {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    canonical.to_string_lossy().replace('/', "%")
-}
-
-/// Cache file path for a directory (repo root or any queried subdirectory).
-pub fn cache_file_path(dir: &Path) -> PathBuf {
-    cache_dir().join(path_to_cache_name(dir))
-}
 
 pub fn config_path() -> Option<PathBuf> {
     // Check XDG-style ~/.config first (cross-platform, and what most CLI tools use on macOS),

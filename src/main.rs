@@ -12,21 +12,6 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-/// A yes/no flag for clap (accepts "yes"/"no", "true"/"false", "1"/"0").
-#[derive(Clone)]
-struct BoolFlag(bool);
-
-impl std::str::FromStr for BoolFlag {
-    type Err = String;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "yes" | "true" | "1" => Ok(BoolFlag(true)),
-            "no" | "false" | "0" => Ok(BoolFlag(false)),
-            _ => Err(format!("expected yes/no, got '{s}'")),
-        }
-    }
-}
-
 #[derive(Parser)]
 #[command(name = "vcs-status-daemon")]
 #[command(about = "Fast jj status for shell prompts")]
@@ -37,10 +22,6 @@ struct Cli {
     /// Path to the jj repository (default: auto-detect)
     #[arg(long)]
     repo: Option<PathBuf>,
-
-    /// Whether to check the file cache before querying the daemon
-    #[arg(long, default_value = "yes")]
-    use_cache: BoolFlag,
 }
 
 #[derive(Subcommand)]
@@ -56,9 +37,6 @@ enum Commands {
         /// Path to the jj repository
         #[arg(long)]
         repo: Option<PathBuf>,
-        /// Whether to check the file cache before querying the daemon
-        #[arg(long, default_value = "yes")]
-        use_cache: BoolFlag,
     },
     /// Shut down the daemon
     Shutdown,
@@ -92,11 +70,10 @@ enum ConfigAction {
 }
 
 /// Fast-path arg parsing for the common client case.
-/// Returns `Some((path, use_cache))` for a direct query, or `None` to fall through to clap.
-fn try_fast_args() -> Option<(Option<PathBuf>, bool)> {
+/// Returns `Some(path)` for a direct query, or `None` to fall through to clap.
+fn try_fast_args() -> Option<Option<PathBuf>> {
     let mut args = std::env::args_os().skip(1);
     let mut repo = None;
-    let mut use_cache = true;
 
     loop {
         let arg = match args.next() {
@@ -111,22 +88,14 @@ fn try_fast_args() -> Option<(Option<PathBuf>, bool)> {
             "--repo" => {
                 repo = Some(PathBuf::from(args.next()?));
             }
-            "--use-cache" => {
-                let val = args.next()?.to_str()?.to_string();
-                use_cache = matches!(val.as_str(), "yes" | "true" | "1");
-            }
-            _ if s.starts_with("--use-cache=") => {
-                let val = &s["--use-cache=".len()..];
-                use_cache = matches!(val, "yes" | "true" | "1");
-            }
             _ => return None,
         }
     }
 
-    Some((repo, use_cache))
+    Some(repo)
 }
 
-fn run_query(path: Option<PathBuf>, use_cache: bool) -> anyhow::Result<()> {
+fn run_query(path: Option<PathBuf>) -> anyhow::Result<()> {
     let path = match path {
         Some(p) => p,
         None => match std::env::current_dir() {
@@ -135,7 +104,7 @@ fn run_query(path: Option<PathBuf>, use_cache: bool) -> anyhow::Result<()> {
         },
     };
 
-    let status = client::query(&path, use_cache)?;
+    let status = client::query(&path)?;
     if !status.is_empty() {
         print!("{status}");
     }
@@ -144,8 +113,8 @@ fn run_query(path: Option<PathBuf>, use_cache: bool) -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     // Fast path: skip clap and tokio for the common no-subcommand client case
-    if let Some((repo, use_cache)) = try_fast_args() {
-        return run_query(repo, use_cache);
+    if let Some(repo) = try_fast_args() {
+        return run_query(repo);
     }
 
     // Slow path: full clap parsing, tokio runtime only started for daemon
@@ -225,11 +194,11 @@ fn run_clap() -> anyhow::Result<()> {
         Some(Commands::Config { action }) => {
             run_config(action)?;
         }
-        Some(Commands::Query { repo, use_cache }) => {
-            run_query(repo.or(cli.repo), use_cache.0)?;
+        Some(Commands::Query { repo }) => {
+            run_query(repo.or(cli.repo))?;
         }
         None => {
-            run_query(cli.repo, cli.use_cache.0)?;
+            run_query(cli.repo)?;
         }
     }
 
