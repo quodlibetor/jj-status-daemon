@@ -12,6 +12,7 @@ pub enum Request {
     Query { repo_path: String },
     Flush,
     Shutdown,
+    DaemonStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -20,6 +21,11 @@ pub enum Response {
     Status { formatted: String },
     Error { message: String },
     Ok,
+    DaemonStatus {
+        pid: u32,
+        uptime_secs: u64,
+        watched_repos: Vec<String>,
+    },
 }
 
 #[cfg(test)]

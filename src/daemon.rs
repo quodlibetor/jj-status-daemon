@@ -23,6 +23,7 @@ struct DaemonState {
     /// Maps arbitrary directories to their repo root and VCS kind. Negatives are not cached.
     dir_to_repo: HashMap<PathBuf, (PathBuf, VcsKind)>,
     last_query: Instant,
+    started_at: Instant,
     config: Config,
     cache_dir: PathBuf,
 }
@@ -106,6 +107,7 @@ pub async fn run_daemon(config: Config, runtime_dir: PathBuf) -> Result<()> {
         watchers: HashMap::new(),
         dir_to_repo: HashMap::new(),
         last_query: Instant::now(),
+        started_at: Instant::now(),
         config: config.clone(),
         cache_dir: cache_dir.clone(),
     }));
@@ -324,6 +326,25 @@ async fn handle_connection(
             send_response(&mut writer, Response::Ok).await?;
             shutdown.notify_one();
             Ok(())
+        }
+        Request::DaemonStatus => {
+            let st = state.lock().await;
+            let watched_repos = st
+                .watchers
+                .keys()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            let uptime_secs = st.started_at.elapsed().as_secs();
+            drop(st);
+            send_response(
+                &mut writer,
+                Response::DaemonStatus {
+                    pid: std::process::id(),
+                    uptime_secs,
+                    watched_repos,
+                },
+            )
+            .await
         }
     }
 }

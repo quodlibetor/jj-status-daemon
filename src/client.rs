@@ -44,6 +44,7 @@ fn extract_status(response: Response) -> Result<String> {
         Response::Status { formatted } => Ok(formatted),
         Response::Error { message } => anyhow::bail!("{message}"),
         Response::Ok => Ok(String::new()),
+        _ => Ok(String::new()),
     }
 }
 
@@ -132,6 +133,48 @@ pub fn restart() -> Result<()> {
     Ok(())
 }
 
+pub fn status() -> Result<()> {
+    let socket_path = config::socket_path();
+    let pid_path = config::pid_path();
+
+    match send_request(&socket_path, &Request::DaemonStatus) {
+        Ok(Response::DaemonStatus {
+            pid,
+            uptime_secs,
+            watched_repos,
+        }) => {
+            let hours = uptime_secs / 3600;
+            let mins = (uptime_secs % 3600) / 60;
+            let secs = uptime_secs % 60;
+            eprintln!("daemon running");
+            eprintln!("  pid:           {pid}");
+            eprintln!("  uptime:        {hours}h {mins}m {secs}s");
+            eprintln!("  watched repos: {}", watched_repos.len());
+            for repo in &watched_repos {
+                eprintln!("    {repo}");
+            }
+            eprintln!("  socket:        {}", socket_path.display());
+            Ok(())
+        }
+        Ok(Response::Error { message }) => anyhow::bail!("{message}"),
+        Ok(_) => anyhow::bail!("unexpected response from daemon"),
+        Err(_) => {
+            // Daemon not running — check for stale pidfile
+            let stale_pid = std::fs::read_to_string(&pid_path).ok();
+            eprintln!("daemon not running");
+            if let Some(pid) = stale_pid {
+                eprintln!(
+                    "  stale pidfile: {} (pid {})",
+                    pid_path.display(),
+                    pid.trim()
+                );
+            }
+            eprintln!("  socket: {}", socket_path.display());
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +223,81 @@ mod tests {
             .await
             .unwrap();
         unsafe { std::env::remove_var("VCS_STATUS_DAEMON_DIR") };
+    }
+
+    #[tokio::test]
+    async fn test_status_daemon_running() {
+        let rt = TempDir::with_prefix("vcs-test-status-running-").unwrap();
+        let socket_path = rt.path().join("sock");
+
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+
+        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Send DaemonStatus request directly via the socket
+        let sp = socket_path.clone();
+        let result = tokio::task::spawn_blocking(move || send_request(&sp, &Request::DaemonStatus))
+            .await
+            .unwrap()
+            .unwrap();
+
+        match result {
+            Response::DaemonStatus {
+                pid,
+                uptime_secs,
+                watched_repos,
+            } => {
+                assert!(pid > 0);
+                assert!(uptime_secs < 10); // just started
+                assert!(watched_repos.is_empty()); // no queries yet
+            }
+            other => panic!("expected DaemonStatus, got {other:?}"),
+        }
+
+        // Verify pidfile was created
+        assert!(rt.path().join("pid").exists());
+
+        let sp = socket_path.clone();
+        tokio::task::spawn_blocking(move || send_request(&sp, &Request::Shutdown).ok())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_status_daemon_not_running() {
+        let rt = TempDir::with_prefix("vcs-test-status-notrunning-").unwrap();
+        let socket_path = rt.path().join("sock");
+
+        // No daemon started — send_request should fail
+        let sp = socket_path.clone();
+        let result = tokio::task::spawn_blocking(move || send_request(&sp, &Request::DaemonStatus))
+            .await
+            .unwrap();
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_status_stale_pidfile() {
+        let rt = TempDir::with_prefix("vcs-test-status-stalepid-").unwrap();
+        let socket_path = rt.path().join("sock");
+        let pid_path = rt.path().join("pid");
+
+        // Write a stale pidfile (PID that doesn't correspond to our daemon)
+        std::fs::write(&pid_path, "999999").unwrap();
+
+        // No daemon running — send_request should fail
+        let sp = socket_path.clone();
+        let result = tokio::task::spawn_blocking(move || send_request(&sp, &Request::DaemonStatus))
+            .await
+            .unwrap();
+
+        assert!(result.is_err());
+        // But the pidfile still exists (stale)
+        assert!(pid_path.exists());
     }
 }
