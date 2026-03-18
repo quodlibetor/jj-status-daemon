@@ -785,7 +785,13 @@ mod tests {
 
     /// Helper: start the daemon as a subprocess and wait for it to be ready.
     async fn spawn_daemon_process(runtime_dir: &std::path::Path) -> tokio::process::Child {
-        let exe = assert_cmd::cargo::cargo_bin("vcs-status-daemon");
+        let exe = escargot::CargoBuild::new()
+            .bin("vcs-status-daemon")
+            .current_target()
+            .run()
+            .expect("failed to build vcs-status-daemon")
+            .path()
+            .to_path_buf();
 
         let socket_path = runtime_dir.join("sock");
         let child = Command::new(&exe)

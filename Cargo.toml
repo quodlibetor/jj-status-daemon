@@ -32,7 +32,7 @@ toml = "1.0.6"
 ignore = "0.4.25"
 
 [dev-dependencies]
-assert_cmd = "2"
+escargot = "0.5"
 tempfile = "3"
 tokio = { version = "1", features = [
   "rt",
