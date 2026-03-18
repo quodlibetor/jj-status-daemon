@@ -132,7 +132,6 @@ pub fn find_repo_root(start: &Path) -> Option<(PathBuf, VcsKind)> {
     }
 }
 
-
 pub fn config_path() -> Option<PathBuf> {
     // Check XDG-style ~/.config first (cross-platform, and what most CLI tools use on macOS),
     // then fall back to the platform-native config dir (~/Library/Application Support on macOS).
@@ -180,10 +179,10 @@ pub const DEFAULT_CONFIG_TOML: &str = r##"# vcs-status-daemon configuration
 # --------------------------------------------------------------------------
 # The status output is rendered using the Tera template engine (Jinja2-like).
 #
-# Built-in templates: "ascii" (default), "nerdfont"
+# Built-in templates: "ascii" (default), "nerdfont", "unicode", "simple"
 # Select one with template_name, or define your own below.
 
-# Which template to use. Built-in options: "ascii", "nerdfont"
+# Which template to use. Built-in options: "ascii", "nerdfont", "unicode", "simple"
 # template_name = "ascii"
 
 # Override template_name with an inline format string.

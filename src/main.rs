@@ -57,6 +57,25 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Preview and test templates
+    Template {
+        #[command(subcommand)]
+        action: TemplateAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TemplateAction {
+    /// List all built-in templates with representative outputs
+    List,
+    /// Render a template with representative examples and the current repo
+    Format {
+        /// Template format string (Tera/Jinja2 syntax)
+        template: String,
+        /// Path to a repository to show live status
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -83,8 +102,8 @@ fn try_fast_args() -> Option<Option<PathBuf>> {
         let s = arg.to_str()?;
         match s {
             // Subcommands and help flags → fall through to clap
-            "daemon" | "shutdown" | "query" | "config" | "init" | "restart" | "status" | "-h"
-            | "--help" | "--version" => return None,
+            "daemon" | "shutdown" | "query" | "config" | "init" | "restart" | "status"
+            | "template" | "-h" | "--help" | "--version" => return None,
             "--repo" => {
                 repo = Some(PathBuf::from(args.next()?));
             }
@@ -169,6 +188,91 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn print_template_samples(tmpl: &str, color: bool) {
+    let samples = template::sample_statuses();
+    for (label, status) in &samples {
+        let rendered = template::format_status(status, tmpl, color);
+        eprintln!("  {label:25} {rendered}");
+    }
+}
+
+fn query_live_status(repo_path: &std::path::Path) -> anyhow::Result<template::RepoStatus> {
+    let config = config::load_config()?;
+    let rt = build_runtime();
+    rt.block_on(async {
+        let repo_path = repo_path.canonicalize()?;
+        // Detect VCS type
+        if repo_path.join(".jj").is_dir() {
+            jj::query_jj_status(&repo_path, &config, false).await
+        } else if repo_path.join(".git").exists() {
+            git::query_git_status(&repo_path, &config).await
+        } else {
+            // Walk up to find repo root
+            let mut p = repo_path.as_path();
+            loop {
+                if p.join(".jj").is_dir() {
+                    return jj::query_jj_status(p, &config, false).await;
+                }
+                if p.join(".git").exists() {
+                    return git::query_git_status(p, &config).await;
+                }
+                match p.parent() {
+                    Some(parent) => p = parent,
+                    None => anyhow::bail!("no VCS repo found at {}", repo_path.display()),
+                }
+            }
+        }
+    })
+}
+
+fn run_template(action: TemplateAction) -> anyhow::Result<()> {
+    let color = std::io::IsTerminal::is_terminal(&std::io::stderr());
+
+    match action {
+        TemplateAction::List => {
+            for name in template::BUILTIN_NAMES {
+                let tmpl = template::builtin_template(name).unwrap();
+                eprintln!("\x1b[1m{name}\x1b[0m:");
+                print_template_samples(tmpl, color);
+                eprintln!();
+            }
+        }
+        TemplateAction::Format {
+            template: tmpl,
+            repo,
+        } => {
+            // Validate template first
+            if let Err(e) = template::validate_template(&tmpl) {
+                anyhow::bail!("{e}");
+            }
+
+            eprintln!("\x1b[1mSample outputs:\x1b[0m");
+            print_template_samples(&tmpl, color);
+
+            // Try to show live repo status
+            let repo_path = repo
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+
+            if !repo_path.as_os_str().is_empty() {
+                match query_live_status(&repo_path) {
+                    Ok(status) => {
+                        let rendered = template::format_status(&status, &tmpl, color);
+                        eprintln!();
+                        eprintln!("\x1b[1mCurrent repo ({}):\x1b[0m", repo_path.display());
+                        eprintln!("  {rendered}");
+                    }
+                    Err(e) => {
+                        eprintln!();
+                        eprintln!("  (could not query repo: {e})");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_clap() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -193,6 +297,9 @@ fn run_clap() -> anyhow::Result<()> {
         }
         Some(Commands::Config { action }) => {
             run_config(action)?;
+        }
+        Some(Commands::Template { action }) => {
+            run_template(action)?;
         }
         Some(Commands::Query { repo }) => {
             run_query(repo.or(cli.repo))?;

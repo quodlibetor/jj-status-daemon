@@ -6,7 +6,7 @@ use tera::Tera;
 /// jj: `xlvlt main [3 +10-5]`
 /// git: `main abc1234 [3 +10-5]`
 pub const ASCII_FORMAT: &str = "\
-{% if is_jj %}{{ MAGENTA }}JJ{{ RST }}{{ change_id }}\
+{% if is_jj %}{{ MAGENTA }}JJ{{ RST }} {{ change_id }}\
 {% for b in bookmarks %} {{ BLUE }}{{ b.display }}{{ RST }}{% endfor %}\
 {% elif is_git %}{{ GREEN }}+{{ RED }}-{{ RST }} {{ BLUE }}{{ branch }}{{ RST }} {{ commit_id }}\
 {% endif %}\
@@ -20,7 +20,7 @@ pub const ASCII_FORMAT: &str = "\
 {% if hidden %} {{ BRIGHT_YELLOW }}HIDDEN{{ RST }}{% endif %}\
 {% if immutable %} {{ YELLOW }}IMMUTABLE{{ RST }}{% endif %}\
 {% if empty %} {{ BLUE }}({{ RST }}EMPTY{{ BLUE }}){{ RST }}{% endif %}\
-{% if not is_default_workspace %} {{ BRIGHT_GREEN }}/\\({{ RST }}{{ workspace_name }}{{ BRIGHT_GREEN }}/\\{{ RST }}{% endif %}";
+{% if not is_default_workspace %} {{ BRIGHT_GREEN }}/{{ RST }}{{ workspace_name }}{{ BRIGHT_GREEN }}\\{{ RST }}{% endif %}";
 
 /// Built-in "nerdfont" template — requires a Nerd Font.
 ///
@@ -36,12 +36,61 @@ pub const NERDFONT_FORMAT: &str = "\
 {{ BRIGHT_GREEN }}+{{ total_lines_added }}{{ RST }} \
 {{ BRIGHT_RED }}-{{ total_lines_removed }}{{ RST }}\
 {{ BLUE }}]{{ RST }}{% endif %}\
-{% if conflict %} {{ BRIGHT_RED }}{{ RST }}{% endif %}\
-{% if divergent %} {{ BRIGHT_RED }}{{ RST }}{% endif %}\
+{% if conflict %} {{ BRIGHT_RED }}\u{f46e}{{ RST }}{% endif %}\
+{% if divergent %} {{ BRIGHT_RED }}\u{f00fb}{{ RST }}{% endif %}\
 {% if hidden %} {{ BRIGHT_YELLOW }}󰘌{{ RST }}{% endif %}\
 {% if immutable %} {{ YELLOW }}{{ RST }}{% endif %}\
 {% if empty %} {{ DIM }}∅{{ RST }}{% endif %}\
 {% if not is_default_workspace %} {{ BRIGHT_GREEN }}\u{F0405} ({{ RST }}{{ workspace_name }}{{ BRIGHT_GREEN }}){{ RST }}{% endif %}";
+
+/// Built-in "unicode" template — uses Unicode symbols (no Nerd Fonts needed).
+///
+/// jj: `\u{203B} xlvlt \u{2261} main \u{300C}3 +10\u{2212}5\u{300D}`
+/// git: `\u{00B1} main abc1234 \u{300C}3 +10\u{2212}5\u{300D}`
+pub const UNICODE_FORMAT: &str = "\
+{% if is_jj %}{{ MAGENTA }}\u{203B}{{ RST }} {{ change_id }}\
+{% for b in bookmarks %} {{ BLUE }}\u{2261} {{ b.display }}{{ RST }}{% endfor %}\
+{% elif is_git %}{{ BLUE }}\u{00B1}{{ RST }} {{ BLUE }}{{ branch }}{{ RST }} {{ commit_id }}\
+{% endif %}\
+{% if total_files_changed > 0 %} {{ BLUE }}[{{ RST }}\
+{{- BRIGHT_BLUE }}{{- total_files_changed }}{{ RST }} \
+{{ BRIGHT_GREEN }}+{{ total_lines_added }}{{ RST }}\
+{{ BRIGHT_RED }}-{{ total_lines_removed }}{{ RST }}\
+{{ BLUE }}]{{ RST }}{% endif %}\
+{% if conflict %} {{ BRIGHT_RED }}\u{2717}{{ RST }}{% endif %}\
+{% if divergent %} {{ BRIGHT_RED }}\u{2ADD}{{ RST }}{% endif %}\
+{% if hidden %} {{ BRIGHT_YELLOW }}\u{25CC}{{ RST }}{% endif %}\
+{% if immutable %} {{ YELLOW }}\u{2205}{{ RST }}{% endif %}\
+{% if empty %} {{ DIM }}\u{2205}{{ RST }}{% endif %}\
+{% if not is_default_workspace %} {{ BRIGHT_GREEN }}\u{6728}({{ RST }}{{ workspace_name }}{{ BRIGHT_GREEN }}){{ RST }}{% endif %}";
+
+/// Built-in "simple" template — just branch/bookmark, color-coded by dirty state.
+///
+/// Clean: green branch name. Dirty: yellow branch name.
+/// jj: `main` or `xlvlt`  git: `main`
+pub const SIMPLE_FORMAT: &str = "\
+{% if is_jj %}\
+{% if bookmarks and bookmarks[0].distance == 0 %}\
+{{ GREEN }}{{ bookmarks[0].name }}{{ RST }}\
+{% elif description %}\
+{{ GREEN }}{{ description }}{{ RST }}\
+{% elif bookmarks and bookmarks[0].distance == 1 %}\
+{% if empty %}{{ GREEN }}{% else %}{{ YELLOW }}{% endif %}\
+{{ bookmarks[0].name }}{{ RST }}\
+{% else %}\
+{% if empty %}{{ GREEN }}{% else %}{{ YELLOW }}{% endif %}\
+{{ change_id }}{{ RST }}\
+{% endif %}\
+{% elif is_git %}\
+{% if files_changed > 0 %}{{ RED }}\
+{% elif staged_files_changed > 0 %}{{ YELLOW }}\
+{% else %}{{ GREEN }}\
+{% endif %}\
+{{ branch }}{{ RST }}\
+{% endif %}\
+{% if not is_default_workspace %}{{ BRIGHT_GREEN }} \u{6728}{{ RST }}{% endif %}\
+{% if conflict %} {{ BRIGHT_RED }}CONFLICT{{ RST }}{% endif %}\
+{% if divergent %} {{ BRIGHT_RED }}DIVERGENT{{ RST }}{% endif %}";
 
 /// Built-in "not ready" template for when the daemon hasn't cached status yet.
 /// Only color variables are available — no repo status values.
@@ -238,11 +287,182 @@ pub fn validate_template(template: &str) -> Result<(), String> {
     }
 }
 
+/// All built-in template names, in display order.
+pub const BUILTIN_NAMES: &[&str] = &["ascii", "nerdfont", "unicode", "simple"];
+
+/// Representative sample statuses for template previews.
+pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
+    vec![
+        (
+            "jj: clean, on bookmark",
+            RepoStatus {
+                is_jj: true,
+                change_id: "xlvltmpk".into(),
+                commit_id: "abc12345".into(),
+                description: "refactor auth".into(),
+                empty: true,
+                bookmarks: vec![Bookmark {
+                    name: "main".into(),
+                    distance: 0,
+                    display: "main".into(),
+                }],
+                ..Default::default()
+            },
+        ),
+        (
+            "jj: dirty, bookmark ahead",
+            RepoStatus {
+                is_jj: true,
+                change_id: "mrtunzqw".into(),
+                commit_id: "def23456".into(),
+                description: "add tests".into(),
+                bookmarks: vec![Bookmark {
+                    name: "main".into(),
+                    distance: 2,
+                    display: "main+2".into(),
+                }],
+                files_changed: 3,
+                lines_added: 10,
+                lines_removed: 5,
+                total_files_changed: 3,
+                total_lines_added: 10,
+                total_lines_removed: 5,
+                ..Default::default()
+            },
+        ),
+        (
+            "jj: new, working",
+            RepoStatus {
+                is_jj: true,
+                change_id: "qstvwxyz".into(),
+                commit_id: "mno45678".into(),
+                bookmarks: vec![Bookmark {
+                    name: "main".into(),
+                    distance: 1,
+                    display: "main+1".into(),
+                }],
+                files_changed: 2,
+                lines_added: 8,
+                lines_removed: 1,
+                total_files_changed: 2,
+                total_lines_added: 8,
+                total_lines_removed: 1,
+                ..Default::default()
+            },
+        ),
+        (
+            "jj: conflict",
+            RepoStatus {
+                is_jj: true,
+                change_id: "npqrsvyx".into(),
+                commit_id: "ghi34567".into(),
+                conflict: true,
+                empty: true,
+                bookmarks: vec![Bookmark {
+                    name: "feat".into(),
+                    distance: 0,
+                    display: "feat".into(),
+                }],
+                ..Default::default()
+            },
+        ),
+        (
+            "jj: divergent",
+            RepoStatus {
+                is_jj: true,
+                change_id: "wkqolyzp".into(),
+                commit_id: "jkl45678".into(),
+                divergent: true,
+                empty: true,
+                bookmarks: vec![Bookmark {
+                    name: "main".into(),
+                    distance: 1,
+                    display: "main+1".into(),
+                }],
+                ..Default::default()
+            },
+        ),
+        (
+            "git: clean",
+            RepoStatus {
+                is_git: true,
+                branch: "main".into(),
+                commit_id: "abc1234".into(),
+                description: "initial commit".into(),
+                ..Default::default()
+            },
+        ),
+        (
+            "git: staged only",
+            RepoStatus {
+                is_git: true,
+                branch: "feature".into(),
+                commit_id: "def5678".into(),
+                description: "wip".into(),
+                staged_files_changed: 2,
+                staged_lines_added: 15,
+                staged_lines_removed: 3,
+                total_files_changed: 2,
+                total_lines_added: 15,
+                total_lines_removed: 3,
+                ..Default::default()
+            },
+        ),
+        (
+            "git: unstaged changes",
+            RepoStatus {
+                is_git: true,
+                branch: "develop".into(),
+                commit_id: "789abcd".into(),
+                description: "fix bug".into(),
+                files_changed: 1,
+                lines_added: 4,
+                lines_removed: 2,
+                total_files_changed: 1,
+                total_lines_added: 4,
+                total_lines_removed: 2,
+                ..Default::default()
+            },
+        ),
+        (
+            "jj: named workspace",
+            RepoStatus {
+                is_jj: true,
+                change_id: "bfglmprs".into(),
+                commit_id: "pqr56789".into(),
+                empty: true,
+                bookmarks: vec![Bookmark {
+                    name: "main".into(),
+                    distance: 0,
+                    display: "main".into(),
+                }],
+                workspace_name: "secondary".into(),
+                is_default_workspace: false,
+                ..Default::default()
+            },
+        ),
+        (
+            "git: linked worktree",
+            RepoStatus {
+                is_git: true,
+                branch: "hotfix".into(),
+                commit_id: "stu7890".into(),
+                description: "urgent fix".into(),
+                workspace_name: "hotfix-wt".into(),
+                is_default_workspace: false,
+                ..Default::default()
+            },
+        ),
+    ]
+}
+
 /// Look up a built-in template by name.
 pub fn builtin_template(name: &str) -> Option<&'static str> {
     match name {
         "ascii" => Some(ASCII_FORMAT),
         "nerdfont" => Some(NERDFONT_FORMAT),
+        "unicode" => Some(UNICODE_FORMAT),
+        "simple" => Some(SIMPLE_FORMAT),
         _ => None,
     }
 }
@@ -337,7 +557,7 @@ mod tests {
             ..Default::default()
         };
         let formatted = format_status(&status, ASCII_FORMAT, false);
-        assert_eq!(formatted, "mrtu main [3 +10-5]");
+        assert_eq!(formatted, "JJ mrtu main [3 +10-5]");
     }
 
     #[test]
@@ -350,7 +570,7 @@ mod tests {
             ..Default::default()
         };
         let formatted = format_status(&status, ASCII_FORMAT, false);
-        assert_eq!(formatted, "mrtu (EMPTY)");
+        assert_eq!(formatted, "JJ mrtu (EMPTY)");
     }
 
     #[test]
@@ -365,7 +585,7 @@ mod tests {
             ..Default::default()
         };
         let formatted = format_status(&status, ASCII_FORMAT, false);
-        assert_eq!(formatted, "main abc1234 [3 +10-5]");
+        assert_eq!(formatted, "+- main abc1234 [3 +10-5]");
     }
 
     #[test]
@@ -378,7 +598,7 @@ mod tests {
             ..Default::default()
         };
         let formatted = format_status(&status, ASCII_FORMAT, false);
-        assert_eq!(formatted, "main abc1234 (EMPTY)");
+        assert_eq!(formatted, "+- main abc1234 (EMPTY)");
     }
 
     #[test]
@@ -403,9 +623,9 @@ mod tests {
     fn test_format_toml_multiline_matches_default() {
         let toml_str = r#"
 format = '''
-{% if is_jj %}{{ change_id }}
+{% if is_jj %}{{ MAGENTA }}JJ{{ RST }} {{ change_id }}
 {%- for b in bookmarks %} {{ BLUE }}{{ b.display }}{{ RST }}{% endfor %}
-{%- elif is_git %}{{ BLUE }}{{ branch }}{{ RST }} {{ commit_id }}
+{%- elif is_git %}{{ GREEN }}+{{ RED }}-{{ RST }} {{ BLUE }}{{ branch }}{{ RST }} {{ commit_id }}
 {%- endif %}
 {%- if total_files_changed > 0 %} {{ BLUE }}[{{ RST }}{{ BRIGHT_BLUE }}{{ total_files_changed }}{{ RST }} {{ BRIGHT_GREEN }}+{{ total_lines_added }}{{ RST }}{{ BRIGHT_RED }}-{{ total_lines_removed }}{{ RST }}{{ BLUE }}]{{ RST }}{% endif %}
 {%- if conflict %} {{ BRIGHT_RED }}CONFLICT{{ RST }}{% endif %}
@@ -413,7 +633,7 @@ format = '''
 {%- if hidden %} {{ BRIGHT_YELLOW }}HIDDEN{{ RST }}{% endif %}
 {%- if immutable %} {{ YELLOW }}IMMUTABLE{{ RST }}{% endif %}
 {%- if empty %} {{ BLUE }}({{ RST }}EMPTY{{ BLUE }}){{ RST }}{% endif %}
-{%- if not is_default_workspace %} {{ BRIGHT_GREEN }}/\{{ RST }}{{ workspace_name }}{% endif %}'''
+{%- if not is_default_workspace %} {{ BRIGHT_GREEN }}/\({{ RST }}{{ workspace_name }}{{ BRIGHT_GREEN }}/\{{ RST }}{% endif %}'''
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
 
@@ -571,6 +791,290 @@ format = '''
         assert!(
             !formatted.contains("EMPTY"),
             "nerdfont should use ∅ not EMPTY: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_unicode_jj() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 0,
+                display: "main".into(),
+            }],
+            total_files_changed: 3,
+            total_lines_added: 10,
+            total_lines_removed: 5,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, UNICODE_FORMAT, false);
+        assert!(
+            formatted.contains("\u{203B}"),
+            "expected reference mark: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("mrtu"),
+            "expected change_id: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("\u{2261}"),
+            "expected equiv sign for bookmark: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("main"),
+            "expected bookmark: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("["),
+            "expected left bracket: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_unicode_git() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            commit_id: "abc1234".to_string(),
+            ..Default::default()
+        };
+        let formatted = format_status(&status, UNICODE_FORMAT, false);
+        assert!(
+            formatted.contains("\u{00B1}"),
+            "expected plus-minus sign: {formatted:?}"
+        );
+        assert!(formatted.contains("main"), "expected branch: {formatted:?}");
+    }
+
+    #[test]
+    fn test_unicode_workspace() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            workspace_name: "secondary".to_string(),
+            is_default_workspace: false,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, UNICODE_FORMAT, false);
+        assert!(
+            formatted.contains("\u{6728}"),
+            "expected kanji tree: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("secondary"),
+            "expected workspace name: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_simple_jj_on_bookmark() {
+        // Case 1: on a bookmark → always green, show bookmark name
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            files_changed: 3, // dirty doesn't matter — still green
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 0,
+                display: "main".into(),
+            }],
+            ..Default::default()
+        };
+        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        assert!(
+            formatted.contains("main"),
+            "expected bookmark: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("\x1b[32m"),
+            "expected green ANSI: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_simple_jj_described() {
+        // Case 1: has description, no bookmark → always green, show description
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            description: "fix auth".to_string(),
+            files_changed: 2,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        assert!(
+            formatted.contains("fix auth"),
+            "expected description: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("\x1b[32m"),
+            "expected green ANSI: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_simple_jj_one_ahead_empty() {
+        // Case 2: undescribed, 1 ahead of bookmark, empty → green, show bookmark
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            empty: true,
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 1,
+                display: "main+1".into(),
+            }],
+            ..Default::default()
+        };
+        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        assert!(
+            formatted.contains("main"),
+            "expected bookmark: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("\x1b[32m"),
+            "expected green ANSI: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_simple_jj_one_ahead_dirty() {
+        // Case 2: undescribed, 1 ahead of bookmark, has changes → yellow, show bookmark
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            empty: false,
+            files_changed: 2,
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 1,
+                display: "main+1".into(),
+            }],
+            ..Default::default()
+        };
+        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        assert!(
+            formatted.contains("main"),
+            "expected bookmark: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("\x1b[33m"),
+            "expected yellow ANSI: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_simple_jj_no_nearby_bookmark_empty() {
+        // Case 3: no bookmark or description, empty → green, show change_id
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            empty: true,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        assert!(
+            formatted.contains("mrtu"),
+            "expected change_id: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("\x1b[32m"),
+            "expected green ANSI: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_simple_jj_no_nearby_bookmark_dirty() {
+        // Case 3: no bookmark or description, has changes → yellow, show change_id
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            empty: false,
+            files_changed: 1,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        assert!(
+            formatted.contains("mrtu"),
+            "expected change_id: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("\x1b[33m"),
+            "expected yellow ANSI: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_simple_jj_far_bookmark_falls_through() {
+        // Bookmark at distance 3, undescribed → case 3 (show change_id)
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            empty: false,
+            files_changed: 1,
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 3,
+                display: "main+3".into(),
+            }],
+            ..Default::default()
+        };
+        let formatted = format_status(&status, SIMPLE_FORMAT, false);
+        assert_eq!(formatted, "mrtu");
+    }
+
+    #[test]
+    fn test_simple_git_clean() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            ..Default::default()
+        };
+        let formatted = format_status(&status, SIMPLE_FORMAT, false);
+        assert_eq!(formatted, "main");
+    }
+
+    #[test]
+    fn test_simple_git_unstaged() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "develop".to_string(),
+            files_changed: 2,
+            total_files_changed: 2,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        assert!(
+            formatted.contains("develop"),
+            "expected branch: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("\x1b[31m"),
+            "expected red ANSI for unstaged: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_simple_git_staged_only() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "feature".to_string(),
+            staged_files_changed: 1,
+            staged_lines_added: 3,
+            total_files_changed: 1,
+            total_lines_added: 3,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        assert!(
+            formatted.contains("feature"),
+            "expected branch: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("\x1b[33m"),
+            "expected yellow ANSI for staged: {formatted:?}"
         );
     }
 
