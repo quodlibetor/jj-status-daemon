@@ -64,6 +64,14 @@ Or go to the [Releases](https://github.com/quodlibetor/vcs-status-daemon/release
 
 ### Shell prompt integration
 
+The easiest thing to do is to just stick it in your prompt, this will work and averages ~2ms for me:
+
+```zsh
+PS1='$(vcs-status-daemon) \$ '
+```
+
+To be even faster you can avoid a subprocess spawn by initializing a shell function.
+
 Add the following to your shell rc file. This sets a `VCS_STATUS` environment variable before each prompt — use it in your prompt however you like.
 
 ```zsh
