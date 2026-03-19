@@ -1,0 +1,16 @@
+{% if is_jj -%}
+  {{ "※" | magenta }} {{ change_id }}
+  {%- for b in bookmarks %} {{ "≡ " | blue }}{{ b.display | blue }}{% endfor %}
+{%- elif is_git -%}
+  {{ "±" | blue }} {{ branch | blue }} {{ commit_id }}
+{%- endif -%}
+{% if total_files_changed > 0 %} {{ "[" | blue }}
+  {{- total_files_changed | bright_blue }} {{ "+" ~ total_lines_added | bright_green }}
+  {{- "-" ~ total_lines_removed | bright_red }}{{ "]" | blue }}
+{%- endif -%}
+{% if conflict %} {{ "✗" | bright_red }}{% endif -%}
+{% if divergent %} {{ "⫝" | bright_red }}{% endif -%}
+{% if hidden %} {{ "◌" | bright_yellow }}{% endif -%}
+{% if immutable %} {{ "∅" | yellow }}{% endif -%}
+{% if empty %} {{ "∅" | dim }}{% endif -%}
+{% if not is_default_workspace %} {{ "木(" | bright_green }}{{ workspace_name }}{{ ")" | bright_green }}{% endif %}

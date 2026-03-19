@@ -1,0 +1,22 @@
+{% if is_jj -%}
+  {% if bookmarks and bookmarks[0].distance == 0 -%}
+    {{ bookmarks[0].name | green }}
+  {%- elif description -%}
+    {{ description | green }}
+  {%- elif bookmarks and bookmarks[0].distance == 1 -%}
+    {% if empty %}{{ bookmarks[0].name | green }}{% else %}{{ bookmarks[0].name | yellow }}{% endif %}
+  {%- else -%}
+    {% if empty %}{{ change_id | green }}{% else %}{{ change_id | yellow }}{% endif %}
+  {%- endif -%}
+{%- elif is_git -%}
+  {% if files_changed > 0 -%}
+    {{ branch | red }}
+  {%- elif staged_files_changed > 0 -%}
+    {{ branch | yellow }}
+  {%- else -%}
+    {{ branch | green }}
+  {%- endif -%}
+{%- endif -%}
+{% if not is_default_workspace %} {{ "木" | bright_green }}{% endif -%}
+{% if conflict %} {{ "CONFLICT" | bright_red }}{% endif -%}
+{% if divergent %} {{ "DIVERGENT" | bright_red }}{% endif %}

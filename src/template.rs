@@ -5,94 +5,30 @@ use tera::Tera;
 ///
 /// jj: `JJ xlvlt main [3 +10-5]`
 /// git: `+- main abc1234 [3 +10-5]`
-pub const ASCII_FORMAT: &str = "\
-{% if is_jj %}{{ \"JJ\" | magenta }} {{ change_id }}\
-{% for b in bookmarks %} {{ b.display | blue }}{% endfor %}\
-{% elif is_git %}{{ \"+\" | green }}{{ \"-\" | red }} {{ branch | blue }} {{ commit_id }}\
-{% endif %}\
-{% if total_files_changed > 0 %} {{ \"[\" | blue }}\
-{{ total_files_changed | bright_blue }} \
-{{ \"+\" | bright_green }}{{ total_lines_added | bright_green }}\
-{{ \"-\" | bright_red }}{{ total_lines_removed | bright_red }}\
-{{ \"]\" | blue }}{% endif %}\
-{% if conflict %} {{ \"CONFLICT\" | bright_red }}{% endif %}\
-{% if divergent %} {{ \"DIVERGENT\" | bright_red }}{% endif %}\
-{% if hidden %} {{ \"HIDDEN\" | bright_yellow }}{% endif %}\
-{% if immutable %} {{ \"IMMUTABLE\" | yellow }}{% endif %}\
-{% if empty %} {{ \"(\" | blue }}EMPTY{{ \")\" | blue }}{% endif %}\
-{% if not is_default_workspace %} {{ \"/\" | bright_green }}{{ workspace_name }}{{ \"\\\" | bright_green }}{% endif %}";
+pub const ASCII_FORMAT: &str = include_str!("templates/ascii.tera");
 
 /// Built-in "nerdfont" template — requires a Nerd Font.
 ///
 /// jj: `󱗆 xlvlt  main [3 +10 -5]`
 /// git: ` main abc1234 [3 +10 -5]`
-pub const NERDFONT_FORMAT: &str = "\
-{% if is_jj %}{{ \"\u{F15C6} \" | magenta }}{{ change_id }}\
-{% for b in bookmarks %} {{ b.display | blue }}{% endfor %}\
-{% elif is_git %}{{ \"\u{f02a2} \" | blue }}{{ branch | blue }} {{ commit_id }}\
-{% endif %}\
-{% if total_files_changed > 0 %} {{ \"[\" | blue }}\
-{{ total_files_changed | bright_blue }} \
-{{ \"+\" | bright_green }}{{ total_lines_added | bright_green }} \
-{{ \"-\" | bright_red }}{{ total_lines_removed | bright_red }}\
-{{ \"]\" | blue }}{% endif %}\
-{% if conflict %} {{ \"\u{f46e}\" | bright_red }}{% endif %}\
-{% if divergent %} {{ \"\u{f00fb}\" | bright_red }}{% endif %}\
-{% if hidden %} {{ \"\u{F0624}\" | bright_yellow }}{% endif %}\
-{% if immutable %} {{ \"\u{F033E}\" | yellow }}{% endif %}\
-{% if empty %} {{ \"\u{2205}\" | dim }}{% endif %}\
-{% if not is_default_workspace %} {{ \"\u{F0405} (\" | bright_green }}{{ workspace_name }}{{ \")\" | bright_green }}{% endif %}";
+pub const NERDFONT_FORMAT: &str = include_str!("templates/nerdfont.tera");
 
 /// Built-in "unicode" template — uses Unicode symbols (no Nerd Fonts needed).
 ///
 /// jj: `※ xlvlt ≡ main [3 +10-5]`
 /// git: `± main abc1234 [3 +10-5]`
-pub const UNICODE_FORMAT: &str = "\
-{% if is_jj %}{{ \"\u{203B}\" | magenta }} {{ change_id }}\
-{% for b in bookmarks %} {{ \"\u{2261} \" | blue }}{{ b.display | blue }}{% endfor %}\
-{% elif is_git %}{{ \"\u{00B1}\" | blue }} {{ branch | blue }} {{ commit_id }}\
-{% endif %}\
-{% if total_files_changed > 0 %} {{ \"[\" | blue }}\
-{{- total_files_changed | bright_blue }} \
-{{ \"+\" | bright_green }}{{ total_lines_added | bright_green }}\
-{{ \"-\" | bright_red }}{{ total_lines_removed | bright_red }}\
-{{ \"]\" | blue }}{% endif %}\
-{% if conflict %} {{ \"\u{2717}\" | bright_red }}{% endif %}\
-{% if divergent %} {{ \"\u{2ADD}\" | bright_red }}{% endif %}\
-{% if hidden %} {{ \"\u{25CC}\" | bright_yellow }}{% endif %}\
-{% if immutable %} {{ \"\u{2205}\" | yellow }}{% endif %}\
-{% if empty %} {{ \"\u{2205}\" | dim }}{% endif %}\
-{% if not is_default_workspace %} {{ \"\u{6728}(\" | bright_green }}{{ workspace_name }}{{ \")\" | bright_green }}{% endif %}";
+pub const UNICODE_FORMAT: &str = include_str!("templates/unicode.tera");
 
 /// Built-in "simple" template — just branch/bookmark, color-coded by dirty state.
 ///
 /// Clean: green branch name. Dirty: yellow branch name.
 /// jj: `main` or `xlvlt`  git: `main`
-pub const SIMPLE_FORMAT: &str = "\
-{% if is_jj %}\
-{% if bookmarks and bookmarks[0].distance == 0 %}\
-{{ bookmarks[0].name | green }}\
-{% elif description %}\
-{{ description | green }}\
-{% elif bookmarks and bookmarks[0].distance == 1 %}\
-{% if empty %}{{ bookmarks[0].name | green }}{% else %}{{ bookmarks[0].name | yellow }}{% endif %}\
-{% else %}\
-{% if empty %}{{ change_id | green }}{% else %}{{ change_id | yellow }}{% endif %}\
-{% endif %}\
-{% elif is_git %}\
-{% if files_changed > 0 %}{{ branch | red }}\
-{% elif staged_files_changed > 0 %}{{ branch | yellow }}\
-{% else %}{{ branch | green }}\
-{% endif %}\
-{% endif %}\
-{% if not is_default_workspace %} {{ \"\u{6728}\" | bright_green }}{% endif %}\
-{% if conflict %} {{ \"CONFLICT\" | bright_red }}{% endif %}\
-{% if divergent %} {{ \"DIVERGENT\" | bright_red }}{% endif %}";
+pub const SIMPLE_FORMAT: &str = include_str!("templates/simple.tera");
 
 /// Built-in "not ready" template for when the daemon hasn't cached status yet.
 /// Only color variables are available — no repo status values.
-pub const NOT_READY_ASCII: &str = "{{ \"\u{2026}\" | dim }}";
-pub const NOT_READY_NERDFONT: &str = "{{ \"\u{2026}\" | dim }}";
+pub const NOT_READY_ASCII: &str = include_str!("templates/not_ready.tera");
+pub const NOT_READY_NERDFONT: &str = include_str!("templates/not_ready.tera");
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Bookmark {
