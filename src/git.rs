@@ -1,199 +1,135 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::time::Duration;
-use tokio::process::Command;
 
 use crate::config::Config;
-use crate::jj::parse_diff_stat;
 use crate::template::RepoStatus;
 
-const VCS_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT2_TIMEOUT: Duration = Duration::from_secs(30);
 
-async fn run_git(repo_path: &Path, args: &[&str]) -> Result<String> {
-    let output = match tokio::time::timeout(
-        VCS_COMMAND_TIMEOUT,
-        Command::new("git")
-            .args(args)
-            .current_dir(repo_path)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    {
-        Ok(result) => result.context("failed to run git")?,
-        Err(_) => anyhow::bail!(
-            "git command timed out after {}s",
-            VCS_COMMAND_TIMEOUT.as_secs()
-        ),
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git command failed: {stderr}");
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+fn diff_stats(diff: &git2::Diff<'_>) -> Result<(u32, u32, u32)> {
+    let stats = diff.stats()?;
+    Ok((
+        stats.files_changed() as u32,
+        stats.insertions() as u32,
+        stats.deletions() as u32,
+    ))
 }
 
-pub async fn query_git_status(repo_path: &Path, _config: &Config) -> Result<RepoStatus> {
+fn query_git_status_blocking(repo_path: &Path) -> Result<RepoStatus> {
+    let repo = git2::Repository::open(repo_path).context("failed to open git repo")?;
+
     let mut status = RepoStatus {
         is_git: true,
         ..Default::default()
     };
 
-    let branch_fut = async {
-        let branch = run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]).await;
-        match branch {
-            Ok(b) => Ok(b.trim().to_string()),
-            Err(_) => {
-                // Detached HEAD — fall back to short commit id
-                run_git(repo_path, &["rev-parse", "--short", "HEAD"])
-                    .await
-                    .map(|s| s.trim().to_string())
-            }
+    // Branch and commit info
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(_) => {
+            // Unborn HEAD (empty repo)
+            return Ok(status);
         }
     };
 
-    let commit_fut = async {
-        run_git(repo_path, &["rev-parse", "--short", "HEAD"])
-            .await
-            .map(|s| s.trim().to_string())
-    };
+    // Branch name (or short OID if detached)
+    status.branch = head.shorthand().unwrap_or("").to_string();
 
-    let description_fut = async {
-        run_git(repo_path, &["log", "-1", "--format=%s"])
-            .await
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default()
-    };
+    // Commit ID (short), description, and tree for diff stats
+    let head_tree = if let Ok(commit) = head.peel_to_commit() {
+        let oid = commit.id();
+        status.commit_id = commit
+            .as_object()
+            .short_id()
+            .map(|buf| buf.as_str().unwrap_or("").to_string())
+            .unwrap_or_else(|_| format!("{:.7}", oid));
+        status.description = commit.summary().unwrap_or("").to_string();
 
-    // Unstaged: working tree vs index
-    let unstaged_fut = async {
-        run_git(repo_path, &["diff", "--stat"])
-            .await
-            .unwrap_or_default()
-    };
-
-    // Staged: index vs HEAD
-    let staged_fut = async {
-        run_git(repo_path, &["diff", "--cached", "--stat"])
-            .await
-            .unwrap_or_default()
-    };
-
-    // Total: working tree vs HEAD
-    let total_fut = async {
-        run_git(repo_path, &["diff", "--stat", "HEAD"])
-            .await
-            .unwrap_or_default()
-    };
-
-    let empty_fut = async {
-        // --quiet exits 0 if no diff (empty), 1 if diff exists
-        run_git(repo_path, &["diff", "--quiet", "HEAD~1", "HEAD"])
-            .await
-            .is_ok()
-    };
-
-    let conflict_fut = async {
-        let result = run_git(repo_path, &["diff", "--name-only", "--diff-filter=U"]).await;
-        match result {
-            Ok(output) => !output.trim().is_empty(),
-            Err(_) => false,
+        // Empty detection: compare HEAD tree to parent tree
+        let head_tree = commit.tree().ok();
+        let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+        if let Some(head_tree) = &head_tree {
+            let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(head_tree), None);
+            status.empty = match diff {
+                Ok(d) => d.stats().map(|s| s.files_changed() == 0).unwrap_or(false),
+                Err(_) => false,
+            };
         }
-    };
-
-    // Worktree detection: --git-common-dir returns ".git" for the main worktree,
-    // or an absolute path for linked worktrees.
-    let worktree_fut = async {
-        run_git(repo_path, &["rev-parse", "--git-common-dir"])
-            .await
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| ".git".to_string())
-    };
-
-    // Rebase detection: check for rebase-merge/ or rebase-apply/ in the
-    // per-worktree git dir (not the common dir).
-    let rebase_fut = async {
-        let git_dir = run_git(repo_path, &["rev-parse", "--git-dir"])
-            .await
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| ".git".to_string());
-        let git_dir = if std::path::Path::new(&git_dir).is_absolute() {
-            std::path::PathBuf::from(git_dir)
-        } else {
-            repo_path.join(git_dir)
-        };
-        git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists()
-    };
-
-    let (
-        branch,
-        commit,
-        description,
-        unstaged_out,
-        staged_out,
-        total_out,
-        empty,
-        conflict,
-        git_common_dir,
-        rebasing,
-    ) = tokio::join!(
-        branch_fut,
-        commit_fut,
-        description_fut,
-        unstaged_fut,
-        staged_fut,
-        total_fut,
-        empty_fut,
-        conflict_fut,
-        worktree_fut,
-        rebase_fut
-    );
-
-    status.branch = branch.unwrap_or_default();
-    status.commit_id = commit.unwrap_or_default();
-    status.description = description;
-    status.empty = empty;
-    status.conflict = conflict;
-    status.rebasing = rebasing;
-
-    // Worktree: if git-common-dir is ".git", we're in the main worktree.
-    // Otherwise we're in a linked worktree named after the directory.
-    if git_common_dir == ".git" {
-        status.workspace_name = "main".to_string();
-        status.is_default_workspace = true;
+        head_tree
     } else {
-        // Use the repo directory name as the worktree name
+        None
+    };
+
+    // Conflict detection
+    status.conflict = repo.index().map(|idx| idx.has_conflicts()).unwrap_or(false);
+
+    // Unstaged: index → workdir
+    let mut diff_opts = git2::DiffOptions::new();
+    if let Ok(diff) = repo.diff_index_to_workdir(None, Some(&mut diff_opts)) {
+        let (f, a, r) = diff_stats(&diff)?;
+        status.files_changed = f;
+        status.lines_added = a;
+        status.lines_removed = r;
+    }
+
+    // Staged: tree → index
+    if let Ok(diff) = repo.diff_tree_to_index(head_tree.as_ref(), None, None) {
+        let (f, a, r) = diff_stats(&diff)?;
+        status.staged_files_changed = f;
+        status.staged_lines_added = a;
+        status.staged_lines_removed = r;
+    }
+
+    // Total: tree → workdir (with index)
+    if let Ok(diff) = repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), None) {
+        let (f, a, r) = diff_stats(&diff)?;
+        status.total_files_changed = f;
+        status.total_lines_added = a;
+        status.total_lines_removed = r;
+    }
+
+    // Worktree detection
+    if repo.is_worktree() {
         status.workspace_name = repo_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "worktree".to_string());
         status.is_default_workspace = false;
-    };
+    } else {
+        status.workspace_name = "main".to_string();
+        status.is_default_workspace = true;
+    }
 
-    let (f, a, r) = parse_diff_stat(&unstaged_out);
-    status.files_changed = f;
-    status.lines_added = a;
-    status.lines_removed = r;
-
-    let (f, a, r) = parse_diff_stat(&staged_out);
-    status.staged_files_changed = f;
-    status.staged_lines_added = a;
-    status.staged_lines_removed = r;
-
-    let (f, a, r) = parse_diff_stat(&total_out);
-    status.total_files_changed = f;
-    status.total_lines_added = a;
-    status.total_lines_removed = r;
+    // Rebase detection
+    status.rebasing = matches!(
+        repo.state(),
+        git2::RepositoryState::Rebase
+            | git2::RepositoryState::RebaseInteractive
+            | git2::RepositoryState::RebaseMerge
+            | git2::RepositoryState::ApplyMailbox
+            | git2::RepositoryState::ApplyMailboxOrRebase
+    );
 
     Ok(status)
+}
+
+pub async fn query_git_status(repo_path: &Path, _config: &Config) -> Result<RepoStatus> {
+    let repo_path = repo_path.to_path_buf();
+    tokio::time::timeout(
+        GIT2_TIMEOUT,
+        tokio::task::spawn_blocking(move || query_git_status_blocking(&repo_path)),
+    )
+    .await
+    .context("git2 query timed out")?
+    .context("git2 task panicked")?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use tokio::process::Command;
 
     async fn create_git_repo() -> TempDir {
         let dir = TempDir::new().unwrap();
@@ -503,6 +439,285 @@ mod tests {
         assert!(
             formatted.contains("initial"),
             "expected description in output: {formatted:?}"
+        );
+    }
+
+    /// Parse the summary line from `git diff --stat` output.
+    fn parse_diff_stat_summary(output: &str) -> (u32, u32, u32) {
+        let Some(summary) = output.lines().rev().find(|l| l.contains("changed")) else {
+            return (0, 0, 0);
+        };
+        let mut files = 0u32;
+        let mut insertions = 0u32;
+        let mut deletions = 0u32;
+        for part in summary.split(',') {
+            let part = part.trim();
+            if part.contains("changed") {
+                files = part
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+            } else if part.contains("insertion") {
+                insertions = part
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+            } else if part.contains("deletion") {
+                deletions = part
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+        (files, insertions, deletions)
+    }
+
+    async fn git_output(repo: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    /// Complex scenario: multiple files added, deleted, and modified.
+    /// Compares unstaged, staged, and total stats against git CLI.
+    #[tokio::test]
+    async fn test_diff_stats_match_git_cli() {
+        let dir = create_git_repo().await;
+
+        // Create initial files and commit
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+
+        let main_initial: String = (1..=25).map(|i| format!("fn app_{i}() {{}}\n")).collect();
+        std::fs::write(dir.path().join("src/app.rs"), &main_initial).unwrap();
+
+        let config_initial: String =
+            (1..=10).map(|i| format!("config_key_{i} = value\n")).collect();
+        std::fs::write(dir.path().join("src/config.rs"), &config_initial).unwrap();
+
+        let guide_initial: String = (1..=15).map(|i| format!("## Guide step {i}\n")).collect();
+        std::fs::write(dir.path().join("guide.md"), &guide_initial).unwrap();
+
+        let makefile_initial: String =
+            (1..=8).map(|i| format!("target_{i}:\n\techo {i}\n")).collect();
+        std::fs::write(dir.path().join("Makefile"), &makefile_initial).unwrap();
+
+        let old_content: String = (1..=6).map(|i| format!("old line {i}\n")).collect();
+        std::fs::write(dir.path().join("old.txt"), &old_content).unwrap();
+
+        git_cmd(dir.path(), &["add", "."]).await;
+        git_cmd(dir.path(), &["commit", "-m", "add initial files"]).await;
+
+        // --- Make modifications ---
+
+        // 1. New file: src/helper.rs (10 lines)
+        let helper: String = (1..=10).map(|i| format!("fn helper_{i}() {{}}\n")).collect();
+        std::fs::write(dir.path().join("src/helper.rs"), &helper).unwrap();
+
+        // 2. Delete old.txt
+        std::fs::remove_file(dir.path().join("old.txt")).unwrap();
+
+        // 3. Modify src/app.rs: change lines 5-8, add 3 at end
+        let mut app_lines: Vec<String> = (1..=25).map(|i| format!("fn app_{i}() {{}}")).collect();
+        app_lines[4] = "fn app_5_changed() { /* new */ }".to_string();
+        app_lines[5] = "fn app_6_changed() { /* new */ }".to_string();
+        app_lines[6] = "fn app_7_changed() { /* new */ }".to_string();
+        app_lines[7] = "fn app_8_changed() { /* new */ }".to_string();
+        app_lines.push("fn app_26() {}".to_string());
+        app_lines.push("fn app_27() {}".to_string());
+        app_lines.push("fn app_28() {}".to_string());
+        std::fs::write(dir.path().join("src/app.rs"), app_lines.join("\n") + "\n").unwrap();
+
+        // 4. Modify guide.md: remove lines 10-15, add 4 new lines
+        let mut guide_lines: Vec<String> = (1..=9).map(|i| format!("## Guide step {i}")).collect();
+        guide_lines.push("## New guide A".to_string());
+        guide_lines.push("## New guide B".to_string());
+        guide_lines.push("## New guide C".to_string());
+        guide_lines.push("## New guide D".to_string());
+        std::fs::write(dir.path().join("guide.md"), guide_lines.join("\n") + "\n").unwrap();
+
+        // 5. Modify Makefile: change 2 lines
+        let mut make_lines: Vec<String> =
+            (1..=8).map(|i| format!("target_{i}:\n\techo {i}")).collect();
+        make_lines[2] = "target_3_new:\n\techo changed_3".to_string();
+        make_lines[5] = "target_6_new:\n\techo changed_6".to_string();
+        std::fs::write(dir.path().join("Makefile"), make_lines.join("\n") + "\n").unwrap();
+
+        // --- Compare total stats (HEAD → workdir, nothing staged) ---
+        let git_total = git_output(dir.path(), &["diff", "--stat", "HEAD"]).await;
+        let (cli_total_f, cli_total_a, cli_total_r) = parse_diff_stat_summary(&git_total);
+
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+        let status = query_git_status(dir.path(), &config).await.unwrap();
+
+        assert_eq!(
+            (
+                status.total_files_changed,
+                status.total_lines_added,
+                status.total_lines_removed
+            ),
+            (cli_total_f, cli_total_a, cli_total_r),
+            "total stats ({}f, +{}, -{}) != git diff --stat HEAD ({}f, +{}, -{})\ngit output:\n{}",
+            status.total_files_changed,
+            status.total_lines_added,
+            status.total_lines_removed,
+            cli_total_f,
+            cli_total_a,
+            cli_total_r,
+            git_total,
+        );
+
+        // Unstaged should match too (nothing is staged)
+        let git_unstaged = git_output(dir.path(), &["diff", "--stat"]).await;
+        let (cli_us_f, cli_us_a, cli_us_r) = parse_diff_stat_summary(&git_unstaged);
+
+        assert_eq!(
+            (
+                status.files_changed,
+                status.lines_added,
+                status.lines_removed
+            ),
+            (cli_us_f, cli_us_a, cli_us_r),
+            "unstaged stats ({}f, +{}, -{}) != git diff --stat ({}f, +{}, -{})\ngit output:\n{}",
+            status.files_changed,
+            status.lines_added,
+            status.lines_removed,
+            cli_us_f,
+            cli_us_a,
+            cli_us_r,
+            git_unstaged,
+        );
+    }
+
+    /// Test with a mix of staged and unstaged changes, verifying all three
+    /// stat categories separately against git CLI.
+    #[tokio::test]
+    async fn test_diff_stats_match_git_cli_staged_and_unstaged() {
+        let dir = create_git_repo().await;
+
+        // Initial committed state: two files
+        let alpha: String = (1..=20).map(|i| format!("alpha line {i}\n")).collect();
+        std::fs::write(dir.path().join("alpha.txt"), &alpha).unwrap();
+
+        let beta: String = (1..=15).map(|i| format!("beta line {i}\n")).collect();
+        std::fs::write(dir.path().join("beta.txt"), &beta).unwrap();
+
+        git_cmd(dir.path(), &["add", "."]).await;
+        git_cmd(dir.path(), &["commit", "-m", "add alpha and beta"]).await;
+
+        // Stage changes to alpha.txt: change lines 3-5, add 2 lines
+        let mut alpha_staged: Vec<String> =
+            (1..=20).map(|i| format!("alpha line {i}")).collect();
+        alpha_staged[2] = "alpha STAGED 3".to_string();
+        alpha_staged[3] = "alpha STAGED 4".to_string();
+        alpha_staged[4] = "alpha STAGED 5".to_string();
+        alpha_staged.push("alpha STAGED new 1".to_string());
+        alpha_staged.push("alpha STAGED new 2".to_string());
+        std::fs::write(
+            dir.path().join("alpha.txt"),
+            alpha_staged.join("\n") + "\n",
+        )
+        .unwrap();
+        git_cmd(dir.path(), &["add", "alpha.txt"]).await;
+
+        // Now make further unstaged changes to alpha.txt on top of staged
+        let mut alpha_unstaged = alpha_staged.clone();
+        alpha_unstaged[9] = "alpha UNSTAGED 10".to_string();
+        alpha_unstaged[10] = "alpha UNSTAGED 11".to_string();
+        std::fs::write(
+            dir.path().join("alpha.txt"),
+            alpha_unstaged.join("\n") + "\n",
+        )
+        .unwrap();
+
+        // Unstaged changes to beta.txt (not staged at all): remove last 5 lines
+        let beta_modified: String = (1..=10).map(|i| format!("beta line {i}\n")).collect();
+        std::fs::write(dir.path().join("beta.txt"), &beta_modified).unwrap();
+
+        // Add a new staged file
+        std::fs::write(dir.path().join("gamma.txt"), "gamma 1\ngamma 2\ngamma 3\n").unwrap();
+        git_cmd(dir.path(), &["add", "gamma.txt"]).await;
+
+        // Compare all three categories
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+        let status = query_git_status(dir.path(), &config).await.unwrap();
+
+        // Unstaged: index → workdir
+        let git_unstaged = git_output(dir.path(), &["diff", "--stat"]).await;
+        let (cli_us_f, cli_us_a, cli_us_r) = parse_diff_stat_summary(&git_unstaged);
+        assert_eq!(
+            (
+                status.files_changed,
+                status.lines_added,
+                status.lines_removed
+            ),
+            (cli_us_f, cli_us_a, cli_us_r),
+            "unstaged ({}f, +{}, -{}) != git diff --stat ({}f, +{}, -{})\n{}",
+            status.files_changed,
+            status.lines_added,
+            status.lines_removed,
+            cli_us_f,
+            cli_us_a,
+            cli_us_r,
+            git_unstaged,
+        );
+
+        // Staged: HEAD → index
+        let git_staged = git_output(dir.path(), &["diff", "--cached", "--stat"]).await;
+        let (cli_st_f, cli_st_a, cli_st_r) = parse_diff_stat_summary(&git_staged);
+        assert_eq!(
+            (
+                status.staged_files_changed,
+                status.staged_lines_added,
+                status.staged_lines_removed
+            ),
+            (cli_st_f, cli_st_a, cli_st_r),
+            "staged ({}f, +{}, -{}) != git diff --cached --stat ({}f, +{}, -{})\n{}",
+            status.staged_files_changed,
+            status.staged_lines_added,
+            status.staged_lines_removed,
+            cli_st_f,
+            cli_st_a,
+            cli_st_r,
+            git_staged,
+        );
+
+        // Total: HEAD → workdir+index
+        let git_total = git_output(dir.path(), &["diff", "--stat", "HEAD"]).await;
+        let (cli_tot_f, cli_tot_a, cli_tot_r) = parse_diff_stat_summary(&git_total);
+        assert_eq!(
+            (
+                status.total_files_changed,
+                status.total_lines_added,
+                status.total_lines_removed
+            ),
+            (cli_tot_f, cli_tot_a, cli_tot_r),
+            "total ({}f, +{}, -{}) != git diff --stat HEAD ({}f, +{}, -{})\n{}",
+            status.total_files_changed,
+            status.total_lines_added,
+            status.total_lines_removed,
+            cli_tot_f,
+            cli_tot_a,
+            cli_tot_r,
+            git_total,
         );
     }
 }
