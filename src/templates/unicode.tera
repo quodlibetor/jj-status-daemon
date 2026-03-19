@@ -1,5 +1,5 @@
 {% if is_jj -%}
-  {{ "※" | magenta }} {{ change_id }}
+  {{ "⋈" | magenta }} {{ change_id }}
   {%- for b in bookmarks %} {{ "≡ " | blue }}{{ b.display | blue }}{% endfor %}
 {%- elif is_git -%}
   {{ "±" | blue }} {{ branch | blue }} {{ commit_id }}

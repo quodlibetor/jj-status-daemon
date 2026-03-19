@@ -725,8 +725,8 @@ format = '''
         };
         let formatted = format_status(&status, UNICODE_FORMAT, false);
         assert!(
-            formatted.contains("\u{203B}"),
-            "expected reference mark: {formatted:?}"
+            formatted.contains("\u{22C8}"),
+            "expected bowtie: {formatted:?}"
         );
         assert!(
             formatted.contains("mrtu"),
