@@ -12,9 +12,47 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
+fn format_version_info(version: &str, git_hash: &str, features: &[String]) -> String {
+    let features_str = if features.is_empty() {
+        "none".to_string()
+    } else {
+        features.join(", ")
+    };
+    format!("{version} ({git_hash})\nfeatures: {features_str}")
+}
+
+fn print_version() {
+    let (version, git_hash, features) = protocol::version_info();
+    println!(
+        "vcs-status-daemon {}",
+        format_version_info(&version, &git_hash, &features)
+    );
+    match client::daemon_version() {
+        Ok((dv, dh, df)) => {
+            println!(
+                "daemon          {}",
+                format_version_info(&dv, &dh, &df)
+            );
+        }
+        Err(_) => {
+            println!("daemon          not running");
+        }
+    }
+}
+
+fn long_version() -> &'static str {
+    use std::sync::LazyLock;
+    static VERSION: LazyLock<String> = LazyLock::new(|| {
+        let (version, git_hash, features) = protocol::version_info();
+        format_version_info(&version, &git_hash, &features)
+    });
+    &VERSION
+}
+
 #[derive(Parser)]
 #[command(name = "vcs-status-daemon")]
 #[command(about = "Fast jj status for shell prompts")]
+#[command(version, long_version = long_version())]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -129,7 +167,11 @@ fn try_fast_args() -> Option<FastArgs> {
         match s {
             // Subcommands and help flags → fall through to clap
             "daemon" | "shutdown" | "query" | "config" | "init" | "restart" | "status"
-            | "template" | "-h" | "--help" | "--version" => return None,
+            | "template" | "-h" | "--help" => return None,
+            "-V" | "--version" => {
+                print_version();
+                std::process::exit(0);
+            }
             "--repo" => {
                 repo = Some(PathBuf::from(args.next()?));
             }
@@ -170,7 +212,17 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn build_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+    // console-subscriber spawns a gRPC server that needs a multi-threaded runtime
+    #[cfg(feature = "tokio-console")]
+    let mut builder = {
+        let mut b = tokio::runtime::Builder::new_multi_thread();
+        b.worker_threads(2);
+        b
+    };
+    #[cfg(not(feature = "tokio-console"))]
+    let mut builder = tokio::runtime::Builder::new_current_thread();
+
+    builder
         .enable_all()
         .build()
         .expect("failed to build tokio runtime")

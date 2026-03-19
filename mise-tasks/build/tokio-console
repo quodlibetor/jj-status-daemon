@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#MISE description="Build daemon and CLI with tokio-console support"
+#MISE sources=["Cargo.toml", "Cargo.lock", "src/**/*.rs", "build.rs"]
+#MISE outputs=["target/release/vcs-status-daemon"]
+set -euo pipefail
+
+RUSTFLAGS="--cfg tokio_unstable" cargo build --features tokio-console --release
+
+if ! command -v tokio-console &>/dev/null; then
+  echo "Installing tokio-console CLI..."
+  cargo install tokio-console
+fi

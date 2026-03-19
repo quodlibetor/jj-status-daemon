@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+#MISE description="Start daemon with tokio-console instrumentation and launch the console UI. Pass --keep to leave instrumented binary installed."
+#MISE depends=["build:tokio-console"]
+set -euo pipefail
+
+KEEP=false
+for arg in "$@"; do
+  case "$arg" in
+    --keep) KEEP=true ;;
+    *) echo "Unknown flag: $arg"; exit 1 ;;
+  esac
+done
+
+INSTALL_DIR="${CARGO_INSTALL_ROOT:-$HOME/.local}/bin"
+BINARY="$INSTALL_DIR/vcs-status-daemon"
+INSTRUMENTED="target/release/vcs-status-daemon"
+
+# Save the original binary if present
+if [[ -f "$BINARY" ]]; then
+  cp "$BINARY" "$BINARY.bak"
+fi
+
+# Verify the build has the feature enabled
+FEATURES=$("$INSTRUMENTED" --version 2>&1 | head -2)
+if ! echo "$FEATURES" | grep -q "tokio-console"; then
+  echo "ERROR: build does not have tokio-console feature enabled"
+  echo "$FEATURES"
+  exit 1
+fi
+
+# Install the instrumented build and restart the daemon
+cp "$INSTRUMENTED" "$BINARY"
+vcs-status-daemon restart || true
+
+# Wait for console-subscriber gRPC port to be ready
+for i in $(seq 1 30); do
+  if lsof -iTCP:6669 -sTCP:LISTEN &>/dev/null; then
+    break
+  fi
+  if [[ $i -eq 30 ]]; then
+    echo "ERROR: daemon did not open tokio-console port (6669) within 3s"
+    echo "Check daemon log: /tmp/vcs-status-daemon-$USER/daemon.log"
+    exit 1
+  fi
+  sleep 0.1
+done
+
+cleanup() {
+  if [[ "$KEEP" == "true" ]]; then
+    echo ""
+    echo "Keeping instrumented binary installed (run 'cargo build --release && cp target/release/vcs-status-daemon $BINARY' to restore)."
+    rm -f "$BINARY.bak"
+  else
+    echo ""
+    echo "Restoring original daemon binary..."
+    if [[ -f "$BINARY.bak" ]]; then
+      cp "$BINARY.bak" "$BINARY"
+      rm "$BINARY.bak"
+      vcs-status-daemon restart || true
+    fi
+  fi
+}
+trap cleanup EXIT
+
+echo "Daemon restarted with tokio-console instrumentation."
+if [[ "$KEEP" == "true" ]]; then
+  echo "Launching tokio-console (Ctrl-C to stop; instrumented binary will remain installed)..."
+else
+  echo "Launching tokio-console (Ctrl-C to stop and restore normal daemon)..."
+fi
+echo ""
+tokio-console

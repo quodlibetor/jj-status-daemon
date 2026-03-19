@@ -6,10 +6,14 @@ repository = "https://github.com/quodlibetor/vcs-status-daemon"
 homepage = "https://github.com/quodlibetor/vcs-status-daemon"
 description = "A tool that caches VCS (jj/git) status so your shell prompt can be fast"
 
+[features]
+tokio-console = ["dep:console-subscriber", "tokio/tracing", "tokio/rt-multi-thread"]
+
 [dependencies]
 anyhow = "1"
 bytecount = "0.6"
 clap = { version = "4", features = ["derive"] }
+console-subscriber = { version = "0.5", optional = true }
 dirs = "6"
 notify = "8.2"
 serde = { version = "1", features = ["derive"] }
@@ -17,7 +21,7 @@ serde_json = "1"
 tera = { version = "1.20", default-features = false, features = ["builtins"] }
 tracing = "0.1"
 tracing-appender = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 tokio = { version = "1", features = [
   "rt",
   "net",

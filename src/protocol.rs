@@ -13,6 +13,7 @@ pub enum Request {
     Flush,
     Shutdown,
     DaemonStatus,
+    Version,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -32,7 +33,43 @@ pub enum Response {
         pid: u32,
         uptime_secs: u64,
         watched_repos: Vec<String>,
+        stats: DaemonStats,
     },
+    Version {
+        version: String,
+        git_hash: String,
+        features: Vec<String>,
+    },
+}
+
+/// Build-time version info.
+pub fn version_info() -> (String, String, Vec<String>) {
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    let git_hash = env!("VSD_GIT_HASH").to_string();
+    let mut features = Vec::new();
+    if cfg!(feature = "tokio-console") {
+        features.push("tokio-console".to_string());
+    }
+    (version, git_hash, features)
+}
+
+/// Performance statistics collected by the daemon.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DaemonStats {
+    /// Total queries received
+    pub queries: u64,
+    /// Cache hits (immediate response)
+    pub cache_hits: u64,
+    /// Cache misses (background populate)
+    pub cache_misses: u64,
+    /// Total refresh cycles (watcher-triggered re-queries)
+    pub refreshes: u64,
+    /// Total filesystem events received
+    pub fs_events: u64,
+    /// Filesystem events skipped because all paths were ignored
+    pub fs_events_ignored: u64,
+    /// Recent query durations in milliseconds (ring buffer, most recent last)
+    pub recent_query_ms: Vec<f64>,
 }
 
 #[cfg(test)]

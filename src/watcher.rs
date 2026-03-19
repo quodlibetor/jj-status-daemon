@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 use crate::protocol::VcsKind;
@@ -17,6 +19,8 @@ pub enum WatchEvent {
 
 pub struct RepoWatcher {
     _watcher: RecommendedWatcher,
+    /// Count of filesystem events skipped because all paths matched ignore rules.
+    pub ignored_events: Arc<AtomicU64>,
 }
 
 /// Build a gitignore matcher from the repo's ignore files.
@@ -95,6 +99,8 @@ pub fn watch_repo(
         VcsKind::Git => canonical_root.join(".git"),
     };
     let gitignore = build_ignore(repo_path, vcs_kind);
+    let ignored_events = Arc::new(AtomicU64::new(0));
+    let ignored_events_cb = ignored_events.clone();
 
     let mut watcher =
         notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
@@ -125,6 +131,7 @@ pub fn watch_repo(
                         .is_ignore()
                 });
                 if all_ignored {
+                    ignored_events_cb.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             }
@@ -168,7 +175,10 @@ pub fn watch_repo(
         .watch(repo_path, RecursiveMode::Recursive)
         .context("failed to watch repo")?;
 
-    Ok(RepoWatcher { _watcher: watcher })
+    Ok(RepoWatcher {
+        _watcher: watcher,
+        ignored_events,
+    })
 }
 
 #[cfg(test)]

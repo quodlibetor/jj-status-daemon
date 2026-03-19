@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 use crate::config::Config;
 use crate::git::query_git_status;
 use crate::jj::query_jj_status;
-use crate::protocol::{Request, Response, VcsKind};
+use crate::protocol::{DaemonStats, Request, Response, VcsKind};
 use crate::template::format_not_ready;
 use crate::template::format_status;
 use crate::watcher::{RepoWatcher, WatchEvent, watch_repo};
@@ -26,6 +26,7 @@ struct DaemonState {
     started_at: Instant,
     config: Config,
     cache_dir: PathBuf,
+    stats: DaemonStats,
 }
 
 use crate::config::find_repo_root;
@@ -33,7 +34,14 @@ use crate::config::find_repo_root;
 /// Maximum log file size before rotation (5 MB).
 const MAX_LOG_SIZE: u64 = 5 * 1024 * 1024;
 
+/// Number of recent query durations to keep for percentile stats.
+const TIMING_RING_SIZE: usize = 100;
+
 pub fn init_logging(runtime_dir: &Path) {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     std::fs::create_dir_all(runtime_dir).ok();
 
     // Rotate on startup: if the log exceeds the limit, move it to .old (keeping one backup).
@@ -50,11 +58,23 @@ pub fn init_logging(runtime_dir: &Path) {
     let filter =
         EnvFilter::try_from_env("VCS_STATUS_DAEMON_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(file_appender)
         .with_ansi(false)
-        .init();
+        .with_filter(filter);
+
+    let registry = tracing_subscriber::registry().with(fmt_layer);
+
+    #[cfg(feature = "tokio-console")]
+    {
+        let console_layer = console_subscriber::spawn();
+        registry.with(console_layer).init();
+    }
+
+    #[cfg(not(feature = "tokio-console"))]
+    {
+        registry.init();
+    }
 }
 
 pub async fn run_daemon(config: Config, runtime_dir: PathBuf) -> Result<()> {
@@ -110,6 +130,7 @@ pub async fn run_daemon(config: Config, runtime_dir: PathBuf) -> Result<()> {
         started_at: Instant::now(),
         config: config.clone(),
         cache_dir: cache_dir.clone(),
+        stats: DaemonStats::default(),
     }));
 
     // Spawn refresh task
@@ -218,6 +239,7 @@ pub async fn run_daemon(config: Config, runtime_dir: PathBuf) -> Result<()> {
     }
 }
 
+#[tracing::instrument(skip_all)]
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     state: Arc<Mutex<DaemonState>>,
@@ -238,9 +260,11 @@ async fn handle_connection(
                 .unwrap_or_else(|_| PathBuf::from(&repo_path));
 
             // Resolve the repo root and VCS kind from the given path
+            let query_start = Instant::now();
             let (repo_path, vcs_kind, cached, config, cd) = {
                 let mut st = state.lock().await;
                 st.last_query = Instant::now();
+                st.stats.queries += 1;
 
                 let resolved = if let Some(entry) = st.dir_to_repo.get(&query_path) {
                     Some(entry.clone())
@@ -277,6 +301,11 @@ async fn handle_connection(
 
             if let Some(cached) = cached {
                 tracing::debug!(repo = %repo_path.display(), "cache hit");
+                {
+                    let mut st = state.lock().await;
+                    st.stats.cache_hits += 1;
+                    record_timing(&mut st.stats, query_start.elapsed());
+                }
                 // Ensure the queried directory has a hardlink to the repo root's cache file
                 if query_path != repo_path {
                     link_cache_file(&cd, &repo_path, &query_path);
@@ -285,6 +314,7 @@ async fn handle_connection(
             } else {
                 // Respond immediately with "not ready" and populate cache in the background
                 tracing::debug!(repo = %repo_path.display(), vcs = ?vcs_kind, "cache miss, returning not-ready");
+                state.lock().await.stats.cache_misses += 1;
                 let not_ready = format_not_ready(&config.resolved_not_ready_format(), config.color);
                 let state_bg = state.clone();
                 let query_path_bg = query_path.clone();
@@ -340,6 +370,12 @@ async fn handle_connection(
                 .map(|p| p.to_string_lossy().to_string())
                 .collect();
             let uptime_secs = st.started_at.elapsed().as_secs();
+            let mut stats = st.stats.clone();
+            stats.fs_events_ignored = st
+                .watchers
+                .values()
+                .map(|w| w.ignored_events.load(std::sync::atomic::Ordering::Relaxed))
+                .sum();
             drop(st);
             send_response(
                 &mut writer,
@@ -347,6 +383,19 @@ async fn handle_connection(
                     pid: std::process::id(),
                     uptime_secs,
                     watched_repos,
+                    stats,
+                },
+            )
+            .await
+        }
+        Request::Version => {
+            let (version, git_hash, features) = crate::protocol::version_info();
+            send_response(
+                &mut writer,
+                Response::Version {
+                    version,
+                    git_hash,
+                    features,
                 },
             )
             .await
@@ -406,6 +455,14 @@ fn link_cache_file(cache_dir: &Path, repo_root: &Path, query_dir: &Path) {
     }
 }
 
+fn record_timing(stats: &mut DaemonStats, elapsed: Duration) {
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    if stats.recent_query_ms.len() >= TIMING_RING_SIZE {
+        stats.recent_query_ms.remove(0);
+    }
+    stats.recent_query_ms.push(ms);
+}
+
 /// Tracks per-repo: (vcs_kind, working_copy_changed)
 fn collect_change(pending: &mut HashMap<PathBuf, (VcsKind, bool)>, event: WatchEvent) {
     match event {
@@ -424,6 +481,7 @@ fn collect_change(pending: &mut HashMap<PathBuf, (VcsKind, bool)>, event: WatchE
     }
 }
 
+#[tracing::instrument(skip_all, fields(count = pending.len()))]
 async fn process_pending(
     state: &Arc<Mutex<DaemonState>>,
     pending: &mut HashMap<PathBuf, (VcsKind, bool)>,
@@ -431,6 +489,7 @@ async fn process_pending(
     let repos: Vec<(PathBuf, VcsKind, bool)> =
         pending.drain().map(|(p, (v, wc))| (p, v, wc)).collect();
     for (repo_path, vcs_kind, needs_snapshot) in repos {
+        let refresh_start = Instant::now();
         let (config, cd) = {
             let st = state.lock().await;
             (st.config.clone(), st.cache_dir.clone())
@@ -446,7 +505,10 @@ async fn process_pending(
             Ok(status) => {
                 let formatted = format_status(&status, &config.resolved_format(), config.color);
                 write_cache_file(&cd, &repo_path, &formatted);
-                state.lock().await.cache.insert(repo_path, formatted);
+                let mut st = state.lock().await;
+                st.cache.insert(repo_path, formatted);
+                st.stats.refreshes += 1;
+                record_timing(&mut st.stats, refresh_start.elapsed());
             }
             Err(e) => {
                 tracing::error!(repo = %repo_path.display(), error = %e, "refresh failed");
@@ -455,6 +517,7 @@ async fn process_pending(
     }
 }
 
+#[tracing::instrument(skip_all)]
 async fn refresh_task(
     state: Arc<Mutex<DaemonState>>,
     mut watch_rx: mpsc::UnboundedReceiver<WatchEvent>,
@@ -473,6 +536,7 @@ async fn refresh_task(
             continue;
         }
 
+        state.lock().await.stats.fs_events += 1;
         collect_change(&mut wc_changed, event);
 
         let debounce_ms = state.lock().await.config.debounce_ms;
@@ -485,6 +549,7 @@ async fn refresh_task(
                 flush_tx = Some(tx);
                 break;
             }
+            state.lock().await.stats.fs_events += 1;
             collect_change(&mut wc_changed, event);
         }
 

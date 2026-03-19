@@ -16,8 +16,12 @@ fn diff_stats(diff: &git2::Diff<'_>) -> Result<(u32, u32, u32)> {
     ))
 }
 
+#[tracing::instrument(fields(repo = %repo_path.display()))]
 fn query_git_status_blocking(repo_path: &Path) -> Result<RepoStatus> {
-    let repo = git2::Repository::open(repo_path).context("failed to open git repo")?;
+    let repo = {
+        let _span = tracing::debug_span!("git_open").entered();
+        git2::Repository::open(repo_path).context("failed to open git repo")?
+    };
 
     let mut status = RepoStatus {
         is_git: true,
@@ -65,28 +69,37 @@ fn query_git_status_blocking(repo_path: &Path) -> Result<RepoStatus> {
     status.conflict = repo.index().map(|idx| idx.has_conflicts()).unwrap_or(false);
 
     // Unstaged: index → workdir
-    let mut diff_opts = git2::DiffOptions::new();
-    if let Ok(diff) = repo.diff_index_to_workdir(None, Some(&mut diff_opts)) {
-        let (f, a, r) = diff_stats(&diff)?;
-        status.files_changed = f;
-        status.lines_added = a;
-        status.lines_removed = r;
+    {
+        let _span = tracing::debug_span!("diff_unstaged").entered();
+        let mut diff_opts = git2::DiffOptions::new();
+        if let Ok(diff) = repo.diff_index_to_workdir(None, Some(&mut diff_opts)) {
+            let (f, a, r) = diff_stats(&diff)?;
+            status.files_changed = f;
+            status.lines_added = a;
+            status.lines_removed = r;
+        }
     }
 
     // Staged: tree → index
-    if let Ok(diff) = repo.diff_tree_to_index(head_tree.as_ref(), None, None) {
-        let (f, a, r) = diff_stats(&diff)?;
-        status.staged_files_changed = f;
-        status.staged_lines_added = a;
-        status.staged_lines_removed = r;
+    {
+        let _span = tracing::debug_span!("diff_staged").entered();
+        if let Ok(diff) = repo.diff_tree_to_index(head_tree.as_ref(), None, None) {
+            let (f, a, r) = diff_stats(&diff)?;
+            status.staged_files_changed = f;
+            status.staged_lines_added = a;
+            status.staged_lines_removed = r;
+        }
     }
 
     // Total: tree → workdir (with index)
-    if let Ok(diff) = repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), None) {
-        let (f, a, r) = diff_stats(&diff)?;
-        status.total_files_changed = f;
-        status.total_lines_added = a;
-        status.total_lines_removed = r;
+    {
+        let _span = tracing::debug_span!("diff_total").entered();
+        if let Ok(diff) = repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), None) {
+            let (f, a, r) = diff_stats(&diff)?;
+            status.total_files_changed = f;
+            status.total_lines_added = a;
+            status.total_lines_removed = r;
+        }
     }
 
     // Worktree detection
@@ -114,6 +127,7 @@ fn query_git_status_blocking(repo_path: &Path) -> Result<RepoStatus> {
     Ok(status)
 }
 
+#[tracing::instrument(skip(_config), fields(repo = %repo_path.display()))]
 pub async fn query_git_status(repo_path: &Path, _config: &Config) -> Result<RepoStatus> {
     let repo_path = repo_path.to_path_buf();
     tokio::time::timeout(

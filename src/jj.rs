@@ -48,6 +48,7 @@ fn create_user_settings() -> Result<UserSettings> {
 /// jj-lib's snapshot API requires locking the working copy and constructing
 /// ignore patterns, which is complex and tightly coupled to internal state.
 /// A single lightweight subprocess is simpler and handles all the edge cases.
+#[tracing::instrument(fields(repo = %repo_path.display()))]
 async fn trigger_snapshot(repo_path: &Path) -> Result<()> {
     let output = match tokio::time::timeout(
         JJ_TIMEOUT,
@@ -98,6 +99,7 @@ fn count_lines(content: &[u8]) -> u32 {
 /// For modified files, uses jj-lib's line-level diff to count only actual
 /// changed lines (not the full-replacement approximation).
 /// Binary files are counted as 1 file changed but 0 lines.
+#[tracing::instrument(skip_all)]
 async fn compute_diff_stats(
     store: &Arc<jj_lib::store::Store>,
     from_tree: &jj_lib::merged_tree::MergedTree,
@@ -356,22 +358,29 @@ fn find_ancestor_bookmarks(
 
 /// Core jj-lib query logic. This produces `!Send` futures (due to jj-lib internals),
 /// so it must be run via `futures::executor::block_on` inside `spawn_blocking`.
+#[tracing::instrument(fields(repo = %repo_path.display()))]
 async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<RepoStatus> {
     let settings = create_user_settings()?;
-    let workspace = Workspace::load(
-        &settings,
-        repo_path,
-        &StoreFactories::default(),
-        &default_working_copy_factories(),
-    )
-    .context("load jj workspace")?;
+    let workspace = {
+        let _span = tracing::debug_span!("load_workspace").entered();
+        Workspace::load(
+            &settings,
+            repo_path,
+            &StoreFactories::default(),
+            &default_working_copy_factories(),
+        )
+        .context("load jj workspace")?
+    };
 
     let workspace_name = workspace.workspace_name().to_owned();
-    let repo: Arc<jj_lib::repo::ReadonlyRepo> = workspace
-        .repo_loader()
-        .load_at_head()
-        .await
-        .context("load jj repo at head")?;
+    let repo: Arc<jj_lib::repo::ReadonlyRepo> = {
+        let _span = tracing::debug_span!("load_repo").entered();
+        workspace
+            .repo_loader()
+            .load_at_head()
+            .await
+            .context("load jj repo at head")?
+    };
 
     let view = repo.view();
 
@@ -423,13 +432,22 @@ async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<RepoStatus> {
 
     // Immutable: check if commit is an ancestor of any immutable head
     // (trunk bookmarks, tags, untracked remote bookmarks).
-    status.immutable = is_commit_immutable(&repo, &workspace_name, &wc_id);
+    status.immutable = {
+        let _span = tracing::debug_span!("check_immutable").entered();
+        is_commit_immutable(&repo, &workspace_name, &wc_id)
+    };
 
     // Bookmarks
-    status.bookmarks = find_ancestor_bookmarks(&repo, view, &wc_id, depth)?;
+    status.bookmarks = {
+        let _span = tracing::debug_span!("find_bookmarks").entered();
+        find_ancestor_bookmarks(&repo, view, &wc_id, depth)?
+    };
 
     // Diff stats (also used to derive emptiness, avoiding a separate tree diff)
-    let parent_tree = commit.parent_tree(repo.as_ref()).await.ok();
+    let parent_tree = {
+        let _span = tracing::debug_span!("load_parent_tree").entered();
+        commit.parent_tree(repo.as_ref()).await.ok()
+    };
     let current_tree = commit.tree();
     if let Some(ref parent_tree) = parent_tree {
         let (f, a, r) = compute_diff_stats(repo.store(), parent_tree, &current_tree).await;
@@ -451,6 +469,7 @@ async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<RepoStatus> {
     Ok(status)
 }
 
+#[tracing::instrument(skip(config), fields(repo = %repo_path.display()))]
 pub async fn query_jj_status(
     repo_path: &Path,
     config: &Config,

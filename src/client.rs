@@ -51,9 +51,31 @@ fn start_daemon(socket_path: &Path, config_file: Option<&Path>) -> Result<()> {
 
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
 
-    cmd.spawn().context("failed to start daemon")?;
+    let mut child = cmd.spawn().context("failed to start daemon")?;
+
+    // Wait briefly to detect immediate crashes (e.g. missing build flags, bad config).
+    // If the daemon is still alive after this, detach and let it run.
+    std::thread::sleep(Duration::from_millis(200));
+    if let Some(status) = child.try_wait().context("failed to check daemon process")? {
+        let stderr = child
+            .stderr
+            .take()
+            .and_then(|mut s| {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut s, &mut buf).ok()?;
+                Some(buf)
+            })
+            .unwrap_or_default();
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            anyhow::bail!("daemon exited immediately with {status}");
+        } else {
+            anyhow::bail!("daemon exited immediately with {status}:\n{stderr}");
+        }
+    }
+
     Ok(())
 }
 
@@ -85,10 +107,28 @@ pub fn query(repo_path: &Path, config_file: Option<&Path>) -> Result<String> {
     match send_request(&socket_path, &request) {
         Ok(response) => extract_status(response),
         Err(_) => {
-            // Daemon not reachable — ensure it's running, return fallback
-            let _ = start_daemon(&socket_path, resolved_config_file.as_deref());
+            // Daemon not reachable — try to start it, return fallback
+            if let Err(e) = start_daemon(&socket_path, resolved_config_file.as_deref()) {
+                eprintln!("vcs-status-daemon: {e}");
+            }
             Ok(NOT_READY_FALLBACK.to_string())
         }
+    }
+}
+
+/// Query the running daemon for its version info.
+/// Returns (version, git_hash, features) or an error if the daemon isn't reachable.
+pub fn daemon_version() -> Result<(String, String, Vec<String>)> {
+    let socket_path = config::socket_path();
+    let response = send_request(&socket_path, &Request::Version)?;
+    match response {
+        Response::Version {
+            version,
+            git_hash,
+            features,
+        } => Ok((version, git_hash, features)),
+        Response::Error { message } => anyhow::bail!("{message}"),
+        _ => anyhow::bail!("unexpected response from daemon"),
     }
 }
 
@@ -148,6 +188,7 @@ pub fn status() -> Result<()> {
             pid,
             uptime_secs,
             watched_repos,
+            stats,
         }) => {
             let hours = uptime_secs / 3600;
             let mins = (uptime_secs % 3600) / 60;
@@ -160,6 +201,29 @@ pub fn status() -> Result<()> {
                 eprintln!("    {repo}");
             }
             eprintln!("  socket:        {}", socket_path.display());
+
+            // Performance stats
+            eprintln!();
+            eprintln!("  queries:       {} ({} hits, {} misses)",
+                stats.queries, stats.cache_hits, stats.cache_misses);
+            if stats.queries > 0 {
+                let hit_rate = stats.cache_hits as f64 / stats.queries as f64 * 100.0;
+                eprintln!("  hit rate:      {hit_rate:.1}%");
+            }
+            eprintln!("  refreshes:     {}", stats.refreshes);
+            eprintln!("  fs events:     {} ({} ignored)", stats.fs_events, stats.fs_events_ignored);
+
+            if !stats.recent_query_ms.is_empty() {
+                let mut sorted = stats.recent_query_ms.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let len = sorted.len();
+                let p50 = sorted[len / 2];
+                let p95 = sorted[(len as f64 * 0.95) as usize];
+                let p99 = sorted[((len as f64 * 0.99) as usize).min(len - 1)];
+                let max = sorted[len - 1];
+                eprintln!("  timing (last {len}): p50={p50:.1}ms p95={p95:.1}ms p99={p99:.1}ms max={max:.1}ms");
+            }
+
             Ok(())
         }
         Ok(Response::Error { message }) => anyhow::bail!("{message}"),
@@ -256,10 +320,12 @@ mod tests {
                 pid,
                 uptime_secs,
                 watched_repos,
+                stats,
             } => {
                 assert!(pid > 0);
                 assert!(uptime_secs < 10); // just started
                 assert!(watched_repos.is_empty()); // no queries yet
+                assert_eq!(stats.queries, 0);
             }
             other => panic!("expected DaemonStatus, got {other:?}"),
         }
