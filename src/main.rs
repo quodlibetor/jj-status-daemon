@@ -133,14 +133,14 @@ enum ConfigAction {
     Path,
     /// Set a config value (e.g. `config set template_name nerdfont`)
     Set {
-        /// Config key (e.g. "template_name", "debounce_ms")
+        /// Config key (e.g. "template_name", "idle_timeout_secs")
         key: String,
         /// Value to set (strings, numbers, and booleans are auto-detected)
         value: String,
     },
     /// Get a config value
     Get {
-        /// Config key (e.g. "template_name", "debounce_ms")
+        /// Config key (e.g. "template_name", "idle_timeout_secs")
         key: String,
     },
 }
@@ -333,7 +333,7 @@ fn run_config(action: ConfigAction, config_file: Option<&Path>) -> anyhow::Resul
             let cfg = config::load_config_from(config_file)?;
             let val = match key.as_str() {
                 "idle_timeout_secs" => cfg.idle_timeout_secs.to_string(),
-                "debounce_ms" => cfg.debounce_ms.to_string(),
+                "debounce_ms" => anyhow::bail!("debounce_ms has been removed"),
                 "format" => cfg.format.unwrap_or_default(),
                 "not_ready_format" => cfg.not_ready_format.unwrap_or_default(),
                 "template_name" => cfg.template_name,
@@ -362,7 +362,7 @@ fn query_live_status(repo_path: &std::path::Path) -> anyhow::Result<template::Re
         let repo_path = repo_path.canonicalize()?;
         // Detect VCS type
         if repo_path.join(".jj").is_dir() {
-            jj::query_jj_status(&repo_path, &config, false).await
+            jj::query_jj_status(&repo_path, &config).await
         } else if repo_path.join(".git").exists() {
             git::query_git_status(&repo_path, &config).await
         } else {
@@ -370,7 +370,7 @@ fn query_live_status(repo_path: &std::path::Path) -> anyhow::Result<template::Re
             let mut p = repo_path.as_path();
             loop {
                 if p.join(".jj").is_dir() {
-                    return jj::query_jj_status(p, &config, false).await;
+                    return jj::query_jj_status(p, &config).await;
                 }
                 if p.join(".git").exists() {
                     return git::query_git_status(p, &config).await;

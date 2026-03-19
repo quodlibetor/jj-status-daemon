@@ -10,8 +10,6 @@ use crate::protocol::VcsKind;
 pub struct Config {
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
-    #[serde(default = "default_debounce_ms")]
-    pub debounce_ms: u64,
     /// Explicit format template. If set, overrides `template_name`.
     #[serde(default)]
     pub format: Option<String>,
@@ -32,9 +30,6 @@ pub struct Config {
 
 fn default_idle_timeout_secs() -> u64 {
     3600
-}
-fn default_debounce_ms() -> u64 {
-    200
 }
 fn default_template_name() -> String {
     "ascii".to_string()
@@ -80,7 +75,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             idle_timeout_secs: default_idle_timeout_secs(),
-            debounce_ms: default_debounce_ms(),
             format: None,
             not_ready_format: None,
             template_name: default_template_name(),
@@ -170,10 +164,6 @@ pub const DEFAULT_CONFIG_TOML: &str = r##"# vcs-status-daemon configuration
 
 # How long (in seconds) the daemon stays alive without any queries.
 # idle_timeout_secs = 3600
-
-# Debounce interval (in milliseconds) for filesystem change events.
-# Lower values make the cache update faster; higher values reduce CPU usage.
-# debounce_ms = 200
 
 # How many ancestors of @ to search for bookmarks (jj only).
 # bookmark_search_depth = 10
@@ -282,7 +272,6 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.idle_timeout_secs, 3600);
-        assert_eq!(config.debounce_ms, 200);
         assert_eq!(config.bookmark_search_depth, 10);
         assert_eq!(config.template_name, "ascii");
         assert!(config.format.is_none());
@@ -347,13 +336,11 @@ template_name = "nonexistent"
     fn test_config_from_toml() {
         let toml_str = r#"
 idle_timeout_secs = 7200
-debounce_ms = 500
 format = "{{ change_id }}"
 bookmark_search_depth = 5
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.idle_timeout_secs, 7200);
-        assert_eq!(config.debounce_ms, 500);
         assert_eq!(config.format, Some("{{ change_id }}".to_string()));
         assert_eq!(config.bookmark_search_depth, 5);
     }
@@ -468,7 +455,7 @@ bookmark_search_depth = 5
                 cf_str,
                 "config",
                 "set",
-                "debounce_ms",
+                "idle_timeout_secs",
                 "500",
             ],
         );
@@ -480,7 +467,7 @@ bookmark_search_depth = 5
 
         let out = run_cmd(
             &exe,
-            &["--config-file", cf_str, "config", "get", "debounce_ms"],
+            &["--config-file", cf_str, "config", "get", "idle_timeout_secs"],
         );
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "500");
@@ -661,7 +648,7 @@ bookmark_search_depth = 5
         std::fs::write(&cf, "").unwrap();
         let cf_str = cf.to_str().unwrap();
 
-        // debounce_ms expects an integer, "notanumber" should fail validation
+        // idle_timeout_secs expects an integer, "notanumber" should fail validation
         let out = run_cmd(
             &exe,
             &[
@@ -669,7 +656,7 @@ bookmark_search_depth = 5
                 cf_str,
                 "config",
                 "set",
-                "debounce_ms",
+                "idle_timeout_secs",
                 "notanumber",
             ],
         );
@@ -679,7 +666,7 @@ bookmark_search_depth = 5
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("debounce_ms"),
+            stderr.contains("idle_timeout_secs"),
             "error should mention the key: {stderr}"
         );
     }

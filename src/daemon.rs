@@ -320,7 +320,7 @@ async fn handle_connection(
                 let query_path_bg = query_path.clone();
                 tokio::spawn(async move {
                     let result = match vcs_kind {
-                        VcsKind::Jj => query_jj_status(&repo_path, &config, false).await,
+                        VcsKind::Jj => query_jj_status(&repo_path, &config).await,
                         VcsKind::Git => query_git_status(&repo_path, &config).await,
                     };
                     match result {
@@ -463,58 +463,50 @@ fn record_timing(stats: &mut DaemonStats, elapsed: Duration) {
     stats.recent_query_ms.push(ms);
 }
 
-/// Tracks per-repo: (vcs_kind, working_copy_changed)
-fn collect_change(pending: &mut HashMap<PathBuf, (VcsKind, bool)>, event: WatchEvent) {
-    match event {
-        WatchEvent::Change {
-            repo_path,
-            vcs_kind,
-            working_copy_changed,
-        } => {
-            if working_copy_changed {
-                pending.insert(repo_path, (vcs_kind, true));
-            } else {
-                pending.entry(repo_path).or_insert((vcs_kind, false));
-            }
-        }
-        WatchEvent::Flush(_) => {} // handled by caller
-    }
+/// Per-repo refresh state: tracks whether a re-refresh is needed while one is in flight.
+/// The bool is `working_copy_changed` (true wins over false).
+enum RepoRefreshState {
+    /// A refresh task is running, no new events queued.
+    InFlight,
+    /// A refresh task is running AND new events arrived — re-refresh needed after completion.
+    Pending(VcsKind, bool),
 }
 
-#[tracing::instrument(skip_all, fields(count = pending.len()))]
-async fn process_pending(
-    state: &Arc<Mutex<DaemonState>>,
-    pending: &mut HashMap<PathBuf, (VcsKind, bool)>,
+/// Channel message sent when a per-repo refresh task completes.
+struct RefreshDone {
+    repo_path: PathBuf,
+}
+
+#[tracing::instrument(skip_all, fields(repo = %repo_path.display(), vcs = ?vcs_kind))]
+async fn refresh_repo(
+    repo_path: PathBuf,
+    vcs_kind: VcsKind,
+    state: Arc<Mutex<DaemonState>>,
+    done_tx: mpsc::UnboundedSender<RefreshDone>,
 ) {
-    let repos: Vec<(PathBuf, VcsKind, bool)> =
-        pending.drain().map(|(p, (v, wc))| (p, v, wc)).collect();
-    for (repo_path, vcs_kind, needs_snapshot) in repos {
-        let refresh_start = Instant::now();
-        let (config, cd) = {
-            let st = state.lock().await;
-            (st.config.clone(), st.cache_dir.clone())
-        };
-        let result = match vcs_kind {
-            VcsKind::Jj => {
-                let ignore_wc = !needs_snapshot;
-                query_jj_status(&repo_path, &config, ignore_wc).await
-            }
-            VcsKind::Git => query_git_status(&repo_path, &config).await,
-        };
-        match result {
-            Ok(status) => {
-                let formatted = format_status(&status, &config.resolved_format(), config.color);
-                write_cache_file(&cd, &repo_path, &formatted);
-                let mut st = state.lock().await;
-                st.cache.insert(repo_path, formatted);
-                st.stats.refreshes += 1;
-                record_timing(&mut st.stats, refresh_start.elapsed());
-            }
-            Err(e) => {
-                tracing::error!(repo = %repo_path.display(), error = %e, "refresh failed");
-            }
+    let refresh_start = Instant::now();
+    let (config, cd) = {
+        let st = state.lock().await;
+        (st.config.clone(), st.cache_dir.clone())
+    };
+    let result = match vcs_kind {
+        VcsKind::Jj => query_jj_status(&repo_path, &config).await,
+        VcsKind::Git => query_git_status(&repo_path, &config).await,
+    };
+    match result {
+        Ok(status) => {
+            let formatted = format_status(&status, &config.resolved_format(), config.color);
+            write_cache_file(&cd, &repo_path, &formatted);
+            let mut st = state.lock().await;
+            st.cache.insert(repo_path.clone(), formatted);
+            st.stats.refreshes += 1;
+            record_timing(&mut st.stats, refresh_start.elapsed());
+        }
+        Err(e) => {
+            tracing::error!(repo = %repo_path.display(), error = %e, "refresh failed");
         }
     }
+    let _ = done_tx.send(RefreshDone { repo_path });
 }
 
 #[tracing::instrument(skip_all)]
@@ -522,41 +514,86 @@ async fn refresh_task(
     state: Arc<Mutex<DaemonState>>,
     mut watch_rx: mpsc::UnboundedReceiver<WatchEvent>,
 ) {
-    let mut wc_changed: HashMap<PathBuf, (VcsKind, bool)> = HashMap::new();
+    // Per-repo concurrency control: at most one refresh per repo at a time.
+    let mut in_flight: HashMap<PathBuf, RepoRefreshState> = HashMap::new();
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<RefreshDone>();
 
     loop {
-        let Some(event) = watch_rx.recv().await else {
-            return;
-        };
+        tokio::select! {
+            event = watch_rx.recv() => {
+                let Some(event) = event else { return };
 
-        // Handle flush immediately if nothing is pending
-        if let WatchEvent::Flush(tx) = event {
-            process_pending(&state, &mut wc_changed).await;
-            let _ = tx.send(());
-            continue;
-        }
+                match event {
+                    WatchEvent::Flush(tx) => {
+                        // Wait for all in-flight refreshes to complete
+                        while !in_flight.is_empty() {
+                            if let Some(done) = done_rx.recv().await {
+                                handle_refresh_done(
+                                    &done, &mut in_flight, &state, &done_tx,
+                                );
+                            }
+                        }
+                        let _ = tx.send(());
+                    }
+                    WatchEvent::Change { repo_path, vcs_kind, working_copy_changed } => {
+                        state.lock().await.stats.fs_events += 1;
 
-        state.lock().await.stats.fs_events += 1;
-        collect_change(&mut wc_changed, event);
-
-        let debounce_ms = state.lock().await.config.debounce_ms;
-        tokio::time::sleep(Duration::from_millis(debounce_ms)).await;
-
-        // Drain remaining events, stopping at a flush
-        let mut flush_tx = None;
-        while let Ok(event) = watch_rx.try_recv() {
-            if let WatchEvent::Flush(tx) = event {
-                flush_tx = Some(tx);
-                break;
+                        match in_flight.get_mut(&repo_path) {
+                            None => {
+                                // No refresh running — start one immediately
+                                in_flight.insert(repo_path.clone(), RepoRefreshState::InFlight);
+                                tokio::spawn(refresh_repo(
+                                    repo_path, vcs_kind,
+                                    state.clone(), done_tx.clone(),
+                                ));
+                            }
+                            Some(entry) => {
+                                // Refresh already running — queue a re-refresh.
+                                // working_copy_changed=true wins (needs snapshot).
+                                match entry {
+                                    RepoRefreshState::InFlight => {
+                                        *entry = RepoRefreshState::Pending(vcs_kind, working_copy_changed);
+                                    }
+                                    RepoRefreshState::Pending(_, wc) => {
+                                        *wc = *wc || working_copy_changed;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            state.lock().await.stats.fs_events += 1;
-            collect_change(&mut wc_changed, event);
+            done = done_rx.recv() => {
+                if let Some(done) = done {
+                    handle_refresh_done(&done, &mut in_flight, &state, &done_tx);
+                }
+            }
         }
+    }
+}
 
-        process_pending(&state, &mut wc_changed).await;
-
-        if let Some(tx) = flush_tx {
-            let _ = tx.send(());
+fn handle_refresh_done(
+    done: &RefreshDone,
+    in_flight: &mut HashMap<PathBuf, RepoRefreshState>,
+    state: &Arc<Mutex<DaemonState>>,
+    done_tx: &mpsc::UnboundedSender<RefreshDone>,
+) {
+    match in_flight.remove(&done.repo_path) {
+        Some(RepoRefreshState::Pending(vcs_kind, wc)) if wc => {
+            // Working copy changed while refreshing — re-refresh immediately
+            in_flight.insert(done.repo_path.clone(), RepoRefreshState::InFlight);
+            tokio::spawn(refresh_repo(
+                done.repo_path.clone(), vcs_kind,
+                state.clone(), done_tx.clone(),
+            ));
+        }
+        Some(RepoRefreshState::Pending(..)) => {
+            // Only VCS-internal changes arrived during refresh — skip to
+            // avoid infinite loop (our own queries create VCS events).
+            tracing::debug!(repo = %done.repo_path.display(), "skipping re-refresh for VCS-internal-only events");
+        }
+        _ => {
+            // Done, no pending work for this repo
         }
     }
 }
@@ -1026,7 +1063,6 @@ mod tests {
         let rt = temp_runtime_dir("cache");
         let socket_path = rt.path().join("sock");
         let config = Config {
-            debounce_ms: 100,
             color: false,
             format: Some(
                 "{{ change_id }} {{ description }}{% if empty %} EMPTY{% endif %}".to_string(),
@@ -1156,7 +1192,6 @@ mod tests {
         let socket_path = rt.path().join("sock");
         let config = Config {
             color: false,
-            debounce_ms: 100,
             format: Some("{{ change_id }} {{ description }}{% for b in bookmarks %} {{ b.name }}{% endfor %}{% if empty %} EMPTY{% endif %}".to_string()),
             ..Default::default()
         };
@@ -1212,6 +1247,13 @@ mod tests {
             .unwrap();
 
         tokio::fs::write(dir_b.path().join("hello.txt"), "world\n")
+            .await
+            .unwrap();
+        // Snapshot so jj-lib sees the working copy change
+        Command::new("jj")
+            .args(["status"])
+            .current_dir(dir_b.path())
+            .output()
             .await
             .unwrap();
 

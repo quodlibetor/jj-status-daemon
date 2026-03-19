@@ -3,8 +3,6 @@ use futures::StreamExt;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
-
 use jj_lib::backend::CommitId;
 use jj_lib::backend::TreeValue;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
@@ -27,8 +25,6 @@ use jj_lib::workspace::{Workspace, default_working_copy_factories};
 use crate::config::Config;
 use crate::template::{Bookmark, RepoStatus};
 
-const JJ_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Create minimal UserSettings for read-only operations.
 fn create_user_settings() -> Result<UserSettings> {
     let mut config = StackedConfig::with_defaults();
@@ -43,32 +39,6 @@ fn create_user_settings() -> Result<UserSettings> {
     UserSettings::from_config(config).context("create UserSettings")
 }
 
-/// Trigger a working copy snapshot by running a minimal jj subprocess.
-///
-/// jj-lib's snapshot API requires locking the working copy and constructing
-/// ignore patterns, which is complex and tightly coupled to internal state.
-/// A single lightweight subprocess is simpler and handles all the edge cases.
-#[tracing::instrument(fields(repo = %repo_path.display()))]
-async fn trigger_snapshot(repo_path: &Path) -> Result<()> {
-    let output = match tokio::time::timeout(
-        JJ_TIMEOUT,
-        tokio::process::Command::new("jj")
-            .args(["log", "-r", "@", "--no-graph", "-T", "\"\"", "--quiet"])
-            .current_dir(repo_path)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    {
-        Ok(result) => result.context("failed to run jj snapshot")?,
-        Err(_) => anyhow::bail!("jj snapshot timed out"),
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("jj snapshot failed: {stderr}");
-    }
-    Ok(())
-}
 
 /// Read file content from the store into a Vec.
 async fn read_file_content(
@@ -473,14 +443,7 @@ async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<RepoStatus> {
 pub async fn query_jj_status(
     repo_path: &Path,
     config: &Config,
-    ignore_working_copy: bool,
 ) -> Result<RepoStatus> {
-    // When working copy changes are detected, trigger a snapshot first
-    // so that @ reflects the current working directory state.
-    if !ignore_working_copy {
-        trigger_snapshot(repo_path).await?;
-    }
-
     let repo_path = repo_path.to_path_buf();
     let depth = config.bookmark_search_depth;
 
@@ -539,7 +502,7 @@ mod tests {
             color: false,
             ..Default::default()
         };
-        let status = query_jj_status(dir.path(), &config, false).await.unwrap();
+        let status = query_jj_status(dir.path(), &config).await.unwrap();
         assert!(!status.change_id.is_empty());
         assert!(status.empty);
         assert!(status.bookmarks.is_empty());
@@ -553,7 +516,7 @@ mod tests {
             color: false,
             ..Default::default()
         };
-        let status = query_jj_status(dir.path(), &config, false).await.unwrap();
+        let status = query_jj_status(dir.path(), &config).await.unwrap();
         assert_eq!(status.description, "hello world");
     }
 
@@ -565,7 +528,7 @@ mod tests {
             color: false,
             ..Default::default()
         };
-        let status = query_jj_status(dir.path(), &config, false).await.unwrap();
+        let status = query_jj_status(dir.path(), &config).await.unwrap();
         assert!(
             status
                 .bookmarks
@@ -583,7 +546,7 @@ mod tests {
             color: false,
             ..Default::default()
         };
-        let status = query_jj_status(dir.path(), &config, false).await.unwrap();
+        let status = query_jj_status(dir.path(), &config).await.unwrap();
         assert!(
             status
                 .bookmarks
@@ -599,7 +562,7 @@ mod tests {
             color: false,
             ..Default::default()
         };
-        let status = query_jj_status(dir.path(), &config, false).await.unwrap();
+        let status = query_jj_status(dir.path(), &config).await.unwrap();
         assert_eq!(status.workspace_name, "default");
         assert!(status.is_default_workspace);
     }
@@ -628,12 +591,12 @@ mod tests {
         };
 
         // Query from the secondary workspace
-        let status = query_jj_status(&work2, &config, false).await.unwrap();
+        let status = query_jj_status(&work2, &config).await.unwrap();
         assert_eq!(status.workspace_name, "secondary");
         assert!(!status.is_default_workspace);
 
         // Original workspace is still "default"
-        let status = query_jj_status(dir.path(), &config, false).await.unwrap();
+        let status = query_jj_status(dir.path(), &config).await.unwrap();
         assert_eq!(status.workspace_name, "default");
         assert!(status.is_default_workspace);
     }
@@ -642,11 +605,13 @@ mod tests {
     async fn test_diff_stats() {
         let dir = create_jj_repo().await;
         std::fs::write(dir.path().join("test.txt"), "hello\nworld\n").unwrap();
+        // Snapshot the working copy so jj-lib sees the new file
+        jj_cmd(dir.path(), &["status"]).await;
         let config = Config {
             color: false,
             ..Default::default()
         };
-        let status = query_jj_status(dir.path(), &config, false).await.unwrap();
+        let status = query_jj_status(dir.path(), &config).await.unwrap();
         assert!(status.files_changed >= 1);
         assert!(status.lines_added > 0);
         // For jj, total should equal unstaged (no staging area)
@@ -781,7 +746,7 @@ mod tests {
             color: false,
             ..Default::default()
         };
-        let status = query_jj_status(dir.path(), &config, false).await.unwrap();
+        let status = query_jj_status(dir.path(), &config).await.unwrap();
 
         assert_eq!(
             (status.files_changed, status.lines_added, status.lines_removed),
@@ -840,7 +805,7 @@ mod tests {
             color: false,
             ..Default::default()
         };
-        let status = query_jj_status(dir.path(), &config, false).await.unwrap();
+        let status = query_jj_status(dir.path(), &config).await.unwrap();
 
         assert_eq!(
             (status.files_changed, status.lines_added, status.lines_removed),
@@ -918,7 +883,7 @@ mod tests {
             color: false,
             ..Default::default()
         };
-        let status = query_jj_status(dir.path(), &config, false).await.unwrap();
+        let status = query_jj_status(dir.path(), &config).await.unwrap();
 
         assert_eq!(
             (status.files_changed, status.lines_added, status.lines_removed),

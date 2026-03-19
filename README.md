@@ -198,9 +198,6 @@ Configuration is loaded from `~/.config/vcs-status-daemon/config.toml`. All fiel
 # How long the daemon stays alive with no queries (seconds, default: 3600)
 idle_timeout_secs = 3600
 
-# Debounce delay for filesystem events before refreshing (ms, default: 200)
-debounce_ms = 200
-
 # How many ancestor commits to search for bookmarks in jj repos (default: 10)
 bookmark_search_depth = 10
 
@@ -450,7 +447,7 @@ format = '''
    - Shells out to `jj` or `git` to gather status info (commit, branch/bookmarks, diff stats)
    - Renders the format template and caches the result
 
-3. **On filesystem changes**, the daemon debounces events (200ms default), then re-runs the appropriate VCS command and updates the cache. For jj repos, it uses `--ignore-working-copy` when only `.jj/` internal files changed (faster, avoids unnecessary snapshots), and omits it when working copy files changed (so `jj` snapshots first, giving accurate diff stats).
+3. **On filesystem changes**, the daemon immediately re-runs the appropriate VCS command and updates the cache (at most one refresh per repo at a time; events arriving during a refresh trigger a re-refresh on completion). For jj repos, it uses `--ignore-working-copy` when only `.jj/` internal files changed (faster, avoids unnecessary snapshots), and omits it when working copy files changed (so `jj` snapshots first, giving accurate diff stats).
 
 4. **Subsequent queries** return the cached string instantly.
 
