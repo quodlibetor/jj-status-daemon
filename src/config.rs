@@ -93,6 +93,25 @@ impl Default for Config {
     }
 }
 
+/// Check that the current user is not root, unless allow_root is true
+/// or VCS_STATUS_DAEMON_DIR is explicitly set.
+pub fn check_not_root(allow_root: bool) -> Result<()> {
+    if allow_root {
+        return Ok(());
+    }
+    // If VCS_STATUS_DAEMON_DIR is explicitly set, the user knows what they're doing
+    if let Ok(path) = std::env::var("VCS_STATUS_DAEMON_DIR")
+        && !path.is_empty()
+    {
+        return Ok(());
+    }
+    let user = std::env::var("USER").unwrap_or_default();
+    if user == "root" {
+        anyhow::bail!("refusing to run as root (use --allow-root to override)");
+    }
+    Ok(())
+}
+
 /// Resolve the daemon runtime directory.
 ///
 /// Checks `VCS_STATUS_DAEMON_DIR` env var first, then falls back
@@ -101,22 +120,25 @@ impl Default for Config {
 /// Layout:
 ///   `<dir>/sock`   — Unix domain socket
 ///   `<dir>/cache/` — cached status files
-pub fn runtime_dir() -> PathBuf {
+pub fn runtime_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("VCS_STATUS_DAEMON_DIR")
         && !path.is_empty()
     {
-        return PathBuf::from(path);
+        return Ok(PathBuf::from(path));
     }
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-    PathBuf::from(format!("/tmp/vcs-status-daemon-{user}"))
+    let user = std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("$USER is not set; set $USER or $VCS_STATUS_DAEMON_DIR"))?;
+    Ok(PathBuf::from(format!("/tmp/vcs-status-daemon-{user}")))
 }
 
-pub fn socket_path() -> PathBuf {
-    runtime_dir().join("sock")
+pub fn socket_path() -> Result<PathBuf> {
+    Ok(runtime_dir()?.join("sock"))
 }
 
-pub fn pid_path() -> PathBuf {
-    runtime_dir().join("pid")
+pub fn pid_path() -> Result<PathBuf> {
+    Ok(runtime_dir()?.join("pid"))
 }
 
 /// Find the repo root and VCS kind. jj wins if both `.jj/` and `.git/` are present.
