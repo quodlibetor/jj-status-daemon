@@ -29,10 +29,7 @@ fn print_version() {
     );
     match client::daemon_version() {
         Ok((dv, dh, df)) => {
-            println!(
-                "daemon          {}",
-                format_version_info(&dv, &dh, &df)
-            );
+            println!("daemon          {}", format_version_info(&dv, &dh, &df));
         }
         Err(_) => {
             println!("daemon          not running");

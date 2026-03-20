@@ -1,8 +1,5 @@
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use jj_lib::backend::CommitId;
 use jj_lib::backend::TreeValue;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
@@ -21,6 +18,9 @@ use jj_lib::revset::{
 use jj_lib::settings::UserSettings;
 use jj_lib::time_util::DatePatternContext;
 use jj_lib::workspace::{Workspace, default_working_copy_factories};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
@@ -40,7 +40,6 @@ fn create_user_settings() -> Result<UserSettings> {
     config.add_layer(user_layer);
     UserSettings::from_config(config).context("create UserSettings")
 }
-
 
 /// Read file content from the store into a Vec.
 async fn read_file_content(
@@ -96,7 +95,7 @@ pub struct JjRepoState {
 /// - Base entries with `Some(stats)` in overlay: overlay replaces base.
 /// - Base entries with `None` in overlay: file reverted to parent, excluded.
 /// - Overlay entries not in base: new files created after snapshot.
-fn aggregate_overlay_stats(
+pub fn aggregate_overlay_stats(
     base: &HashMap<String, FileDiffStats>,
     overlay: &HashMap<String, Option<FileDiffStats>>,
 ) -> (u32, u32, u32) {
@@ -311,10 +310,29 @@ async fn diff_single_file(
 }
 
 /// Convert an absolute filesystem path to a repo-relative path string.
-fn abs_to_repo_relative(repo_root: &Path, abs_path: &Path) -> Option<String> {
-    let rel = abs_path.strip_prefix(repo_root).ok()?;
-    // jj RepoPath uses forward slashes internally
-    Some(rel.to_string_lossy().replace('\\', "/"))
+///
+/// Tries direct strip_prefix first, then falls back to canonicalizing
+/// the path (handling symlinks and macOS /var → /private/var).
+/// For deleted files, canonicalizes the parent directory instead.
+pub fn abs_to_repo_relative(repo_root: &Path, abs_path: &Path) -> Option<String> {
+    // Fast path: direct prefix strip
+    if let Ok(rel) = abs_path.strip_prefix(repo_root) {
+        return Some(rel.to_string_lossy().replace('\\', "/"));
+    }
+    // Slow path: canonicalize (handles symlinks, /var → /private/var, etc.)
+    let canonical = abs_path.canonicalize().or_else(|e| {
+        // File might be deleted; canonicalize the parent and append filename
+        let parent = abs_path.parent().ok_or(e)?;
+        let name = abs_path
+            .file_name()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no file name"))?;
+        parent.canonicalize().map(|cp| cp.join(name))
+    });
+    if let Ok(canonical) = canonical {
+        let rel = canonical.strip_prefix(repo_root).ok()?;
+        return Some(rel.to_string_lossy().replace('\\', "/"));
+    }
+    None
 }
 
 /// Default revset alias definitions from jj-cli's config/revsets.toml.
@@ -336,7 +354,9 @@ const DEFAULT_IMMUTABLE_HEADS_ALIAS: &str = "builtin_immutable_heads()";
 fn load_user_revset_aliases(aliases_map: &mut RevsetAliasesMap) {
     // Check standard jj config locations
     let config_paths: Vec<std::path::PathBuf> = [
-        std::env::var("JJ_CONFIG").ok().map(std::path::PathBuf::from),
+        std::env::var("JJ_CONFIG")
+            .ok()
+            .map(std::path::PathBuf::from),
         dirs::config_dir().map(|d| d.join("jj").join("config.toml")),
         dirs::home_dir().map(|d| d.join(".jjconfig.toml")),
     ]
@@ -598,8 +618,7 @@ async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<(RepoStatus, JjRep
     };
     let current_tree = commit.tree();
     let base_file_stats = if let Some(ref parent_tree) = parent_tree {
-        let per_file =
-            compute_per_file_diff_stats(repo.store(), parent_tree, &current_tree).await;
+        let per_file = compute_per_file_diff_stats(repo.store(), parent_tree, &current_tree).await;
         let (f, a, r) = aggregate_file_stats(&per_file);
         status.files_changed = f;
         status.lines_added = a;
@@ -638,10 +657,7 @@ async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<(RepoStatus, JjRep
 }
 
 #[tracing::instrument(skip(config), fields(repo = %repo_path.display()))]
-pub async fn query_jj_status(
-    repo_path: &Path,
-    config: &Config,
-) -> Result<RepoStatus> {
+pub async fn query_jj_status(repo_path: &Path, config: &Config) -> Result<RepoStatus> {
     let (status, _state) = query_jj_status_with_state(repo_path, config).await?;
     Ok(status)
 }
@@ -662,7 +678,6 @@ pub async fn query_jj_status_with_state(
 }
 
 /// Requests that can be sent to the jj worker thread.
-#[allow(dead_code)]
 pub enum JjWorkerRequest {
     /// Full refresh: reload workspace/repo, compute all status fields.
     FullRefresh {
@@ -675,10 +690,6 @@ pub enum JjWorkerRequest {
         repo_path: PathBuf,
         changed_paths: Vec<PathBuf>,
         reply: tokio::sync::oneshot::Sender<Result<RepoStatus>>,
-    },
-    /// Drop retained state for a repo (cleanup).
-    DropRepo {
-        repo_path: PathBuf,
     },
 }
 
@@ -757,9 +768,6 @@ async fn jj_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
 
                 let status = state.current_status();
                 let _ = reply.send(Ok(status));
-            }
-            JjWorkerRequest::DropRepo { repo_path } => {
-                states.remove(&repo_path);
             }
         }
     }
@@ -978,7 +986,9 @@ mod tests {
         std::fs::write(dir.path().join("src/main.rs"), &main_initial).unwrap();
 
         // src/lib.rs: 15 lines (unchanged throughout test)
-        let lib_content: String = (1..=15).map(|i| format!("pub fn lib_{i}() {{}}\n")).collect();
+        let lib_content: String = (1..=15)
+            .map(|i| format!("pub fn lib_{i}() {{}}\n"))
+            .collect();
         std::fs::write(dir.path().join("src/lib.rs"), &lib_content).unwrap();
 
         // README.md: 10 lines
@@ -993,8 +1003,9 @@ mod tests {
         .unwrap();
 
         // tests/test_basic.rs: 12 lines (will be deleted)
-        let test_initial: String =
-            (1..=12).map(|i| format!("#[test] fn test_{i}() {{}}\n")).collect();
+        let test_initial: String = (1..=12)
+            .map(|i| format!("#[test] fn test_{i}() {{}}\n"))
+            .collect();
         std::fs::write(dir.path().join("tests/test_basic.rs"), &test_initial).unwrap();
 
         // Commit these as the parent: `jj new` moves @ forward
@@ -1003,15 +1014,16 @@ mod tests {
         // --- Complex modifications ---
 
         // 1. New file: src/utils.rs (8 lines)
-        let utils_content: String = (1..=8).map(|i| format!("pub fn util_{i}() {{}}\n")).collect();
+        let utils_content: String = (1..=8)
+            .map(|i| format!("pub fn util_{i}() {{}}\n"))
+            .collect();
         std::fs::write(dir.path().join("src/utils.rs"), &utils_content).unwrap();
 
         // 2. Delete tests/test_basic.rs
         std::fs::remove_file(dir.path().join("tests/test_basic.rs")).unwrap();
 
         // 3. Modify src/main.rs: change lines 5-7, add 4 lines at end
-        let mut main_lines: Vec<String> =
-            (1..=20).map(|i| format!("fn line_{i}() {{}}")).collect();
+        let mut main_lines: Vec<String> = (1..=20).map(|i| format!("fn line_{i}() {{}}")).collect();
         main_lines[4] = "fn modified_5() { /* changed */ }".to_string();
         main_lines[5] = "fn modified_6() { /* changed */ }".to_string();
         main_lines[6] = "fn modified_7() { /* changed */ }".to_string();
@@ -1019,11 +1031,7 @@ mod tests {
         main_lines.push("fn added_22() {}".to_string());
         main_lines.push("fn added_23() {}".to_string());
         main_lines.push("fn added_24() {}".to_string());
-        std::fs::write(
-            dir.path().join("src/main.rs"),
-            main_lines.join("\n") + "\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), main_lines.join("\n") + "\n").unwrap();
 
         // 4. Modify README.md: remove last 3 lines, add 5 new lines
         let mut readme_lines: Vec<String> = (1..=7).map(|i| format!("# Section {i}")).collect();
@@ -1032,11 +1040,7 @@ mod tests {
         readme_lines.push("# New Section C".to_string());
         readme_lines.push("# New Section D".to_string());
         readme_lines.push("# New Section E".to_string());
-        std::fs::write(
-            dir.path().join("README.md"),
-            readme_lines.join("\n") + "\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("README.md"), readme_lines.join("\n") + "\n").unwrap();
 
         // 5. Modify config.toml: change 2 of 5 lines
         std::fs::write(
@@ -1057,7 +1061,11 @@ mod tests {
         let status = query_jj_status(dir.path(), &config).await.unwrap();
 
         assert_eq!(
-            (status.files_changed, status.lines_added, status.lines_removed),
+            (
+                status.files_changed,
+                status.lines_added,
+                status.lines_removed
+            ),
             (cli_files, cli_added, cli_removed),
             "our stats ({}f, +{}, -{}) != jj diff --stat ({}f, +{}, -{})\njj output:\n{}",
             status.files_changed,
@@ -1090,7 +1098,7 @@ mod tests {
         let mut lines: Vec<String> = Vec::new();
         for i in 1..=50 {
             match i {
-                5..=8 => continue,    // deleted
+                5..=8 => continue, // deleted
                 15 => lines.push("changed line 15".to_string()),
                 16 => lines.push("changed line 16".to_string()),
                 17 => lines.push("changed line 17".to_string()),
@@ -1116,7 +1124,11 @@ mod tests {
         let status = query_jj_status(dir.path(), &config).await.unwrap();
 
         assert_eq!(
-            (status.files_changed, status.lines_added, status.lines_removed),
+            (
+                status.files_changed,
+                status.lines_added,
+                status.lines_removed
+            ),
             (cli_files, cli_added, cli_removed),
             "our stats ({}f, +{}, -{}) != jj diff --stat ({}f, +{}, -{})\njj output:\n{}",
             status.files_changed,
@@ -1137,11 +1149,7 @@ mod tests {
         let dir = create_jj_repo().await;
 
         // File that will go from content to empty
-        std::fs::write(
-            dir.path().join("shrink.txt"),
-            "aaa\nbbb\nccc\nddd\neee\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("shrink.txt"), "aaa\nbbb\nccc\nddd\neee\n").unwrap();
 
         // File with repeated/similar lines (harder for diff algorithms)
         let repetitive: String = (1..=20)
@@ -1194,7 +1202,11 @@ mod tests {
         let status = query_jj_status(dir.path(), &config).await.unwrap();
 
         assert_eq!(
-            (status.files_changed, status.lines_added, status.lines_removed),
+            (
+                status.files_changed,
+                status.lines_added,
+                status.lines_removed
+            ),
             (cli_files, cli_added, cli_removed),
             "our stats ({}f, +{}, -{}) != jj diff --stat ({}f, +{}, -{})\njj output:\n{}",
             status.files_changed,
@@ -1235,11 +1247,7 @@ mod tests {
         std::fs::write(dir.path().join("hello.txt"), "line1\nline2\nline3\n").unwrap();
 
         // Incremental update — should see the new file
-        let abs_path = dir
-            .path()
-            .canonicalize()
-            .unwrap()
-            .join("hello.txt");
+        let abs_path = dir.path().canonicalize().unwrap().join("hello.txt");
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         jj_worker
             .send(JjWorkerRequest::IncrementalUpdate {
@@ -1297,7 +1305,10 @@ mod tests {
             .unwrap();
         let status = reply_rx.await.unwrap().unwrap();
         assert_eq!(status.files_changed, 1);
-        assert_eq!(status.lines_added, 4, "should see 4 lines added (vs parent)");
+        assert_eq!(
+            status.lines_added, 4,
+            "should see 4 lines added (vs parent)"
+        );
         assert_eq!(status.lines_removed, 0);
     }
 
@@ -1397,9 +1408,9 @@ mod tests {
     #[test]
     fn test_aggregate_mixed_base_and_overlay() {
         let base = HashMap::from([
-            ("unchanged.rs".into(), fstats(10, 2)),  // no overlay → kept
-            ("modified.rs".into(), fstats(5, 1)),     // overlay replaces
-            ("reverted.rs".into(), fstats(8, 3)),     // overlay reverts to parent
+            ("unchanged.rs".into(), fstats(10, 2)), // no overlay → kept
+            ("modified.rs".into(), fstats(5, 1)),   // overlay replaces
+            ("reverted.rs".into(), fstats(8, 3)),   // overlay reverts to parent
         ]);
         let overlay = HashMap::from([
             ("modified.rs".into(), Some(fstats(7, 0))),
@@ -1489,7 +1500,11 @@ mod tests {
 
     /// Helper: apply a single file event to an overlay (mirrors jj_worker_loop logic).
     /// `diff` is `Some(stats)` if the file differs from parent, `None` if it matches.
-    fn apply_event(overlay: &mut HashMap<String, Option<FileDiffStats>>, path: &str, diff: Option<FileDiffStats>) {
+    fn apply_event(
+        overlay: &mut HashMap<String, Option<FileDiffStats>>,
+        path: &str,
+        diff: Option<FileDiffStats>,
+    ) {
         overlay.insert(path.to_string(), diff);
     }
 
@@ -1609,8 +1624,8 @@ mod tests {
 
         // Full refresh: new base, overlay cleared (simulates what jj_worker_loop does)
         base = HashMap::from([
-            ("old.rs".into(), fstats(10, 2)),   // now snapshotted with the overlay values
-            ("new.txt".into(), fstats(5, 0)),   // also snapshotted
+            ("old.rs".into(), fstats(10, 2)), // now snapshotted with the overlay values
+            ("new.txt".into(), fstats(5, 0)), // also snapshotted
         ]);
         overlay.clear();
         assert_eq!(aggregate_overlay_stats(&base, &overlay), (2, 15, 2));

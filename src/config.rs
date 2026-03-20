@@ -467,7 +467,13 @@ bookmark_search_depth = 5
 
         let out = run_cmd(
             &exe,
-            &["--config-file", cf_str, "config", "get", "idle_timeout_secs"],
+            &[
+                "--config-file",
+                cf_str,
+                "config",
+                "get",
+                "idle_timeout_secs",
+            ],
         );
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "500");

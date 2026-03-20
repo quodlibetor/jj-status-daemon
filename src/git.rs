@@ -1,8 +1,12 @@
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tokio::sync::mpsc;
+
 use crate::config::Config;
+use crate::jj::{FileDiffStats, abs_to_repo_relative, aggregate_overlay_stats};
 use crate::template::RepoStatus;
 
 const GIT2_TIMEOUT: Duration = Duration::from_secs(30);
@@ -16,8 +20,168 @@ fn diff_stats(diff: &git2::Diff<'_>) -> Result<(u32, u32, u32)> {
     ))
 }
 
+/// Extract per-file line-level diff stats from a git2 Diff.
+fn per_file_stats_from_diff(diff: &git2::Diff<'_>) -> Result<HashMap<String, FileDiffStats>> {
+    let mut result: HashMap<String, FileDiffStats> = HashMap::new();
+
+    diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().to_string());
+        if let Some(path) = path {
+            let stats = result.entry(path).or_default();
+            match line.origin() {
+                '+' => stats.lines_added += 1,
+                '-' => stats.lines_removed += 1,
+                _ => {}
+            }
+        }
+        true
+    })?;
+
+    // Also ensure entries exist for files with no line content (binary, pure renames)
+    for i in 0..diff.deltas().len() {
+        if let Some(delta) = diff.get_delta(i) {
+            let path = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .map(|p| p.to_string_lossy().to_string());
+            if let Some(path) = path {
+                result.entry(path).or_default();
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Aggregate per-file stats into (files_changed, lines_added, lines_removed).
+fn aggregate_file_stats(per_file: &HashMap<String, FileDiffStats>) -> (u32, u32, u32) {
+    let mut files = 0u32;
+    let mut added = 0u32;
+    let mut removed = 0u32;
+    for stats in per_file.values() {
+        if stats.lines_added > 0 || stats.lines_removed > 0 {
+            files += 1;
+            added += stats.lines_added;
+            removed += stats.lines_removed;
+        }
+    }
+    (files, added, removed)
+}
+
+/// Retained git state for incremental working copy diffs.
+pub struct GitRepoState {
+    /// OID of the HEAD tree (for total diffs: HEAD → workdir).
+    head_tree_oid: Option<git2::Oid>,
+    repo_root: PathBuf,
+    base_status: RepoStatus,
+    /// Per-file stats from index → workdir diff (unstaged).
+    base_unstaged: HashMap<String, FileDiffStats>,
+    /// Per-file stats from HEAD tree → workdir+index diff (total).
+    base_total: HashMap<String, FileDiffStats>,
+    /// Overlay for unstaged diffs (working copy changes only).
+    unstaged_overlay: HashMap<String, Option<FileDiffStats>>,
+    /// Overlay for total diffs (working copy changes only).
+    total_overlay: HashMap<String, Option<FileDiffStats>>,
+}
+
+impl GitRepoState {
+    /// Build a RepoStatus with current aggregate diff stats from base + overlay.
+    fn current_status(&self) -> RepoStatus {
+        let (us_f, us_a, us_r) =
+            aggregate_overlay_stats(&self.base_unstaged, &self.unstaged_overlay);
+        let (tot_f, tot_a, tot_r) = aggregate_overlay_stats(&self.base_total, &self.total_overlay);
+        RepoStatus {
+            files_changed: us_f,
+            lines_added: us_a,
+            lines_removed: us_r,
+            total_files_changed: tot_f,
+            total_lines_added: tot_a,
+            total_lines_removed: tot_r,
+            // Staged stats are unchanged by working copy edits
+            ..self.base_status.clone()
+        }
+    }
+
+    /// Incrementally update overlays for the given changed files.
+    fn update_files(&mut self, changed_paths: &[PathBuf]) {
+        let rel_paths: Vec<String> = changed_paths
+            .iter()
+            .filter_map(|p| abs_to_repo_relative(&self.repo_root, p))
+            .collect();
+
+        if rel_paths.is_empty() {
+            return;
+        }
+
+        // Re-open the repo to get fresh stat/index state.
+        // This is cheap (just reads .git/HEAD, config, index) and avoids
+        // stale stat-cache issues that prevent detecting working copy changes.
+        let repo = match git2::Repository::open(&self.repo_root) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to re-open git repo for incremental update");
+                return;
+            }
+        };
+
+        let head_tree = self.head_tree_oid.and_then(|oid| repo.find_tree(oid).ok());
+
+        // Batch unstaged diff: index → workdir with pathspec filter
+        {
+            let mut opts = git2::DiffOptions::new();
+            for path in &rel_paths {
+                opts.pathspec(path);
+            }
+            match repo.diff_index_to_workdir(None, Some(&mut opts)) {
+                Ok(diff) => {
+                    let stats_map = per_file_stats_from_diff(&diff).unwrap_or_default();
+                    for path in &rel_paths {
+                        self.unstaged_overlay
+                            .insert(path.clone(), stats_map.get(path).cloned());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "incremental unstaged diff failed");
+                }
+            }
+        }
+
+        // Batch total diff: HEAD tree → workdir+index with pathspec filter
+        {
+            let mut opts = git2::DiffOptions::new();
+            for path in &rel_paths {
+                opts.pathspec(path);
+            }
+            match repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts)) {
+                Ok(diff) => {
+                    let stats_map = per_file_stats_from_diff(&diff).unwrap_or_default();
+                    for path in &rel_paths {
+                        self.total_overlay
+                            .insert(path.clone(), stats_map.get(path).cloned());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "incremental total diff failed");
+                }
+            }
+        }
+    }
+}
+
 #[tracing::instrument(fields(repo = %repo_path.display()))]
 fn query_git_status_blocking(repo_path: &Path) -> Result<RepoStatus> {
+    let (status, _state) = query_git_status_blocking_with_state(repo_path)?;
+    Ok(status)
+}
+
+/// Full git status query that also returns retained state for incremental updates.
+#[tracing::instrument(fields(repo = %repo_path.display()))]
+fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus, GitRepoState)> {
     let repo = {
         let _span = tracing::debug_span!("git_open").entered();
         git2::Repository::open(repo_path).context("failed to open git repo")?
@@ -28,103 +192,144 @@ fn query_git_status_blocking(repo_path: &Path) -> Result<RepoStatus> {
         ..Default::default()
     };
 
-    // Branch and commit info
-    let head = match repo.head() {
-        Ok(head) => head,
-        Err(_) => {
-            // Unborn HEAD (empty repo)
-            return Ok(status);
+    // Check for unborn HEAD
+    if repo.head().is_err() {
+        let repo_root = repo_path
+            .canonicalize()
+            .unwrap_or_else(|_| repo_path.to_path_buf());
+        let state = GitRepoState {
+            head_tree_oid: None,
+            repo_root,
+            base_status: status.clone(),
+            base_unstaged: HashMap::new(),
+            base_total: HashMap::new(),
+            unstaged_overlay: HashMap::new(),
+            total_overlay: HashMap::new(),
+        };
+        return Ok((status, state));
+    }
+
+    let (head_tree_oid, base_unstaged, base_total) = {
+        // head() is Ok — we checked above
+        let head = repo.head().unwrap();
+
+        // Branch name (or short OID if detached)
+        status.branch = head.shorthand().unwrap_or("").to_string();
+
+        // Commit ID (short), description, and tree for diff stats
+        let head_tree_oid = if let Ok(commit) = head.peel_to_commit() {
+            let oid = commit.id();
+            status.commit_id = commit
+                .as_object()
+                .short_id()
+                .map(|buf| buf.as_str().unwrap_or("").to_string())
+                .unwrap_or_else(|_| format!("{:.7}", oid));
+            status.description = commit.summary().unwrap_or("").to_string();
+
+            // Empty detection: compare HEAD tree to parent tree
+            let head_tree = commit.tree().ok();
+            let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+            if let Some(head_tree) = &head_tree {
+                let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(head_tree), None);
+                status.empty = match diff {
+                    Ok(d) => d.stats().map(|s| s.files_changed() == 0).unwrap_or(false),
+                    Err(_) => false,
+                };
+            }
+            head_tree.map(|t| t.id())
+        } else {
+            None
+        };
+
+        // Re-lookup the head tree by OID (so `head` and `commit` can be dropped)
+        let head_tree = head_tree_oid.and_then(|oid| repo.find_tree(oid).ok());
+
+        // Conflict detection
+        status.conflict = repo.index().map(|idx| idx.has_conflicts()).unwrap_or(false);
+
+        // Unstaged: index → workdir (with per-file stats)
+        let base_unstaged = {
+            let _span = tracing::debug_span!("diff_unstaged").entered();
+            let mut diff_opts = git2::DiffOptions::new();
+            if let Ok(diff) = repo.diff_index_to_workdir(None, Some(&mut diff_opts)) {
+                let per_file = per_file_stats_from_diff(&diff).unwrap_or_default();
+                let (f, a, r) = aggregate_file_stats(&per_file);
+                status.files_changed = f;
+                status.lines_added = a;
+                status.lines_removed = r;
+                per_file
+            } else {
+                HashMap::new()
+            }
+        };
+
+        // Staged: tree → index
+        {
+            let _span = tracing::debug_span!("diff_staged").entered();
+            if let Ok(diff) = repo.diff_tree_to_index(head_tree.as_ref(), None, None)
+                && let Ok((f, a, r)) = diff_stats(&diff)
+            {
+                status.staged_files_changed = f;
+                status.staged_lines_added = a;
+                status.staged_lines_removed = r;
+            }
         }
+
+        // Total: tree → workdir (with per-file stats)
+        let base_total = {
+            let _span = tracing::debug_span!("diff_total").entered();
+            if let Ok(diff) = repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), None) {
+                let per_file = per_file_stats_from_diff(&diff).unwrap_or_default();
+                let (f, a, r) = aggregate_file_stats(&per_file);
+                status.total_files_changed = f;
+                status.total_lines_added = a;
+                status.total_lines_removed = r;
+                per_file
+            } else {
+                HashMap::new()
+            }
+        };
+
+        // Worktree detection
+        if repo.is_worktree() {
+            status.workspace_name = repo_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "worktree".to_string());
+            status.is_default_workspace = false;
+        } else {
+            status.workspace_name = "main".to_string();
+            status.is_default_workspace = true;
+        }
+
+        // Rebase detection
+        status.rebasing = matches!(
+            repo.state(),
+            git2::RepositoryState::Rebase
+                | git2::RepositoryState::RebaseInteractive
+                | git2::RepositoryState::RebaseMerge
+                | git2::RepositoryState::ApplyMailbox
+                | git2::RepositoryState::ApplyMailboxOrRebase
+        );
+
+        (head_tree_oid, base_unstaged, base_total)
     };
 
-    // Branch name (or short OID if detached)
-    status.branch = head.shorthand().unwrap_or("").to_string();
+    let repo_root = repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.to_path_buf());
 
-    // Commit ID (short), description, and tree for diff stats
-    let head_tree = if let Ok(commit) = head.peel_to_commit() {
-        let oid = commit.id();
-        status.commit_id = commit
-            .as_object()
-            .short_id()
-            .map(|buf| buf.as_str().unwrap_or("").to_string())
-            .unwrap_or_else(|_| format!("{:.7}", oid));
-        status.description = commit.summary().unwrap_or("").to_string();
-
-        // Empty detection: compare HEAD tree to parent tree
-        let head_tree = commit.tree().ok();
-        let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-        if let Some(head_tree) = &head_tree {
-            let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(head_tree), None);
-            status.empty = match diff {
-                Ok(d) => d.stats().map(|s| s.files_changed() == 0).unwrap_or(false),
-                Err(_) => false,
-            };
-        }
-        head_tree
-    } else {
-        None
+    let state = GitRepoState {
+        head_tree_oid,
+        repo_root,
+        base_status: status.clone(),
+        base_unstaged,
+        base_total,
+        unstaged_overlay: HashMap::new(),
+        total_overlay: HashMap::new(),
     };
 
-    // Conflict detection
-    status.conflict = repo.index().map(|idx| idx.has_conflicts()).unwrap_or(false);
-
-    // Unstaged: index → workdir
-    {
-        let _span = tracing::debug_span!("diff_unstaged").entered();
-        let mut diff_opts = git2::DiffOptions::new();
-        if let Ok(diff) = repo.diff_index_to_workdir(None, Some(&mut diff_opts)) {
-            let (f, a, r) = diff_stats(&diff)?;
-            status.files_changed = f;
-            status.lines_added = a;
-            status.lines_removed = r;
-        }
-    }
-
-    // Staged: tree → index
-    {
-        let _span = tracing::debug_span!("diff_staged").entered();
-        if let Ok(diff) = repo.diff_tree_to_index(head_tree.as_ref(), None, None) {
-            let (f, a, r) = diff_stats(&diff)?;
-            status.staged_files_changed = f;
-            status.staged_lines_added = a;
-            status.staged_lines_removed = r;
-        }
-    }
-
-    // Total: tree → workdir (with index)
-    {
-        let _span = tracing::debug_span!("diff_total").entered();
-        if let Ok(diff) = repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), None) {
-            let (f, a, r) = diff_stats(&diff)?;
-            status.total_files_changed = f;
-            status.total_lines_added = a;
-            status.total_lines_removed = r;
-        }
-    }
-
-    // Worktree detection
-    if repo.is_worktree() {
-        status.workspace_name = repo_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "worktree".to_string());
-        status.is_default_workspace = false;
-    } else {
-        status.workspace_name = "main".to_string();
-        status.is_default_workspace = true;
-    }
-
-    // Rebase detection
-    status.rebasing = matches!(
-        repo.state(),
-        git2::RepositoryState::Rebase
-            | git2::RepositoryState::RebaseInteractive
-            | git2::RepositoryState::RebaseMerge
-            | git2::RepositoryState::ApplyMailbox
-            | git2::RepositoryState::ApplyMailboxOrRebase
-    );
-
-    Ok(status)
+    Ok((status, state))
 }
 
 #[tracing::instrument(skip(_config), fields(repo = %repo_path.display()))]
@@ -137,6 +342,70 @@ pub async fn query_git_status(repo_path: &Path, _config: &Config) -> Result<Repo
     .await
     .context("git2 query timed out")?
     .context("git2 task panicked")?
+}
+
+/// Requests that can be sent to the git worker thread.
+pub enum GitWorkerRequest {
+    /// Full refresh: re-open repo, compute all status fields.
+    FullRefresh {
+        repo_path: PathBuf,
+        reply: tokio::sync::oneshot::Sender<Result<RepoStatus>>,
+    },
+    /// Incremental update: diff specific working copy files using retained state.
+    IncrementalUpdate {
+        repo_path: PathBuf,
+        changed_paths: Vec<PathBuf>,
+        reply: tokio::sync::oneshot::Sender<Result<RepoStatus>>,
+    },
+}
+
+/// Spawn a dedicated blocking thread that owns git2 Repository state.
+///
+/// Returns a sender for submitting requests. The worker exits when the sender is dropped.
+pub fn spawn_git_worker() -> mpsc::UnboundedSender<GitWorkerRequest> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::task::spawn_blocking(move || {
+        let mut states: HashMap<PathBuf, GitRepoState> = HashMap::new();
+
+        // Blocking recv loop — runs on a dedicated OS thread
+        while let Some(req) = rx.blocking_recv() {
+            match req {
+                GitWorkerRequest::FullRefresh { repo_path, reply } => {
+                    let result = query_git_status_blocking_with_state(&repo_path);
+                    match result {
+                        Ok((status, git_state)) => {
+                            states.insert(repo_path, git_state);
+                            let _ = reply.send(Ok(status));
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                }
+                GitWorkerRequest::IncrementalUpdate {
+                    repo_path,
+                    changed_paths,
+                    reply,
+                } => {
+                    let Some(state) = states.get_mut(&repo_path) else {
+                        let _ =
+                            reply.send(Err(anyhow::anyhow!("no incremental state for git repo")));
+                        continue;
+                    };
+                    let _span = tracing::debug_span!("git_incremental_update",
+                        repo = %repo_path.display(),
+                        files = changed_paths.len()
+                    )
+                    .entered();
+
+                    state.update_files(&changed_paths);
+                    let status = state.current_status();
+                    let _ = reply.send(Ok(status));
+                }
+            }
+        }
+    });
+    tx
 }
 
 #[cfg(test)]
@@ -517,15 +786,17 @@ mod tests {
         let main_initial: String = (1..=25).map(|i| format!("fn app_{i}() {{}}\n")).collect();
         std::fs::write(dir.path().join("src/app.rs"), &main_initial).unwrap();
 
-        let config_initial: String =
-            (1..=10).map(|i| format!("config_key_{i} = value\n")).collect();
+        let config_initial: String = (1..=10)
+            .map(|i| format!("config_key_{i} = value\n"))
+            .collect();
         std::fs::write(dir.path().join("src/config.rs"), &config_initial).unwrap();
 
         let guide_initial: String = (1..=15).map(|i| format!("## Guide step {i}\n")).collect();
         std::fs::write(dir.path().join("guide.md"), &guide_initial).unwrap();
 
-        let makefile_initial: String =
-            (1..=8).map(|i| format!("target_{i}:\n\techo {i}\n")).collect();
+        let makefile_initial: String = (1..=8)
+            .map(|i| format!("target_{i}:\n\techo {i}\n"))
+            .collect();
         std::fs::write(dir.path().join("Makefile"), &makefile_initial).unwrap();
 
         let old_content: String = (1..=6).map(|i| format!("old line {i}\n")).collect();
@@ -537,7 +808,9 @@ mod tests {
         // --- Make modifications ---
 
         // 1. New file: src/helper.rs (10 lines)
-        let helper: String = (1..=10).map(|i| format!("fn helper_{i}() {{}}\n")).collect();
+        let helper: String = (1..=10)
+            .map(|i| format!("fn helper_{i}() {{}}\n"))
+            .collect();
         std::fs::write(dir.path().join("src/helper.rs"), &helper).unwrap();
 
         // 2. Delete old.txt
@@ -563,8 +836,9 @@ mod tests {
         std::fs::write(dir.path().join("guide.md"), guide_lines.join("\n") + "\n").unwrap();
 
         // 5. Modify Makefile: change 2 lines
-        let mut make_lines: Vec<String> =
-            (1..=8).map(|i| format!("target_{i}:\n\techo {i}")).collect();
+        let mut make_lines: Vec<String> = (1..=8)
+            .map(|i| format!("target_{i}:\n\techo {i}"))
+            .collect();
         make_lines[2] = "target_3_new:\n\techo changed_3".to_string();
         make_lines[5] = "target_6_new:\n\techo changed_6".to_string();
         std::fs::write(dir.path().join("Makefile"), make_lines.join("\n") + "\n").unwrap();
@@ -635,18 +909,13 @@ mod tests {
         git_cmd(dir.path(), &["commit", "-m", "add alpha and beta"]).await;
 
         // Stage changes to alpha.txt: change lines 3-5, add 2 lines
-        let mut alpha_staged: Vec<String> =
-            (1..=20).map(|i| format!("alpha line {i}")).collect();
+        let mut alpha_staged: Vec<String> = (1..=20).map(|i| format!("alpha line {i}")).collect();
         alpha_staged[2] = "alpha STAGED 3".to_string();
         alpha_staged[3] = "alpha STAGED 4".to_string();
         alpha_staged[4] = "alpha STAGED 5".to_string();
         alpha_staged.push("alpha STAGED new 1".to_string());
         alpha_staged.push("alpha STAGED new 2".to_string());
-        std::fs::write(
-            dir.path().join("alpha.txt"),
-            alpha_staged.join("\n") + "\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("alpha.txt"), alpha_staged.join("\n") + "\n").unwrap();
         git_cmd(dir.path(), &["add", "alpha.txt"]).await;
 
         // Now make further unstaged changes to alpha.txt on top of staged
@@ -733,5 +1002,312 @@ mod tests {
             cli_tot_r,
             git_total,
         );
+    }
+
+    // --- Per-file stats extraction tests ---
+
+    #[tokio::test]
+    async fn test_per_file_stats_extraction() {
+        let dir = create_git_repo().await;
+        // Create and commit two files
+        std::fs::write(dir.path().join("a.txt"), "line1\nline2\nline3\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "alpha\nbeta\n").unwrap();
+        git_cmd(dir.path(), &["add", "."]).await;
+        git_cmd(dir.path(), &["commit", "-m", "two files"]).await;
+
+        // Modify both files
+        std::fs::write(dir.path().join("a.txt"), "line1\nmodified\nline3\nnew\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let mut opts = git2::DiffOptions::new();
+        let diff = repo.diff_index_to_workdir(None, Some(&mut opts)).unwrap();
+        let per_file = per_file_stats_from_diff(&diff).unwrap();
+
+        assert!(per_file.contains_key("a.txt"), "should have a.txt");
+        assert!(per_file.contains_key("b.txt"), "should have b.txt");
+
+        let a = &per_file["a.txt"];
+        assert!(a.lines_added > 0, "a.txt should have additions");
+        assert!(a.lines_removed > 0, "a.txt should have removals");
+
+        let b = &per_file["b.txt"];
+        assert_eq!(b.lines_added, 1, "b.txt should have 1 addition");
+        assert_eq!(b.lines_removed, 0, "b.txt should have 0 removals");
+
+        // Aggregate should match diff_stats
+        let (f, a_total, r_total) = aggregate_file_stats(&per_file);
+        let (sf, sa, sr) = diff_stats(&diff).unwrap();
+        assert_eq!((f, a_total, r_total), (sf, sa, sr));
+    }
+
+    // --- GitRepoState incremental update tests ---
+
+    #[tokio::test]
+    async fn test_git_incremental_modify_file() {
+        let dir = create_git_repo().await;
+        std::fs::write(dir.path().join("src.txt"), "line1\nline2\nline3\n").unwrap();
+        git_cmd(dir.path(), &["add", "."]).await;
+        git_cmd(dir.path(), &["commit", "-m", "add src"]).await;
+
+        // Full refresh with no working copy changes
+        let (base_status, mut state) = query_git_status_blocking_with_state(dir.path()).unwrap();
+        assert_eq!(base_status.total_files_changed, 0);
+
+        // Modify the file
+        std::fs::write(dir.path().join("src.txt"), "line1\nMODIFIED\nline3\nnew\n").unwrap();
+
+        // Incremental update
+        state.update_files(&[dir.path().join("src.txt")]);
+        let updated = state.current_status();
+
+        assert_eq!(updated.total_files_changed, 1);
+        assert!(updated.total_lines_added > 0);
+        assert!(updated.total_lines_removed > 0);
+        // Unstaged should also reflect the change
+        assert_eq!(updated.files_changed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_git_incremental_new_tracked_file() {
+        let dir = create_git_repo().await;
+
+        // Stage a new file (so it appears in the index)
+        std::fs::write(dir.path().join("new.txt"), "hello\nworld\n").unwrap();
+        git_cmd(dir.path(), &["add", "new.txt"]).await;
+
+        // Base with staged new file
+        let (base_status, mut state) = query_git_status_blocking_with_state(dir.path()).unwrap();
+        assert!(
+            base_status.staged_files_changed >= 1,
+            "expected staged changes"
+        );
+
+        // Now modify the staged file further (unstaged change)
+        std::fs::write(dir.path().join("new.txt"), "hello\nworld\nmore\n").unwrap();
+
+        state.update_files(&[dir.path().join("new.txt")]);
+        let updated = state.current_status();
+
+        // Should detect the unstaged modification
+        assert!(
+            updated.files_changed >= 1,
+            "expected unstaged change, got files_changed={}",
+            updated.files_changed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_git_incremental_delete_file() {
+        let dir = create_git_repo().await;
+        std::fs::write(dir.path().join("doomed.txt"), "goodbye\nworld\n").unwrap();
+        git_cmd(dir.path(), &["add", "."]).await;
+        git_cmd(dir.path(), &["commit", "-m", "add doomed"]).await;
+
+        let (_base, mut state) = query_git_status_blocking_with_state(dir.path()).unwrap();
+
+        // Delete the file
+        std::fs::remove_file(dir.path().join("doomed.txt")).unwrap();
+
+        state.update_files(&[dir.path().join("doomed.txt")]);
+        let updated = state.current_status();
+
+        assert_eq!(updated.total_files_changed, 1);
+        assert!(updated.total_lines_removed > 0);
+        assert_eq!(updated.total_lines_added, 0);
+    }
+
+    #[tokio::test]
+    async fn test_git_incremental_revert_file() {
+        let dir = create_git_repo().await;
+        std::fs::write(dir.path().join("src.txt"), "original\n").unwrap();
+        git_cmd(dir.path(), &["add", "."]).await;
+        git_cmd(dir.path(), &["commit", "-m", "add src"]).await;
+
+        // Modify the file, take a base snapshot
+        std::fs::write(dir.path().join("src.txt"), "modified\n").unwrap();
+        let (_base, mut state) = query_git_status_blocking_with_state(dir.path()).unwrap();
+        assert_eq!(state.base_status.total_files_changed, 1);
+
+        // Revert the file back to committed content
+        std::fs::write(dir.path().join("src.txt"), "original\n").unwrap();
+
+        state.update_files(&[dir.path().join("src.txt")]);
+        let updated = state.current_status();
+
+        // Should show no changes since file matches HEAD
+        assert_eq!(
+            updated.total_files_changed, 0,
+            "expected 0 total_files_changed after revert, got {}",
+            updated.total_files_changed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_git_incremental_multiple_files() {
+        let dir = create_git_repo().await;
+        std::fs::write(dir.path().join("a.txt"), "aaa\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "bbb\n").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "ccc\n").unwrap();
+        git_cmd(dir.path(), &["add", "."]).await;
+        git_cmd(dir.path(), &["commit", "-m", "three files"]).await;
+
+        let (_base, mut state) = query_git_status_blocking_with_state(dir.path()).unwrap();
+
+        // Modify a and c, leave b unchanged
+        std::fs::write(dir.path().join("a.txt"), "AAA\nNEW\n").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "CCC\n").unwrap();
+
+        state.update_files(&[
+            dir.path().join("a.txt"),
+            dir.path().join("b.txt"),
+            dir.path().join("c.txt"),
+        ]);
+        let updated = state.current_status();
+
+        assert_eq!(updated.total_files_changed, 2, "expected 2 changed files");
+    }
+
+    #[tokio::test]
+    async fn test_git_incremental_matches_full_refresh() {
+        let dir = create_git_repo().await;
+        std::fs::write(dir.path().join("x.txt"), "line1\nline2\nline3\n").unwrap();
+        std::fs::write(dir.path().join("y.txt"), "alpha\nbeta\n").unwrap();
+        git_cmd(dir.path(), &["add", "."]).await;
+        git_cmd(dir.path(), &["commit", "-m", "two files"]).await;
+
+        // Take base with clean state
+        let (_base, mut state) = query_git_status_blocking_with_state(dir.path()).unwrap();
+
+        // Make changes
+        std::fs::write(dir.path().join("x.txt"), "line1\nMOD\nline3\nNEW\n").unwrap();
+        std::fs::remove_file(dir.path().join("y.txt")).unwrap();
+        std::fs::write(dir.path().join("z.txt"), "new file\n").unwrap();
+
+        // Incremental update
+        state.update_files(&[
+            dir.path().join("x.txt"),
+            dir.path().join("y.txt"),
+            dir.path().join("z.txt"),
+        ]);
+        let incremental = state.current_status();
+
+        // Full refresh for comparison
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+        let full = query_git_status(dir.path(), &config).await.unwrap();
+
+        assert_eq!(
+            (
+                incremental.total_files_changed,
+                incremental.total_lines_added,
+                incremental.total_lines_removed
+            ),
+            (
+                full.total_files_changed,
+                full.total_lines_added,
+                full.total_lines_removed
+            ),
+            "incremental total ({}f, +{}, -{}) != full ({}f, +{}, -{})",
+            incremental.total_files_changed,
+            incremental.total_lines_added,
+            incremental.total_lines_removed,
+            full.total_files_changed,
+            full.total_lines_added,
+            full.total_lines_removed,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_git_incremental_preserves_staged_stats() {
+        let dir = create_git_repo().await;
+        std::fs::write(dir.path().join("staged.txt"), "line1\n").unwrap();
+        std::fs::write(dir.path().join("wc.txt"), "aaa\n").unwrap();
+        git_cmd(dir.path(), &["add", "."]).await;
+        git_cmd(dir.path(), &["commit", "-m", "initial"]).await;
+
+        // Stage a change
+        std::fs::write(dir.path().join("staged.txt"), "line1\nstaged line\n").unwrap();
+        git_cmd(dir.path(), &["add", "staged.txt"]).await;
+
+        // Take base
+        let (base, mut state) = query_git_status_blocking_with_state(dir.path()).unwrap();
+        assert!(base.staged_files_changed >= 1, "expected staged changes");
+
+        // Modify a working copy file
+        std::fs::write(dir.path().join("wc.txt"), "modified\n").unwrap();
+
+        state.update_files(&[dir.path().join("wc.txt")]);
+        let updated = state.current_status();
+
+        // Staged stats should be unchanged
+        assert_eq!(
+            updated.staged_files_changed, base.staged_files_changed,
+            "staged_files_changed should be preserved"
+        );
+        assert_eq!(
+            updated.staged_lines_added, base.staged_lines_added,
+            "staged_lines_added should be preserved"
+        );
+        // Unstaged should show the working copy change
+        assert!(updated.files_changed >= 1, "expected unstaged changes");
+    }
+
+    // --- Git worker integration tests ---
+
+    #[tokio::test]
+    async fn test_git_worker_full_and_incremental() {
+        let dir = create_git_repo().await;
+        std::fs::write(dir.path().join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        git_cmd(dir.path(), &["add", "."]).await;
+        git_cmd(dir.path(), &["commit", "-m", "file"]).await;
+
+        let worker = spawn_git_worker();
+
+        // Full refresh
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        worker
+            .send(GitWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(status.total_files_changed, 0);
+
+        // Modify and do incremental update
+        std::fs::write(dir.path().join("f.txt"), "one\nMODIFIED\nthree\nfour\n").unwrap();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        worker
+            .send(GitWorkerRequest::IncrementalUpdate {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![dir.path().join("f.txt")],
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(status.total_files_changed, 1);
+        assert!(status.total_lines_added > 0);
+    }
+
+    #[tokio::test]
+    async fn test_git_worker_incremental_without_state_fails() {
+        let dir = create_git_repo().await;
+        let worker = spawn_git_worker();
+
+        // Try incremental without full refresh first — should fail
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        worker
+            .send(GitWorkerRequest::IncrementalUpdate {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![dir.path().join("f.txt")],
+                reply: reply_tx,
+            })
+            .unwrap();
+        let result = reply_rx.await.unwrap();
+        assert!(result.is_err(), "expected error without prior full refresh");
     }
 }

@@ -10,7 +10,7 @@ use tokio::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
-use crate::git::query_git_status;
+use crate::git::{GitWorkerRequest, query_git_status, spawn_git_worker};
 use crate::jj::{JjWorkerRequest, query_jj_status, spawn_jj_worker};
 use crate::protocol::{DaemonStats, Request, Response, VcsKind};
 use crate::template::format_not_ready;
@@ -477,6 +477,7 @@ struct RefreshDone {
     repo_path: PathBuf,
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, fields(repo = %repo_path.display(), vcs = ?vcs_kind))]
 async fn refresh_repo(
     repo_path: PathBuf,
@@ -485,6 +486,7 @@ async fn refresh_repo(
     changed_paths: Vec<PathBuf>,
     state: Arc<Mutex<DaemonState>>,
     jj_worker: mpsc::UnboundedSender<JjWorkerRequest>,
+    git_worker: mpsc::UnboundedSender<GitWorkerRequest>,
     done_tx: mpsc::UnboundedSender<RefreshDone>,
 ) {
     let refresh_start = Instant::now();
@@ -515,7 +517,27 @@ async fn refresh_repo(
             // VCS-internal event or no paths — full refresh
             jj_full_refresh(&repo_path, &config, &jj_worker).await
         }
-        VcsKind::Git => query_git_status(&repo_path, &config).await,
+        VcsKind::Git if working_copy_changed && !changed_paths.is_empty() => {
+            // Try incremental update via git worker
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let _ = git_worker.send(GitWorkerRequest::IncrementalUpdate {
+                repo_path: repo_path.clone(),
+                changed_paths,
+                reply: reply_tx,
+            });
+            match reply_rx.await {
+                Ok(Ok(status)) => Ok(status),
+                Ok(Err(_)) => {
+                    // No incremental state — fall back to full refresh
+                    git_full_refresh(&repo_path, &git_worker).await
+                }
+                Err(_) => Err(anyhow::anyhow!("git worker channel closed")),
+            }
+        }
+        VcsKind::Git => {
+            // VCS-internal event or no paths — full refresh
+            git_full_refresh(&repo_path, &git_worker).await
+        }
     };
 
     match result {
@@ -551,6 +573,21 @@ async fn jj_full_refresh(
         .map_err(|_| anyhow::anyhow!("jj worker channel closed"))?
 }
 
+/// Full git refresh via the worker thread (replaces incremental state).
+async fn git_full_refresh(
+    repo_path: &Path,
+    git_worker: &mpsc::UnboundedSender<GitWorkerRequest>,
+) -> Result<crate::template::RepoStatus> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = git_worker.send(GitWorkerRequest::FullRefresh {
+        repo_path: repo_path.to_path_buf(),
+        reply: reply_tx,
+    });
+    reply_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("git worker channel closed"))?
+}
+
 #[tracing::instrument(skip_all)]
 async fn refresh_task(
     state: Arc<Mutex<DaemonState>>,
@@ -560,6 +597,7 @@ async fn refresh_task(
     let mut in_flight: HashMap<PathBuf, RepoRefreshState> = HashMap::new();
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<RefreshDone>();
     let jj_worker = spawn_jj_worker();
+    let git_worker = spawn_git_worker();
 
     loop {
         tokio::select! {
@@ -572,7 +610,7 @@ async fn refresh_task(
                         while !in_flight.is_empty() {
                             if let Some(done) = done_rx.recv().await {
                                 handle_refresh_done(
-                                    &done, &mut in_flight, &jj_worker, &state, &done_tx,
+                                    &done, &mut in_flight, &jj_worker, &git_worker, &state, &done_tx,
                                 );
                             }
                         }
@@ -587,7 +625,7 @@ async fn refresh_task(
                                 in_flight.insert(repo_path.clone(), RepoRefreshState::InFlight);
                                 tokio::spawn(refresh_repo(
                                     repo_path, vcs_kind, working_copy_changed, changed_paths,
-                                    state.clone(), jj_worker.clone(), done_tx.clone(),
+                                    state.clone(), jj_worker.clone(), git_worker.clone(), done_tx.clone(),
                                 ));
                             }
                             Some(entry) => {
@@ -609,7 +647,7 @@ async fn refresh_task(
             }
             done = done_rx.recv() => {
                 if let Some(done) = done {
-                    handle_refresh_done(&done, &mut in_flight, &jj_worker, &state, &done_tx);
+                    handle_refresh_done(&done, &mut in_flight, &jj_worker, &git_worker, &state, &done_tx);
                 }
             }
         }
@@ -620,6 +658,7 @@ fn handle_refresh_done(
     done: &RefreshDone,
     in_flight: &mut HashMap<PathBuf, RepoRefreshState>,
     jj_worker: &mpsc::UnboundedSender<JjWorkerRequest>,
+    git_worker: &mpsc::UnboundedSender<GitWorkerRequest>,
     state: &Arc<Mutex<DaemonState>>,
     done_tx: &mpsc::UnboundedSender<RefreshDone>,
 ) {
@@ -628,8 +667,14 @@ fn handle_refresh_done(
             // Working copy changed while refreshing — re-refresh immediately
             in_flight.insert(done.repo_path.clone(), RepoRefreshState::InFlight);
             tokio::spawn(refresh_repo(
-                done.repo_path.clone(), vcs_kind, wc, paths,
-                state.clone(), jj_worker.clone(), done_tx.clone(),
+                done.repo_path.clone(),
+                vcs_kind,
+                wc,
+                paths,
+                state.clone(),
+                jj_worker.clone(),
+                git_worker.clone(),
+                done_tx.clone(),
             ));
         }
         Some(RepoRefreshState::Pending(..)) => {

@@ -204,14 +204,19 @@ pub fn status() -> Result<()> {
 
             // Performance stats
             eprintln!();
-            eprintln!("  queries:       {} ({} hits, {} misses)",
-                stats.queries, stats.cache_hits, stats.cache_misses);
+            eprintln!(
+                "  queries:       {} ({} hits, {} misses)",
+                stats.queries, stats.cache_hits, stats.cache_misses
+            );
             if stats.queries > 0 {
                 let hit_rate = stats.cache_hits as f64 / stats.queries as f64 * 100.0;
                 eprintln!("  hit rate:      {hit_rate:.1}%");
             }
             eprintln!("  refreshes:     {}", stats.refreshes);
-            eprintln!("  fs events:     {} ({} ignored)", stats.fs_events, stats.fs_events_ignored);
+            eprintln!(
+                "  fs events:     {} ({} ignored)",
+                stats.fs_events, stats.fs_events_ignored
+            );
 
             if !stats.recent_query_ms.is_empty() {
                 let mut sorted = stats.recent_query_ms.clone();
@@ -221,7 +226,9 @@ pub fn status() -> Result<()> {
                 let p95 = sorted[(len as f64 * 0.95) as usize];
                 let p99 = sorted[((len as f64 * 0.99) as usize).min(len - 1)];
                 let max = sorted[len - 1];
-                eprintln!("  timing (last {len}): p50={p50:.1}ms p95={p95:.1}ms p99={p99:.1}ms max={max:.1}ms");
+                eprintln!(
+                    "  timing (last {len}): p50={p50:.1}ms p95={p95:.1}ms p99={p99:.1}ms max={max:.1}ms"
+                );
             }
 
             Ok(())
