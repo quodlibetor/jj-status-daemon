@@ -226,6 +226,54 @@ pub async fn run_daemon(config: Config, runtime_dir: PathBuf) -> Result<()> {
         }
     });
 
+    // Watch for socket deletion: shut down if the socket file is removed
+    let shutdown_socket = shutdown.clone();
+    let socket_path_watch = socket_path.clone();
+    tokio::spawn(async move {
+        use notify::{Event, EventKind, RecursiveMode, Watcher, event::RemoveKind};
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _watcher = notify::RecommendedWatcher::new(
+            move |res: Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    let _ = tx.send(event);
+                }
+            },
+            notify::Config::default(),
+        );
+        let mut watcher = match _watcher {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create socket watcher");
+                return;
+            }
+        };
+        if let Err(e) = watcher.watch(
+            socket_path_watch.parent().unwrap(),
+            RecursiveMode::NonRecursive,
+        ) {
+            tracing::warn!(error = %e, "failed to watch runtime directory for socket deletion");
+            return;
+        }
+        while let Some(event) = rx.recv().await {
+            if matches!(
+                event.kind,
+                EventKind::Remove(RemoveKind::File | RemoveKind::Any)
+            ) && event.paths.iter().any(|p| p == &socket_path_watch)
+            {
+                tracing::info!("socket file was deleted, shutting down");
+                shutdown_socket.notify_one();
+                return;
+            }
+            // Also detect rename-over (some editors/tools delete via rename)
+            if matches!(event.kind, EventKind::Remove(_)) && !socket_path_watch.exists() {
+                tracing::info!("socket file is gone, shutting down");
+                shutdown_socket.notify_one();
+                return;
+            }
+        }
+    });
+
     // SIGTERM: clean up everything and shut down
     let shutdown_term = shutdown.clone();
     tokio::spawn(async move {
@@ -1310,6 +1358,39 @@ mod tests {
         assert!(!formatted.is_empty());
 
         let _ = send_request(&socket_path, &Request::Shutdown).await;
+        daemon.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_daemon_shuts_down_on_socket_deletion() {
+        let dir = create_jj_repo().await;
+        let rt = temp_runtime_dir("sockdel");
+        let socket_path = rt.path().join("sock");
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
+
+        // Make sure daemon is running and serving
+        let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
+        assert!(!formatted.is_empty());
+
+        // Delete the socket file
+        std::fs::remove_file(&socket_path).unwrap();
+
+        // The daemon should shut down on its own
+        for _ in 0..200 {
+            if daemon.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            daemon.is_finished(),
+            "daemon should shut down after socket deletion"
+        );
         daemon.await.unwrap().unwrap();
     }
 
