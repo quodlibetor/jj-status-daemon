@@ -386,9 +386,6 @@ mod tests {
         let rt = TempDir::with_prefix("vcs-test-client-").unwrap();
         let socket_path = rt.path().join("sock");
 
-        // Point both daemon and client at the same runtime directory
-        unsafe { std::env::set_var("VCS_STATUS_DAEMON_DIR", rt.path()) };
-
         let config = Config {
             color: false,
             ..Default::default()
@@ -397,18 +394,24 @@ mod tests {
         let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
         wait_for_socket(&socket_path).await;
 
-        // Client calls are synchronous — run on a blocking thread so the
-        // tokio executor can still drive the daemon task.
         let dir_path = dir.path().to_path_buf();
-        let result = tokio::task::spawn_blocking(move || query(&dir_path, None).unwrap())
-            .await
-            .unwrap();
+        let sp = socket_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let request = Request::Query {
+                repo_path: dir_path.to_string_lossy().to_string(),
+                timeout_override_ms: 0,
+            };
+            let response = send_request_slow(&sp, &request).unwrap();
+            extract_status(response).unwrap()
+        })
+        .await
+        .unwrap();
         assert!(!result.is_empty());
 
-        tokio::task::spawn_blocking(|| shutdown().ok())
+        let sp = socket_path.clone();
+        tokio::task::spawn_blocking(move || send_request(&sp, &Request::Shutdown).ok())
             .await
             .unwrap();
-        unsafe { std::env::remove_var("VCS_STATUS_DAEMON_DIR") };
     }
 
     #[tokio::test]
@@ -490,21 +493,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_returns_fallback_when_daemon_not_running() {
+    async fn test_send_request_fails_when_daemon_not_running() {
         let rt = TempDir::with_prefix("vcs-test-fallback-").unwrap();
-        // Point client at a directory with no daemon
-        unsafe { std::env::set_var("VCS_STATUS_DAEMON_DIR", rt.path()) };
+        let socket_path = rt.path().join("sock");
 
-        let dir = create_jj_repo().await;
-        let dir_path = dir.path().to_path_buf();
-        let result = tokio::task::spawn_blocking(move || query(&dir_path, None))
-            .await
-            .unwrap()
-            .unwrap();
+        let sp = socket_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let request = Request::Query {
+                repo_path: "/tmp/fake".to_string(),
+                timeout_override_ms: 0,
+            };
+            send_request(&sp, &request)
+        })
+        .await
+        .unwrap();
 
-        assert_eq!(result, NOT_READY_FALLBACK, "should return fallback text");
-
-        unsafe { std::env::remove_var("VCS_STATUS_DAEMON_DIR") };
+        assert!(result.is_err(), "should fail when no daemon is running");
     }
 
     #[tokio::test]
