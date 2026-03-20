@@ -191,6 +191,14 @@ pub fn restart(config_file: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+fn fmt_features(features: &[String]) -> String {
+    if features.is_empty() {
+        "none".to_string()
+    } else {
+        features.join(", ")
+    }
+}
+
 pub fn status() -> Result<()> {
     let socket_path = config::socket_path();
     let pid_path = config::pid_path();
@@ -205,7 +213,28 @@ pub fn status() -> Result<()> {
             let hours = uptime_secs / 3600;
             let mins = (uptime_secs % 3600) / 60;
             let secs = uptime_secs % 60;
+            let (cv, ch, cf) = crate::protocol::version_info();
+            let dv_info = daemon_version().ok();
+            let show_features =
+                !cf.is_empty() || dv_info.as_ref().is_some_and(|(_, _, df)| !df.is_empty());
             eprintln!("daemon running");
+            if show_features {
+                eprintln!(
+                    "  client:        {cv} ({ch}) features: {}",
+                    fmt_features(&cf)
+                );
+                if let Some((dv, dh, df)) = &dv_info {
+                    eprintln!(
+                        "  daemon:        {dv} ({dh}) features: {}",
+                        fmt_features(df)
+                    );
+                }
+            } else {
+                eprintln!("  client:        {cv} ({ch})");
+                if let Some((dv, dh, _)) = &dv_info {
+                    eprintln!("  daemon:        {dv} ({dh})");
+                }
+            }
             eprintln!("  pid:           {pid}");
             eprintln!("  uptime:        {hours}h {mins}m {secs}s");
             eprintln!("  watched repos: {}", watched_repos.len());
@@ -250,7 +279,16 @@ pub fn status() -> Result<()> {
         Err(_) => {
             // Daemon not running — check for stale pidfile
             let stale_pid = std::fs::read_to_string(&pid_path).ok();
+            let (cv, ch, cf) = crate::protocol::version_info();
             eprintln!("daemon not running");
+            if cf.is_empty() {
+                eprintln!("  client:        {cv} ({ch})");
+            } else {
+                eprintln!(
+                    "  client:        {cv} ({ch}) features: {}",
+                    fmt_features(&cf)
+                );
+            }
             if let Some(pid) = stale_pid {
                 eprintln!(
                     "  stale pidfile: {} (pid {})",
