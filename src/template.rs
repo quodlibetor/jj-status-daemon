@@ -79,6 +79,10 @@ pub struct RepoStatus {
     // Workspace/worktree
     pub workspace_name: String,
     pub is_default_workspace: bool,
+
+    // Staleness (set when refresh fails with cached data)
+    pub is_stale: bool,
+    pub refresh_error: String,
 }
 
 impl Default for RepoStatus {
@@ -108,6 +112,8 @@ impl Default for RepoStatus {
             rebasing: false,
             workspace_name: String::new(),
             is_default_workspace: true,
+            is_stale: false,
+            refresh_error: String::new(),
         }
     }
 }
@@ -210,6 +216,10 @@ pub fn format_status(status: &RepoStatus, template: &str, color: bool) -> String
     // Workspace/worktree
     ctx.insert("workspace_name", &status.workspace_name);
     ctx.insert("is_default_workspace", &status.is_default_workspace);
+
+    // Staleness
+    ctx.insert("is_stale", &status.is_stale);
+    ctx.insert("refresh_error", &status.refresh_error);
 
     match build_tera(template, color) {
         Ok(tera) => match tera.render("tpl", &ctx) {
@@ -407,6 +417,22 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                 description: "urgent fix".into(),
                 workspace_name: "hotfix-wt".into(),
                 is_default_workspace: false,
+                ..Default::default()
+            },
+        ),
+        (
+            "jj: stale (refresh error)",
+            RepoStatus {
+                is_jj: true,
+                change_id: "xlvltmpk".into(),
+                commit_id: "abc12345".into(),
+                bookmarks: vec![Bookmark {
+                    name: "main".into(),
+                    distance: 0,
+                    display: "main".into(),
+                }],
+                is_stale: true,
+                refresh_error: "jj exited with status 1".into(),
                 ..Default::default()
             },
         ),
@@ -990,6 +1016,98 @@ format = '''
             formatted.contains("\x1b[33m"),
             "expected yellow ANSI for staged: {formatted:?}"
         );
+    }
+
+    #[test]
+    fn test_format_stale_ascii() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 0,
+                display: "main".into(),
+            }],
+            is_stale: true,
+            refresh_error: "jj-lib error".to_string(),
+            ..Default::default()
+        };
+        let formatted = format_status(&status, ASCII_FORMAT, false);
+        assert!(
+            formatted.contains("STALE"),
+            "expected STALE indicator: {formatted:?}"
+        );
+        // Original status data should still be present
+        assert!(
+            formatted.contains("mrtu"),
+            "expected change_id preserved: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_stale_nerdfont() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            is_stale: true,
+            refresh_error: "error".to_string(),
+            ..Default::default()
+        };
+        let formatted = format_status(&status, NERDFONT_FORMAT, false);
+        assert!(
+            formatted.contains("󰇘"),
+            "expected nerdfont stale icon: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_stale_unicode() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            commit_id: "abc1234".to_string(),
+            is_stale: true,
+            refresh_error: "git2 error".to_string(),
+            ..Default::default()
+        };
+        let formatted = format_status(&status, UNICODE_FORMAT, false);
+        assert!(
+            formatted.contains("⟳"),
+            "expected unicode stale icon: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("main"),
+            "expected branch preserved: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_not_stale_no_indicator() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            is_stale: false,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, ASCII_FORMAT, false);
+        assert!(
+            !formatted.contains("STALE"),
+            "non-stale status should not show STALE: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_stale_custom_template_with_error() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            is_stale: true,
+            refresh_error: "workspace load failed".to_string(),
+            ..Default::default()
+        };
+        let tmpl = "{{ change_id }}{% if is_stale %} STALE({{ refresh_error }}){% endif %}";
+        let formatted = format_status(&status, tmpl, false);
+        assert_eq!(formatted, "mrtu STALE(workspace load failed)");
     }
 
     #[test]
