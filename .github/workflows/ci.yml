@@ -52,4 +52,6 @@ jobs:
       - uses: taiki-e/install-action@cargo-binstall
       - name: Install jj
         run: cargo binstall --no-confirm --strategies crate-meta-data jj-cli
-      - run: cargo test
+      - name: Build tests
+        run: cargo test --no-run
+      - run: cargo nextest run
