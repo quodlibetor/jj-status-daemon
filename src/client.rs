@@ -272,6 +272,16 @@ mod tests {
     use tempfile::TempDir;
     use tokio::process::Command;
 
+    async fn wait_for_socket(socket_path: &std::path::Path) {
+        for _ in 0..2000 {
+            if socket_path.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("socket never appeared at {}", socket_path.display());
+    }
+
     async fn create_jj_repo() -> TempDir {
         let dir = TempDir::new().unwrap();
         let output = Command::new("jj")
@@ -288,6 +298,7 @@ mod tests {
     async fn test_client_connects_to_running_daemon() {
         let dir = create_jj_repo().await;
         let rt = TempDir::with_prefix("vcs-test-client-").unwrap();
+        let socket_path = rt.path().join("sock");
 
         // Point both daemon and client at the same runtime directory
         unsafe { std::env::set_var("VCS_STATUS_DAEMON_DIR", rt.path()) };
@@ -298,7 +309,7 @@ mod tests {
         };
 
         let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        wait_for_socket(&socket_path).await;
 
         // Client calls are synchronous — run on a blocking thread so the
         // tokio executor can still drive the daemon task.
@@ -325,7 +336,7 @@ mod tests {
         };
 
         let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        wait_for_socket(&socket_path).await;
 
         // Send DaemonStatus request directly via the socket
         let sp = socket_path.clone();
@@ -447,18 +458,12 @@ mod tests {
         );
 
         // Wait for daemon to start listening
-        for _ in 0..30 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if socket_path.exists() {
-                break;
-            }
-        }
-        assert!(socket_path.exists(), "daemon should have created socket");
+        wait_for_socket(&socket_path).await;
 
         // Second query: daemon is running, should eventually return real status
         // May need a few retries as daemon populates cache
         let mut got_status = false;
-        for _ in 0..20 {
+        for _ in 0..2000 {
             let output = Command::new(&exe)
                 .args(["--repo", dir.path().to_str().unwrap()])
                 .env("VCS_STATUS_DAEMON_DIR", rt.path())
@@ -470,7 +475,7 @@ mod tests {
                 got_status = true;
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(
             got_status,
