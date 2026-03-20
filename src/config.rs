@@ -26,6 +26,10 @@ pub struct Config {
     pub bookmark_search_depth: u32,
     #[serde(default = "default_color")]
     pub color: bool,
+    /// How long (ms) to wait for a fresh status before returning "not ready" or stale data.
+    /// 0 means respond immediately.
+    #[serde(default = "default_query_timeout_ms")]
+    pub query_timeout_ms: u64,
 }
 
 fn default_idle_timeout_secs() -> u64 {
@@ -39,6 +43,9 @@ fn default_bookmark_search_depth() -> u32 {
 }
 fn default_color() -> bool {
     true
+}
+fn default_query_timeout_ms() -> u64 {
+    150
 }
 
 impl Config {
@@ -81,6 +88,7 @@ impl Default for Config {
             templates: HashMap::new(),
             bookmark_search_depth: default_bookmark_search_depth(),
             color: default_color(),
+            query_timeout_ms: default_query_timeout_ms(),
         }
     }
 }
@@ -171,6 +179,12 @@ pub const DEFAULT_CONFIG_TOML: &str = r##"# vcs-status-daemon configuration
 # Whether to include ANSI color codes in the output.
 # Set to false if your shell prompt handles colors separately.
 # color = true
+
+# How long (ms) to wait for a fresh status before returning "not ready" or stale data.
+# The daemon holds the client connection open until the scan completes or the timeout
+# expires. Useful to avoid the initial "…" flash on first prompt.
+# Set to 0 for immediate response without waiting.
+# query_timeout_ms = 150
 
 # --------------------------------------------------------------------------
 # Templates

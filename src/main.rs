@@ -336,6 +336,7 @@ fn run_config(action: ConfigAction, config_file: Option<&Path>) -> anyhow::Resul
                 "template_name" => cfg.template_name,
                 "bookmark_search_depth" => cfg.bookmark_search_depth.to_string(),
                 "color" => cfg.color.to_string(),
+                "query_timeout_ms" => cfg.query_timeout_ms.to_string(),
                 _ => anyhow::bail!("unknown config key: {key}"),
             };
             println!("{val}");

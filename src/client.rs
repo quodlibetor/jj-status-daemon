@@ -103,8 +103,19 @@ pub fn query(repo_path: &Path, config_file: Option<&Path>) -> Result<String> {
         .map(|p| p.to_path_buf())
         .or_else(config::config_path);
 
-    // Try connecting with a short timeout (100ms)
-    match send_request(&socket_path, &request) {
+    // Load config to get query_timeout_ms for socket read timeout
+    let query_timeout_ms = config::load_config_from(resolved_config_file.as_deref())
+        .map(|c| c.query_timeout_ms)
+        .unwrap_or(0);
+
+    let timeout = if query_timeout_ms > 0 {
+        // Allow extra margin for daemon overhead
+        Duration::from_millis(query_timeout_ms + 200)
+    } else {
+        Duration::from_millis(100)
+    };
+
+    match send_request_with_timeout(&socket_path, &request, timeout) {
         Ok(response) => extract_status(response),
         Err(_) => {
             // Daemon not reachable — try to start it, return fallback

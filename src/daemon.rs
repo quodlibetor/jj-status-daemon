@@ -1,10 +1,10 @@
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::time::{Duration, Instant};
 
 use tracing_subscriber::EnvFilter;
@@ -27,6 +27,29 @@ struct DaemonState {
     config: Config,
     cache_dir: PathBuf,
     stats: DaemonStats,
+    /// Repos currently being refreshed by watcher-triggered refresh_repo.
+    refreshing: HashSet<PathBuf>,
+    /// Per-repo watch channels notified when cache is updated.
+    cache_watch: HashMap<PathBuf, watch::Sender<u64>>,
+}
+
+impl DaemonState {
+    /// Insert a cache entry and notify any waiting clients.
+    fn update_cache(&mut self, repo_path: &Path, formatted: String) {
+        self.cache.insert(repo_path.to_path_buf(), formatted);
+        if let Some(tx) = self.cache_watch.get(repo_path) {
+            let val = *tx.borrow() + 1;
+            let _ = tx.send(val);
+        }
+    }
+
+    /// Get a watch receiver for a repo's cache updates.
+    fn subscribe_cache(&mut self, repo_path: &Path) -> watch::Receiver<u64> {
+        self.cache_watch
+            .entry(repo_path.to_path_buf())
+            .or_insert_with(|| watch::channel(0).0)
+            .subscribe()
+    }
 }
 
 use crate::config::find_repo_root;
@@ -131,6 +154,8 @@ pub async fn run_daemon(config: Config, runtime_dir: PathBuf) -> Result<()> {
         config: config.clone(),
         cache_dir: cache_dir.clone(),
         stats: DaemonStats::default(),
+        refreshing: HashSet::new(),
+        cache_watch: HashMap::new(),
     }));
 
     // Spawn refresh task
@@ -301,6 +326,46 @@ async fn handle_connection(
 
             if let Some(cached) = cached {
                 tracing::debug!(repo = %repo_path.display(), "cache hit");
+
+                // If a refresh is in progress and wait is configured, wait for fresh data
+                if config.query_timeout_ms > 0 {
+                    let rx = {
+                        let mut st = state.lock().await;
+                        if st.refreshing.contains(&repo_path) {
+                            Some(st.subscribe_cache(&repo_path))
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(mut rx) = rx {
+                        tracing::debug!(repo = %repo_path.display(), timeout_ms = config.query_timeout_ms, "waiting for in-flight refresh");
+                        if let Ok(Ok(())) = tokio::time::timeout(
+                            Duration::from_millis(config.query_timeout_ms),
+                            rx.changed(),
+                        )
+                        .await
+                        {
+                            // Fresh data available
+                            let mut st = state.lock().await;
+                            if let Some(fresh) = st.cache.get(&repo_path).cloned() {
+                                st.stats.cache_hits += 1;
+                                record_timing(&mut st.stats, query_start.elapsed());
+                                drop(st);
+                                if query_path != repo_path {
+                                    link_cache_file(&cd, &repo_path, &query_path);
+                                }
+                                return send_response(
+                                    &mut writer,
+                                    Response::Status { formatted: fresh },
+                                )
+                                .await;
+                            }
+                        }
+                        // Timeout — fall through to return stale cached value
+                    }
+                }
+
                 {
                     let mut st = state.lock().await;
                     st.stats.cache_hits += 1;
@@ -312,36 +377,65 @@ async fn handle_connection(
                 }
                 send_response(&mut writer, Response::Status { formatted: cached }).await
             } else {
-                // Respond immediately with "not ready" and populate cache in the background
-                tracing::debug!(repo = %repo_path.display(), vcs = ?vcs_kind, "cache miss, returning not-ready");
-                state.lock().await.stats.cache_misses += 1;
+                // Cache miss — populate in the background
+                tracing::debug!(repo = %repo_path.display(), vcs = ?vcs_kind, "cache miss");
+                let query_timeout_ms = config.query_timeout_ms;
+                let rx = {
+                    let mut st = state.lock().await;
+                    st.stats.cache_misses += 1;
+                    if query_timeout_ms > 0 {
+                        Some(st.subscribe_cache(&repo_path))
+                    } else {
+                        None
+                    }
+                };
+
                 let not_ready = format_not_ready(&config.resolved_not_ready_format(), config.color);
                 let state_bg = state.clone();
                 let query_path_bg = query_path.clone();
+                let repo_path_bg = repo_path.clone();
+                let cd_bg = cd.clone();
                 tokio::spawn(async move {
                     let result = match vcs_kind {
-                        VcsKind::Jj => query_jj_status(&repo_path, &config).await,
-                        VcsKind::Git => query_git_status(&repo_path, &config).await,
+                        VcsKind::Jj => query_jj_status(&repo_path_bg, &config).await,
+                        VcsKind::Git => query_git_status(&repo_path_bg, &config).await,
                     };
                     match result {
                         Ok(status) => {
                             let formatted =
                                 format_status(&status, &config.resolved_format(), config.color);
-                            write_cache_file(&cd, &repo_path, &formatted);
-                            if query_path_bg != repo_path {
-                                link_cache_file(&cd, &repo_path, &query_path_bg);
+                            write_cache_file(&cd_bg, &repo_path_bg, &formatted);
+                            if query_path_bg != repo_path_bg {
+                                link_cache_file(&cd_bg, &repo_path_bg, &query_path_bg);
                             }
-                            state_bg
-                                .lock()
-                                .await
-                                .cache
-                                .insert(repo_path.clone(), formatted);
+                            state_bg.lock().await.update_cache(&repo_path_bg, formatted);
                         }
                         Err(e) => {
-                            tracing::error!(repo = %repo_path.display(), error = %e, "background status query failed");
+                            tracing::error!(repo = %repo_path_bg.display(), error = %e, "background status query failed");
                         }
                     }
                 });
+
+                // If timeout configured, wait for background task to complete
+                if let Some(mut rx) = rx {
+                    tracing::debug!(repo = %repo_path.display(), timeout_ms = query_timeout_ms, "waiting for initial scan");
+                    if let Ok(Ok(())) =
+                        tokio::time::timeout(Duration::from_millis(query_timeout_ms), rx.changed())
+                            .await
+                    {
+                        let mut st = state.lock().await;
+                        if let Some(formatted) = st.cache.get(&repo_path).cloned() {
+                            record_timing(&mut st.stats, query_start.elapsed());
+                            drop(st);
+                            if query_path != repo_path {
+                                link_cache_file(&cd, &repo_path, &query_path);
+                            }
+                            return send_response(&mut writer, Response::Status { formatted })
+                                .await;
+                        }
+                    }
+                }
+
                 send_response(
                     &mut writer,
                     Response::NotReady {
@@ -491,7 +585,8 @@ async fn refresh_repo(
 ) {
     let refresh_start = Instant::now();
     let (config, cd) = {
-        let st = state.lock().await;
+        let mut st = state.lock().await;
+        st.refreshing.insert(repo_path.clone());
         (st.config.clone(), st.cache_dir.clone())
     };
 
@@ -545,12 +640,14 @@ async fn refresh_repo(
             let formatted = format_status(&status, &config.resolved_format(), config.color);
             write_cache_file(&cd, &repo_path, &formatted);
             let mut st = state.lock().await;
-            st.cache.insert(repo_path.clone(), formatted);
+            st.refreshing.remove(&repo_path);
+            st.update_cache(&repo_path, formatted);
             st.stats.refreshes += 1;
             record_timing(&mut st.stats, refresh_start.elapsed());
         }
         Err(e) => {
             tracing::error!(repo = %repo_path.display(), error = %e, "refresh failed");
+            state.lock().await.refreshing.remove(&repo_path);
         }
     }
     let _ = done_tx.send(RefreshDone { repo_path });
@@ -838,6 +935,7 @@ mod tests {
         let socket_path = rt.path().join("sock");
         let config = Config {
             color: false,
+            query_timeout_ms: 0, // disable waiting to test NotReady behavior
             ..Default::default()
         };
 
@@ -1448,6 +1546,71 @@ mod tests {
         assert!(
             !status_b.contains("feature"),
             "repo B round 3: should not have 'feature', got: {status_b:?}"
+        );
+
+        let _ = send_request(&socket_path, &Request::Shutdown).await;
+        daemon.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_daemon_query_timeout_waits_for_result() {
+        let dir = create_jj_repo().await;
+        let rt = temp_runtime_dir("qtimeout");
+        let socket_path = rt.path().join("sock");
+        let config = Config {
+            color: false,
+            query_timeout_ms: 5000, // generous timeout so the scan completes
+            ..Default::default()
+        };
+
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let query = Request::Query {
+            repo_path: dir.path().to_string_lossy().to_string(),
+        };
+
+        // With query_timeout_ms, the first query should wait and return Status (not NotReady)
+        let resp = send_request(&socket_path, &query).await;
+        match resp {
+            Response::Status { formatted } => {
+                assert!(!formatted.is_empty(), "expected non-empty status");
+            }
+            Response::NotReady { .. } => {
+                panic!(
+                    "with query_timeout_ms=5000, first query should wait and return Status, not NotReady"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let _ = send_request(&socket_path, &Request::Shutdown).await;
+        daemon.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_daemon_query_timeout_zero_returns_not_ready() {
+        let dir = create_jj_repo().await;
+        let rt = temp_runtime_dir("qtimeout0");
+        let socket_path = rt.path().join("sock");
+        let config = Config {
+            color: false,
+            query_timeout_ms: 0, // default — no waiting
+            ..Default::default()
+        };
+
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let query = Request::Query {
+            repo_path: dir.path().to_string_lossy().to_string(),
+        };
+
+        // With query_timeout_ms=0, the first query should return NotReady (current behavior)
+        let resp = send_request(&socket_path, &query).await;
+        assert!(
+            matches!(resp, Response::NotReady { .. }),
+            "with query_timeout_ms=0, first query should be NotReady, got {resp:?}"
         );
 
         let _ = send_request(&socket_path, &Request::Shutdown).await;
