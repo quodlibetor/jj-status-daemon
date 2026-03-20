@@ -14,12 +14,13 @@ use crate::config::Config;
 use crate::git::{GitWorkerRequest, query_git_status, spawn_git_worker};
 use crate::jj::{JjWorkerRequest, query_jj_status, spawn_jj_worker};
 use crate::protocol::{DaemonStats, Request, Response, VcsKind};
+use crate::template::RepoStatus;
 use crate::template::format_not_ready;
 use crate::template::format_status;
 use crate::watcher::{RepoWatcher, WatchEvent, watch_repo};
 
 struct DaemonState {
-    cache: HashMap<PathBuf, String>,
+    cache: HashMap<PathBuf, (RepoStatus, String)>,
     watchers: HashMap<PathBuf, RepoWatcher>,
     /// Maps arbitrary directories to their repo root and VCS kind. Negatives are not cached.
     dir_to_repo: HashMap<PathBuf, (PathBuf, VcsKind)>,
@@ -36,8 +37,9 @@ struct DaemonState {
 
 impl DaemonState {
     /// Insert a cache entry and notify any waiting clients.
-    fn update_cache(&mut self, repo_path: &Path, formatted: String) {
-        self.cache.insert(repo_path.to_path_buf(), formatted);
+    fn update_cache(&mut self, repo_path: &Path, status: RepoStatus, formatted: String) {
+        self.cache
+            .insert(repo_path.to_path_buf(), (status, formatted));
         if let Some(tx) = self.cache_watch.get(repo_path) {
             let val = *tx.borrow() + 1;
             let _ = tx.send(val);
@@ -328,7 +330,7 @@ async fn handle_connection(
                     st.watchers.insert(repo_path.clone(), watcher);
                 }
 
-                let cached = st.cache.get(&repo_path).cloned();
+                let cached = st.cache.get(&repo_path).map(|(_, f)| f.clone());
                 let config = st.config.clone();
                 let cache_dir = st.cache_dir.clone();
                 (repo_path, vcs_kind, cached, config, cache_dir)
@@ -361,7 +363,7 @@ async fn handle_connection(
                         {
                             // Fresh data available
                             let mut st = state.lock().await;
-                            if let Some(fresh) = st.cache.get(&repo_path).cloned() {
+                            if let Some((_, fresh)) = st.cache.get(&repo_path).cloned() {
                                 st.stats.cache_hits += 1;
                                 record_timing(&mut st.stats, query_start.elapsed());
                                 drop(st);
@@ -421,7 +423,10 @@ async fn handle_connection(
                             if query_path_bg != repo_path_bg {
                                 link_cache_file(&cd_bg, &repo_path_bg, &query_path_bg);
                             }
-                            state_bg.lock().await.update_cache(&repo_path_bg, formatted);
+                            state_bg
+                                .lock()
+                                .await
+                                .update_cache(&repo_path_bg, status, formatted);
                         }
                         Err(e) => {
                             tracing::error!(repo = %repo_path_bg.display(), error = %e, "background status query failed");
@@ -437,7 +442,7 @@ async fn handle_connection(
                             .await
                     {
                         let mut st = state.lock().await;
-                        if let Some(formatted) = st.cache.get(&repo_path).cloned() {
+                        if let Some((_, formatted)) = st.cache.get(&repo_path).cloned() {
                             record_timing(&mut st.stats, query_start.elapsed());
                             drop(st);
                             if query_path != repo_path {
@@ -600,7 +605,21 @@ async fn refresh_repo(
     let (config, cd) = {
         let mut st = state.lock().await;
         st.refreshing.insert(repo_path.clone());
-        (st.config.clone(), st.cache_dir.clone())
+        let config = st.config.clone();
+        let cd = st.cache_dir.clone();
+
+        // Mark existing cache as stale immediately so the prompt reflects
+        // that a refresh is in progress, before the VCS query completes.
+        if let Some((prev_status, _)) = st.cache.get(&repo_path) {
+            let mut stale_status = prev_status.clone();
+            stale_status.is_stale = true;
+            stale_status.refresh_error.clear();
+            let formatted = format_status(&stale_status, &config.resolved_format(), config.color);
+            write_cache_file(&cd, &repo_path, &formatted);
+            st.update_cache(&repo_path, stale_status, formatted);
+        }
+
+        (config, cd)
     };
 
     let result = match vcs_kind {
@@ -654,13 +673,23 @@ async fn refresh_repo(
             write_cache_file(&cd, &repo_path, &formatted);
             let mut st = state.lock().await;
             st.refreshing.remove(&repo_path);
-            st.update_cache(&repo_path, formatted);
+            st.update_cache(&repo_path, status, formatted);
             st.stats.refreshes += 1;
             record_timing(&mut st.stats, refresh_start.elapsed());
         }
         Err(e) => {
             tracing::error!(repo = %repo_path.display(), error = %e, "refresh failed");
-            state.lock().await.refreshing.remove(&repo_path);
+            let mut st = state.lock().await;
+            st.refreshing.remove(&repo_path);
+            if let Some((prev_status, _)) = st.cache.get(&repo_path) {
+                let mut stale_status = prev_status.clone();
+                stale_status.is_stale = true;
+                stale_status.refresh_error = e.to_string();
+                let formatted =
+                    format_status(&stale_status, &config.resolved_format(), config.color);
+                write_cache_file(&cd, &repo_path, &formatted);
+                st.update_cache(&repo_path, stale_status, formatted);
+            }
         }
     }
     let _ = done_tx.send(RefreshDone { repo_path });
@@ -1581,6 +1610,155 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+
+        let _ = send_request(&socket_path, &Request::Shutdown).await;
+        daemon.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_daemon_stale_on_refresh_error() {
+        let dir = create_jj_repo().await;
+        let rt = temp_runtime_dir("stale-refresh");
+        let socket_path = rt.path().join("sock");
+        let config = Config {
+            color: false,
+            format: Some("{{ change_id }}{% if is_stale %} STALE{% endif %}".to_string()),
+            ..Default::default()
+        };
+
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
+
+        // Populate the cache with a successful status
+        let first = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
+        assert!(
+            !first.contains("STALE"),
+            "initial status should not be stale: {first:?}"
+        );
+
+        // Corrupt the repo so jj-lib will fail on next refresh
+        let repo_dir = dir.path().join(".jj").join("repo");
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+
+        // Write a file to trigger a file-system event and refresh
+        std::fs::write(dir.path().join("trigger.txt"), "trigger\n").unwrap();
+
+        // Wait for the stale indicator to appear
+        let stale = query_until_match(&socket_path, &dir.path().to_string_lossy(), |s| {
+            s.contains("STALE")
+        })
+        .await;
+        assert!(
+            stale.contains("STALE"),
+            "expected STALE after corruption: {stale:?}"
+        );
+        // Original change_id should still be present
+        assert!(!stale.is_empty(), "stale status should still contain data");
+
+        let _ = send_request(&socket_path, &Request::Shutdown).await;
+        daemon.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_daemon_stale_clears_on_recovery() {
+        let dir = create_jj_repo().await;
+        let rt = temp_runtime_dir("stale-recover");
+        let socket_path = rt.path().join("sock");
+        let config = Config {
+            color: false,
+            format: Some("{{ change_id }}{% if is_stale %} STALE{% endif %}".to_string()),
+            ..Default::default()
+        };
+
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
+
+        // Populate cache
+        let first = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
+        assert!(!first.contains("STALE"));
+
+        // Corrupt
+        let repo_dir = dir.path().join(".jj").join("repo");
+        let backup = TempDir::new().unwrap();
+        // Copy instead of delete so we can restore
+        Command::new("cp")
+            .args([
+                "-a",
+                &repo_dir.to_string_lossy(),
+                &backup.path().join("repo").to_string_lossy(),
+            ])
+            .output()
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+
+        // Trigger refresh — should become stale
+        std::fs::write(dir.path().join("trigger.txt"), "trigger\n").unwrap();
+        let stale = query_until_match(&socket_path, &dir.path().to_string_lossy(), |s| {
+            s.contains("STALE")
+        })
+        .await;
+        assert!(stale.contains("STALE"));
+
+        // Restore the repo
+        Command::new("cp")
+            .args([
+                "-a",
+                &backup.path().join("repo").to_string_lossy(),
+                &repo_dir.to_string_lossy(),
+            ])
+            .output()
+            .await
+            .unwrap();
+
+        // Trigger another refresh — should clear staleness
+        std::fs::write(dir.path().join("trigger2.txt"), "recover\n").unwrap();
+        let recovered = query_until_match(&socket_path, &dir.path().to_string_lossy(), |s| {
+            !s.contains("STALE")
+        })
+        .await;
+        assert!(
+            !recovered.contains("STALE"),
+            "staleness should clear after recovery: {recovered:?}"
+        );
+
+        let _ = send_request(&socket_path, &Request::Shutdown).await;
+        daemon.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_daemon_stale_git_on_refresh_error() {
+        let dir = create_git_repo().await;
+        let rt = temp_runtime_dir("stale-git");
+        let socket_path = rt.path().join("sock");
+        let config = Config {
+            color: false,
+            format: Some("{{ branch }}{% if is_stale %} STALE{% endif %}".to_string()),
+            ..Default::default()
+        };
+
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
+
+        // Populate cache
+        let first = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
+        assert!(
+            !first.contains("STALE"),
+            "initial should not be stale: {first:?}"
+        );
+
+        // Corrupt git repo by removing .git/HEAD
+        std::fs::remove_file(dir.path().join(".git").join("HEAD")).unwrap();
+
+        // Trigger refresh
+        std::fs::write(dir.path().join("trigger.txt"), "trigger\n").unwrap();
+
+        // Wait for stale
+        let stale = query_until_match(&socket_path, &dir.path().to_string_lossy(), |s| {
+            s.contains("STALE")
+        })
+        .await;
+        assert!(
+            stale.contains("STALE"),
+            "expected STALE after git corruption: {stale:?}"
+        );
 
         let _ = send_request(&socket_path, &Request::Shutdown).await;
         daemon.await.unwrap().unwrap();

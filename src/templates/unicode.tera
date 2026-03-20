@@ -14,4 +14,5 @@
 {% if hidden %} {{ "◌" | bright_yellow }}{% endif -%}
 {% if immutable %} {{ "∅" | yellow }}{% endif -%}
 {% if empty %} {{ "∅" | dim }}{% endif -%}
+{% if is_stale %} {{ "⟳" | bright_yellow }}{% endif -%}
 {% if not is_default_workspace %} {{ "木(" | bright_green }}{{ workspace_name }}{{ ")" | bright_green }}{% endif %}
