@@ -121,7 +121,7 @@ enum TemplateAction {
 }
 
 #[derive(Subcommand)]
-enum ConfigAction {
+pub(crate) enum ConfigAction {
     /// Write a default config file with explanatory comments
     Init,
     /// Open the config file in $EDITOR
@@ -231,7 +231,7 @@ fn resolve_config_path(config_file: Option<&Path>) -> Option<PathBuf> {
         .or_else(config::config_path)
 }
 
-fn run_config(action: ConfigAction, config_file: Option<&Path>) -> anyhow::Result<()> {
+pub(crate) fn run_config(action: ConfigAction, config_file: Option<&Path>) -> anyhow::Result<()> {
     match action {
         ConfigAction::Init => {
             let path = config_file

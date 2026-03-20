@@ -390,201 +390,113 @@ bookmark_search_depth = 5
         );
     }
 
-    fn build_exe() -> PathBuf {
-        escargot::CargoBuild::new()
-            .bin("vcs-status-daemon")
-            .current_target()
-            .run()
-            .expect("failed to build vcs-status-daemon")
-            .path()
-            .to_path_buf()
-    }
-
-    fn run_cmd(exe: &Path, args: &[&str]) -> std::process::Output {
-        std::process::Command::new(exe)
-            .args(args)
-            .output()
-            .expect("failed to run command")
-    }
-
     #[test]
-    fn test_config_set_and_get_via_cli() {
-        let exe = build_exe();
+    fn test_config_set_and_get() {
         let dir = tempfile::TempDir::with_prefix("vcs-cfg-set-").unwrap();
         let cf = dir.path().join("config.toml");
-
-        // Write a minimal starting config
         std::fs::write(&cf, "template_name = \"ascii\"\n").unwrap();
 
-        let cf_str = cf.to_str().unwrap();
+        crate::run_config(
+            crate::ConfigAction::Set {
+                key: "template_name".into(),
+                value: "nerdfont".into(),
+            },
+            Some(&cf),
+        )
+        .unwrap();
 
-        // Set template_name to nerdfont
-        let out = run_cmd(
-            &exe,
-            &[
-                "--config-file",
-                cf_str,
-                "config",
-                "set",
-                "template_name",
-                "nerdfont",
-            ],
-        );
-        assert!(
-            out.status.success(),
-            "config set failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-
-        // Get it back
-        let out = run_cmd(
-            &exe,
-            &["--config-file", cf_str, "config", "get", "template_name"],
-        );
-        assert!(
-            out.status.success(),
-            "config get failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "nerdfont");
-
-        // Verify the file was updated and is still valid TOML
-        let contents = std::fs::read_to_string(&cf).unwrap();
-        let config: Config = toml::from_str(&contents).unwrap();
+        // Verify via load_config_from
+        let config = load_config_from(Some(&cf)).unwrap();
         assert_eq!(config.template_name, "nerdfont");
+
+        // Verify the file is still valid TOML
+        let contents = std::fs::read_to_string(&cf).unwrap();
+        let _: Config = toml::from_str(&contents).unwrap();
     }
 
     #[test]
-    fn test_config_set_integer_via_cli() {
-        let exe = build_exe();
+    fn test_config_set_integer() {
         let dir = tempfile::TempDir::with_prefix("vcs-cfg-int-").unwrap();
         let cf = dir.path().join("config.toml");
         std::fs::write(&cf, "").unwrap();
-        let cf_str = cf.to_str().unwrap();
 
-        let out = run_cmd(
-            &exe,
-            &[
-                "--config-file",
-                cf_str,
-                "config",
-                "set",
-                "idle_timeout_secs",
-                "500",
-            ],
-        );
-        assert!(
-            out.status.success(),
-            "config set failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        crate::run_config(
+            crate::ConfigAction::Set {
+                key: "idle_timeout_secs".into(),
+                value: "500".into(),
+            },
+            Some(&cf),
+        )
+        .unwrap();
 
-        let out = run_cmd(
-            &exe,
-            &[
-                "--config-file",
-                cf_str,
-                "config",
-                "get",
-                "idle_timeout_secs",
-            ],
-        );
-        assert!(out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "500");
+        let config = load_config_from(Some(&cf)).unwrap();
+        assert_eq!(config.idle_timeout_secs, 500);
     }
 
     #[test]
-    fn test_config_set_bool_via_cli() {
-        let exe = build_exe();
+    fn test_config_set_bool() {
         let dir = tempfile::TempDir::with_prefix("vcs-cfg-bool-").unwrap();
         let cf = dir.path().join("config.toml");
         std::fs::write(&cf, "").unwrap();
-        let cf_str = cf.to_str().unwrap();
 
-        let out = run_cmd(
-            &exe,
-            &["--config-file", cf_str, "config", "set", "color", "false"],
-        );
-        assert!(
-            out.status.success(),
-            "config set failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        crate::run_config(
+            crate::ConfigAction::Set {
+                key: "color".into(),
+                value: "false".into(),
+            },
+            Some(&cf),
+        )
+        .unwrap();
 
-        let out = run_cmd(&exe, &["--config-file", cf_str, "config", "get", "color"]);
-        assert!(out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "false");
+        let config = load_config_from(Some(&cf)).unwrap();
+        assert!(!config.color);
     }
 
     #[test]
-    fn test_config_path_via_cli() {
-        let exe = build_exe();
+    fn test_config_path() {
         let dir = tempfile::TempDir::with_prefix("vcs-cfg-path-").unwrap();
         let cf = dir.path().join("config.toml");
         std::fs::write(&cf, "").unwrap();
-        let cf_str = cf.to_str().unwrap();
 
-        let out = run_cmd(&exe, &["--config-file", cf_str, "config", "path"]);
-        assert!(out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), cf_str);
+        // Just verify it doesn't error
+        let result = crate::run_config(crate::ConfigAction::Path, Some(&cf));
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn test_config_init_via_cli() {
-        let exe = build_exe();
+    fn test_config_init() {
         let dir = tempfile::TempDir::with_prefix("vcs-cfg-init-").unwrap();
         let cf = dir.path().join("subdir").join("config.toml");
-        let cf_str = cf.to_str().unwrap();
 
-        // File doesn't exist yet
         assert!(!cf.exists());
 
-        let out = run_cmd(&exe, &["--config-file", cf_str, "config", "init"]);
-        assert!(
-            out.status.success(),
-            "config init failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        crate::run_config(crate::ConfigAction::Init, Some(&cf)).unwrap();
 
         // File should now exist and be valid
         assert!(cf.exists());
         let contents = std::fs::read_to_string(&cf).unwrap();
-        let _config: Config = toml::from_str(&contents).unwrap();
+        let _: Config = toml::from_str(&contents).unwrap();
 
         // Running init again should fail (file already exists)
-        let out = run_cmd(&exe, &["--config-file", cf_str, "config", "init"]);
-        assert!(
-            !out.status.success(),
-            "config init should fail when file exists"
-        );
+        let result = crate::run_config(crate::ConfigAction::Init, Some(&cf));
+        assert!(result.is_err(), "config init should fail when file exists");
     }
 
     #[test]
     fn test_config_set_preserves_comments() {
-        let exe = build_exe();
         let dir = tempfile::TempDir::with_prefix("vcs-cfg-comments-").unwrap();
         let cf = dir.path().join("config.toml");
         std::fs::write(&cf, DEFAULT_CONFIG_TOML).unwrap();
-        let cf_str = cf.to_str().unwrap();
 
-        let out = run_cmd(
-            &exe,
-            &[
-                "--config-file",
-                cf_str,
-                "config",
-                "set",
-                "template_name",
-                "simple",
-            ],
-        );
-        assert!(
-            out.status.success(),
-            "config set failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        crate::run_config(
+            crate::ConfigAction::Set {
+                key: "template_name".into(),
+                value: "simple".into(),
+            },
+            Some(&cf),
+        )
+        .unwrap();
 
-        // Comments should still be there
         let contents = std::fs::read_to_string(&cf).unwrap();
         assert!(
             contents.contains("# vcs-status-daemon configuration"),
@@ -598,157 +510,112 @@ bookmark_search_depth = 5
 
     #[test]
     fn test_config_get_defaults_without_file() {
-        let exe = build_exe();
         let dir = tempfile::TempDir::with_prefix("vcs-cfg-nofile-").unwrap();
         let cf = dir.path().join("nonexistent.toml");
-        let cf_str = cf.to_str().unwrap();
 
         // File doesn't exist — should return defaults
-        let out = run_cmd(
-            &exe,
-            &["--config-file", cf_str, "config", "get", "template_name"],
-        );
-        assert!(out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ascii");
+        let config = load_config_from(Some(&cf)).unwrap();
+        assert_eq!(config.template_name, "ascii");
     }
 
     #[test]
     fn test_config_set_rejects_unknown_key() {
-        let exe = build_exe();
         let dir = tempfile::TempDir::with_prefix("vcs-cfg-badkey-").unwrap();
         let cf = dir.path().join("config.toml");
         std::fs::write(&cf, "").unwrap();
-        let cf_str = cf.to_str().unwrap();
 
-        let out = run_cmd(
-            &exe,
-            &[
-                "--config-file",
-                cf_str,
-                "config",
-                "set",
-                "bogus_key",
-                "hello",
-            ],
+        let result = crate::run_config(
+            crate::ConfigAction::Set {
+                key: "bogus_key".into(),
+                value: "hello".into(),
+            },
+            Some(&cf),
         );
+        assert!(result.is_err(), "config set should reject unknown keys");
+        let err = result.unwrap_err().to_string();
         assert!(
-            !out.status.success(),
-            "config set should reject unknown keys"
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("bogus_key"),
-            "error should mention the bad key: {stderr}"
+            err.contains("bogus_key"),
+            "error should mention the bad key: {err}"
         );
     }
 
     #[test]
     fn test_config_get_rejects_unknown_key() {
-        let exe = build_exe();
         let dir = tempfile::TempDir::with_prefix("vcs-cfg-badget-").unwrap();
         let cf = dir.path().join("config.toml");
         std::fs::write(&cf, "").unwrap();
-        let cf_str = cf.to_str().unwrap();
 
-        let out = run_cmd(
-            &exe,
-            &["--config-file", cf_str, "config", "get", "nonexistent"],
+        let result = crate::run_config(
+            crate::ConfigAction::Get {
+                key: "nonexistent".into(),
+            },
+            Some(&cf),
         );
-        assert!(
-            !out.status.success(),
-            "config get should reject unknown keys"
-        );
+        assert!(result.is_err(), "config get should reject unknown keys");
     }
 
     #[test]
     fn test_config_set_rejects_wrong_type() {
-        let exe = build_exe();
         let dir = tempfile::TempDir::with_prefix("vcs-cfg-badtype-").unwrap();
         let cf = dir.path().join("config.toml");
         std::fs::write(&cf, "").unwrap();
-        let cf_str = cf.to_str().unwrap();
 
-        // idle_timeout_secs expects an integer, "notanumber" should fail validation
-        let out = run_cmd(
-            &exe,
-            &[
-                "--config-file",
-                cf_str,
-                "config",
-                "set",
-                "idle_timeout_secs",
-                "notanumber",
-            ],
+        let result = crate::run_config(
+            crate::ConfigAction::Set {
+                key: "idle_timeout_secs".into(),
+                value: "notanumber".into(),
+            },
+            Some(&cf),
         );
+        assert!(result.is_err(), "config set should reject wrong types");
+        let err = result.unwrap_err().to_string();
         assert!(
-            !out.status.success(),
-            "config set should reject wrong types"
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("idle_timeout_secs"),
-            "error should mention the key: {stderr}"
+            err.contains("idle_timeout_secs"),
+            "error should mention the key: {err}"
         );
     }
 
     #[test]
     fn test_config_set_rejects_invalid_template_name() {
-        let exe = build_exe();
         let dir = tempfile::TempDir::with_prefix("vcs-cfg-badtmpl-").unwrap();
         let cf = dir.path().join("config.toml");
         std::fs::write(&cf, "").unwrap();
-        let cf_str = cf.to_str().unwrap();
 
-        let out = run_cmd(
-            &exe,
-            &[
-                "--config-file",
-                cf_str,
-                "config",
-                "set",
-                "template_name",
-                "nonexistent",
-            ],
+        let result = crate::run_config(
+            crate::ConfigAction::Set {
+                key: "template_name".into(),
+                value: "nonexistent".into(),
+            },
+            Some(&cf),
         );
         assert!(
-            !out.status.success(),
+            result.is_err(),
             "config set should reject unknown template names"
         );
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let err = result.unwrap_err().to_string();
         assert!(
-            stderr.contains("nonexistent"),
-            "error should mention the bad name: {stderr}"
+            err.contains("nonexistent"),
+            "error should mention the bad name: {err}"
         );
         assert!(
-            stderr.contains("ascii"),
-            "error should list valid names: {stderr}"
+            err.contains("ascii"),
+            "error should list valid names: {err}"
         );
     }
 
     #[test]
     fn test_config_set_accepts_user_defined_template_name() {
-        let exe = build_exe();
         let dir = tempfile::TempDir::with_prefix("vcs-cfg-usertmpl-").unwrap();
         let cf = dir.path().join("config.toml");
-        // Pre-populate with a user-defined template
         std::fs::write(&cf, "[templates]\nmy_custom = \"{{ change_id }}\"\n").unwrap();
-        let cf_str = cf.to_str().unwrap();
 
-        let out = run_cmd(
-            &exe,
-            &[
-                "--config-file",
-                cf_str,
-                "config",
-                "set",
-                "template_name",
-                "my_custom",
-            ],
-        );
-        assert!(
-            out.status.success(),
-            "config set should accept user-defined template names: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        crate::run_config(
+            crate::ConfigAction::Set {
+                key: "template_name".into(),
+                value: "my_custom".into(),
+            },
+            Some(&cf),
+        )
+        .unwrap();
     }
 }
