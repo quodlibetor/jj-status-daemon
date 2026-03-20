@@ -13,6 +13,8 @@ pub enum WatchEvent {
         repo_path: PathBuf,
         vcs_kind: VcsKind,
         working_copy_changed: bool,
+        /// Absolute paths of changed files (non-ignored working copy files only).
+        changed_paths: Vec<PathBuf>,
     },
     Flush(tokio::sync::oneshot::Sender<()>),
 }
@@ -136,10 +138,31 @@ pub fn watch_repo(
                 }
             }
 
+            // Collect non-VCS, non-ignored working copy paths for incremental diffs
+            let changed_paths: Vec<PathBuf> = if working_copy_changed {
+                event
+                    .paths
+                    .iter()
+                    .filter(|p| {
+                        if p.starts_with(&vcs_dir) {
+                            return false;
+                        }
+                        let rel = p.strip_prefix(&canonical_root).unwrap_or(p);
+                        let is_dir = p.is_dir();
+                        !gitignore
+                            .matched_path_or_any_parents(rel, is_dir)
+                            .is_ignore()
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let _ = tx.send(WatchEvent::Change {
                 repo_path: repo_path_owned.clone(),
                 vcs_kind,
                 working_copy_changed,
+                changed_paths,
             });
         })?;
 

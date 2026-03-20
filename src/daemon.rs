@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
 use crate::git::query_git_status;
-use crate::jj::query_jj_status;
+use crate::jj::{JjWorkerRequest, query_jj_status, spawn_jj_worker};
 use crate::protocol::{DaemonStats, Request, Response, VcsKind};
 use crate::template::format_not_ready;
 use crate::template::format_status;
@@ -464,12 +464,12 @@ fn record_timing(stats: &mut DaemonStats, elapsed: Duration) {
 }
 
 /// Per-repo refresh state: tracks whether a re-refresh is needed while one is in flight.
-/// The bool is `working_copy_changed` (true wins over false).
 enum RepoRefreshState {
     /// A refresh task is running, no new events queued.
     InFlight,
     /// A refresh task is running AND new events arrived — re-refresh needed after completion.
-    Pending(VcsKind, bool),
+    /// Fields: vcs_kind, working_copy_changed, accumulated changed_paths.
+    Pending(VcsKind, bool, Vec<PathBuf>),
 }
 
 /// Channel message sent when a per-repo refresh task completes.
@@ -481,7 +481,10 @@ struct RefreshDone {
 async fn refresh_repo(
     repo_path: PathBuf,
     vcs_kind: VcsKind,
+    working_copy_changed: bool,
+    changed_paths: Vec<PathBuf>,
     state: Arc<Mutex<DaemonState>>,
+    jj_worker: mpsc::UnboundedSender<JjWorkerRequest>,
     done_tx: mpsc::UnboundedSender<RefreshDone>,
 ) {
     let refresh_start = Instant::now();
@@ -489,10 +492,32 @@ async fn refresh_repo(
         let st = state.lock().await;
         (st.config.clone(), st.cache_dir.clone())
     };
+
     let result = match vcs_kind {
-        VcsKind::Jj => query_jj_status(&repo_path, &config).await,
+        VcsKind::Jj if working_copy_changed && !changed_paths.is_empty() => {
+            // Try incremental update via jj worker
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let _ = jj_worker.send(JjWorkerRequest::IncrementalUpdate {
+                repo_path: repo_path.clone(),
+                changed_paths,
+                reply: reply_tx,
+            });
+            match reply_rx.await {
+                Ok(Ok(status)) => Ok(status),
+                Ok(Err(_)) => {
+                    // No incremental state — fall back to full refresh
+                    jj_full_refresh(&repo_path, &config, &jj_worker).await
+                }
+                Err(_) => Err(anyhow::anyhow!("jj worker channel closed")),
+            }
+        }
+        VcsKind::Jj => {
+            // VCS-internal event or no paths — full refresh
+            jj_full_refresh(&repo_path, &config, &jj_worker).await
+        }
         VcsKind::Git => query_git_status(&repo_path, &config).await,
     };
+
     match result {
         Ok(status) => {
             let formatted = format_status(&status, &config.resolved_format(), config.color);
@@ -509,6 +534,23 @@ async fn refresh_repo(
     let _ = done_tx.send(RefreshDone { repo_path });
 }
 
+/// Full jj refresh via the worker thread (replaces incremental state).
+async fn jj_full_refresh(
+    repo_path: &Path,
+    config: &Config,
+    jj_worker: &mpsc::UnboundedSender<JjWorkerRequest>,
+) -> Result<crate::template::RepoStatus> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = jj_worker.send(JjWorkerRequest::FullRefresh {
+        repo_path: repo_path.to_path_buf(),
+        depth: config.bookmark_search_depth,
+        reply: reply_tx,
+    });
+    reply_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("jj worker channel closed"))?
+}
+
 #[tracing::instrument(skip_all)]
 async fn refresh_task(
     state: Arc<Mutex<DaemonState>>,
@@ -517,6 +559,7 @@ async fn refresh_task(
     // Per-repo concurrency control: at most one refresh per repo at a time.
     let mut in_flight: HashMap<PathBuf, RepoRefreshState> = HashMap::new();
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<RefreshDone>();
+    let jj_worker = spawn_jj_worker();
 
     loop {
         tokio::select! {
@@ -529,13 +572,13 @@ async fn refresh_task(
                         while !in_flight.is_empty() {
                             if let Some(done) = done_rx.recv().await {
                                 handle_refresh_done(
-                                    &done, &mut in_flight, &state, &done_tx,
+                                    &done, &mut in_flight, &jj_worker, &state, &done_tx,
                                 );
                             }
                         }
                         let _ = tx.send(());
                     }
-                    WatchEvent::Change { repo_path, vcs_kind, working_copy_changed } => {
+                    WatchEvent::Change { repo_path, vcs_kind, working_copy_changed, changed_paths } => {
                         state.lock().await.stats.fs_events += 1;
 
                         match in_flight.get_mut(&repo_path) {
@@ -543,19 +586,20 @@ async fn refresh_task(
                                 // No refresh running — start one immediately
                                 in_flight.insert(repo_path.clone(), RepoRefreshState::InFlight);
                                 tokio::spawn(refresh_repo(
-                                    repo_path, vcs_kind,
-                                    state.clone(), done_tx.clone(),
+                                    repo_path, vcs_kind, working_copy_changed, changed_paths,
+                                    state.clone(), jj_worker.clone(), done_tx.clone(),
                                 ));
                             }
                             Some(entry) => {
                                 // Refresh already running — queue a re-refresh.
-                                // working_copy_changed=true wins (needs snapshot).
+                                // working_copy_changed=true wins; accumulate paths.
                                 match entry {
                                     RepoRefreshState::InFlight => {
-                                        *entry = RepoRefreshState::Pending(vcs_kind, working_copy_changed);
+                                        *entry = RepoRefreshState::Pending(vcs_kind, working_copy_changed, changed_paths);
                                     }
-                                    RepoRefreshState::Pending(_, wc) => {
+                                    RepoRefreshState::Pending(_, wc, paths) => {
                                         *wc = *wc || working_copy_changed;
+                                        paths.extend(changed_paths);
                                     }
                                 }
                             }
@@ -565,7 +609,7 @@ async fn refresh_task(
             }
             done = done_rx.recv() => {
                 if let Some(done) = done {
-                    handle_refresh_done(&done, &mut in_flight, &state, &done_tx);
+                    handle_refresh_done(&done, &mut in_flight, &jj_worker, &state, &done_tx);
                 }
             }
         }
@@ -575,16 +619,17 @@ async fn refresh_task(
 fn handle_refresh_done(
     done: &RefreshDone,
     in_flight: &mut HashMap<PathBuf, RepoRefreshState>,
+    jj_worker: &mpsc::UnboundedSender<JjWorkerRequest>,
     state: &Arc<Mutex<DaemonState>>,
     done_tx: &mpsc::UnboundedSender<RefreshDone>,
 ) {
     match in_flight.remove(&done.repo_path) {
-        Some(RepoRefreshState::Pending(vcs_kind, wc)) if wc => {
+        Some(RepoRefreshState::Pending(vcs_kind, wc, paths)) if wc => {
             // Working copy changed while refreshing — re-refresh immediately
             in_flight.insert(done.repo_path.clone(), RepoRefreshState::InFlight);
             tokio::spawn(refresh_repo(
-                done.repo_path.clone(), vcs_kind,
-                state.clone(), done_tx.clone(),
+                done.repo_path.clone(), vcs_kind, wc, paths,
+                state.clone(), jj_worker.clone(), done_tx.clone(),
             ));
         }
         Some(RepoRefreshState::Pending(..)) => {
