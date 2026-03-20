@@ -948,8 +948,12 @@ mod tests {
             .current_dir(dir.path())
             .output()
             .await
-            .unwrap();
-        assert!(output.status.success());
+            .expect("failed to run `jj git init` — is `jj` installed and in PATH?");
+        assert!(
+            output.status.success(),
+            "jj git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         dir
     }
 
