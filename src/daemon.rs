@@ -143,6 +143,10 @@ pub async fn run_daemon(config: Config, runtime_dir: PathBuf) -> Result<()> {
     let pid_path = runtime_dir.join("pid");
     std::fs::write(&pid_path, std::process::id().to_string()).ok();
 
+    // Write version file so clients can detect version mismatches without a socket round-trip
+    let (version, git_hash, _) = crate::protocol::version_info();
+    std::fs::write(runtime_dir.join("version"), format!("{version} {git_hash}")).ok();
+
     let (watch_tx, watch_rx) = mpsc::unbounded_channel();
     let shutdown = Arc::new(Notify::new());
 
@@ -259,6 +263,8 @@ pub async fn run_daemon(config: Config, runtime_dir: PathBuf) -> Result<()> {
                     tracing::warn!(path = %cache_dir.display(), error = %e, "failed to remove cache directory");
                 }
                 let _ = std::fs::remove_file(&pid_path);
+                let _ = std::fs::remove_file(runtime_dir.join("version"));
+                let _ = std::fs::remove_file(runtime_dir.join("version_warned"));
                 return Ok(());
             }
         }

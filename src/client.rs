@@ -36,8 +36,52 @@ fn send_request_with_timeout(
     Ok(response)
 }
 
+/// Check the daemon's version file (written on startup) against the client version.
+/// Warns once per daemon instance by writing a marker file.
+fn check_version_file(socket_path: &Path) {
+    let Some(runtime_dir) = socket_path.parent() else {
+        return;
+    };
+    let version_path = runtime_dir.join("version");
+    let warned_path = runtime_dir.join("version_warned");
+
+    let Ok(daemon_version_str) = std::fs::read_to_string(&version_path) else {
+        return; // Old daemon that doesn't write version file
+    };
+    let daemon_version = daemon_version_str.split_whitespace().next().unwrap_or("");
+    let (client_version, _, _) = crate::protocol::version_info();
+
+    if daemon_version == client_version {
+        // Versions match — clean up any stale warning marker
+        let _ = std::fs::remove_file(&warned_path);
+        return;
+    }
+
+    // Only warn once: check if we already warned for this daemon version
+    if let Ok(warned_for) = std::fs::read_to_string(&warned_path)
+        && warned_for.trim() == daemon_version
+    {
+        return;
+    }
+
+    eprintln!(
+        "vcs-status-daemon: warning: client is v{client_version} but daemon is v{daemon_version}, \
+         run `vcs-status-daemon restart` to upgrade"
+    );
+    let _ = std::fs::write(&warned_path, daemon_version);
+}
+
 fn start_daemon(socket_path: &Path, config_file: Option<&Path>) -> Result<()> {
-    let exe = std::env::current_exe().context("failed to get current exe")?;
+    // If the socket is already connectable, a daemon is running — nothing to do.
+    if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+        check_version_file(socket_path);
+        return Ok(());
+    }
+
+    // Canonicalize to resolve symlinks — ensures we start this exact binary,
+    // not a shim or symlink that might resolve to a different version later.
+    let exe = std::fs::canonicalize(std::env::current_exe().context("failed to get current exe")?)
+        .context("failed to canonicalize exe path")?;
 
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["daemon", "--dir"]);
@@ -457,6 +501,163 @@ mod tests {
         assert_eq!(result, NOT_READY_FALLBACK, "should return fallback text");
 
         unsafe { std::env::remove_var("VCS_STATUS_DAEMON_DIR") };
+    }
+
+    #[tokio::test]
+    async fn test_start_daemon_noop_when_already_running() {
+        let rt = TempDir::with_prefix("vcs-test-noop-").unwrap();
+        let socket_path = rt.path().join("sock");
+
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+
+        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
+        wait_for_socket(&socket_path).await;
+
+        // Calling start_daemon when daemon is already running should be a no-op.
+        // Currently this FAILS because it spawns a subprocess that bails with
+        // "daemon already running (socket is active)".
+        let sp = socket_path.clone();
+        let result = tokio::task::spawn_blocking(move || start_daemon(&sp, None))
+            .await
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "start_daemon should no-op when daemon is already running, got: {result:?}"
+        );
+
+        // Clean up
+        let sp = socket_path.clone();
+        tokio::task::spawn_blocking(move || send_request(&sp, &Request::Shutdown).ok())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_daemon_writes_version_file() {
+        let rt = TempDir::with_prefix("vcs-test-version-file-").unwrap();
+        let socket_path = rt.path().join("sock");
+        let version_path = rt.path().join("version");
+
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+
+        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
+        wait_for_socket(&socket_path).await;
+
+        // Daemon should write a version file on startup
+        assert!(version_path.exists(), "daemon should write version file");
+        let contents = std::fs::read_to_string(&version_path).unwrap();
+        let (expected_version, expected_hash, _) = crate::protocol::version_info();
+        assert_eq!(
+            contents,
+            format!("{expected_version} {expected_hash}"),
+            "version file should contain version and git hash"
+        );
+
+        let sp = socket_path.clone();
+        tokio::task::spawn_blocking(move || send_request(&sp, &Request::Shutdown).ok())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_version_file_cleaned_up_on_shutdown() {
+        let rt = TempDir::with_prefix("vcs-test-version-cleanup-").unwrap();
+        let socket_path = rt.path().join("sock");
+        let version_path = rt.path().join("version");
+
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
+        wait_for_socket(&socket_path).await;
+        assert!(version_path.exists());
+
+        let sp = socket_path.clone();
+        tokio::task::spawn_blocking(move || send_request(&sp, &Request::Shutdown).ok())
+            .await
+            .unwrap();
+        daemon.await.unwrap().unwrap();
+
+        assert!(
+            !version_path.exists(),
+            "version file should be removed on shutdown"
+        );
+    }
+
+    #[test]
+    fn test_check_version_file_no_warn_on_match() {
+        let rt = TempDir::with_prefix("vcs-test-version-match-").unwrap();
+        let socket_path = rt.path().join("sock");
+        let (version, hash, _) = crate::protocol::version_info();
+
+        // Write matching version file
+        std::fs::write(rt.path().join("version"), format!("{version} {hash}")).unwrap();
+
+        // Should not create warned marker
+        check_version_file(&socket_path);
+        assert!(
+            !rt.path().join("version_warned").exists(),
+            "should not create warned marker when versions match"
+        );
+    }
+
+    #[test]
+    fn test_check_version_file_warns_on_mismatch() {
+        let rt = TempDir::with_prefix("vcs-test-version-mismatch-").unwrap();
+        let socket_path = rt.path().join("sock");
+
+        // Write mismatched version file
+        std::fs::write(rt.path().join("version"), "0.0.1 abc123").unwrap();
+
+        // Should create warned marker
+        check_version_file(&socket_path);
+        assert!(
+            rt.path().join("version_warned").exists(),
+            "should create warned marker on version mismatch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rt.path().join("version_warned"))
+                .unwrap()
+                .trim(),
+            "0.0.1"
+        );
+    }
+
+    #[test]
+    fn test_check_version_file_warns_only_once() {
+        let rt = TempDir::with_prefix("vcs-test-version-once-").unwrap();
+        let socket_path = rt.path().join("sock");
+        let warned_path = rt.path().join("version_warned");
+
+        // Write mismatched version file
+        std::fs::write(rt.path().join("version"), "0.0.1 abc123").unwrap();
+
+        // First check creates marker
+        check_version_file(&socket_path);
+        assert!(warned_path.exists());
+        assert_eq!(std::fs::read_to_string(&warned_path).unwrap(), "0.0.1");
+
+        // Record mtime of the warned marker
+        let mtime_before = std::fs::metadata(&warned_path).unwrap().modified().unwrap();
+
+        // Small delay so mtime would differ if rewritten
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Second check should see marker and not rewrite
+        check_version_file(&socket_path);
+        let mtime_after = std::fs::metadata(&warned_path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "warned marker should not be rewritten on subsequent checks"
+        );
     }
 
     #[tokio::test]
