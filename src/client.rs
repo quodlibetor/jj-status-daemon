@@ -136,7 +136,7 @@ fn extract_status(response: Response) -> Result<String> {
 const NOT_READY_FALLBACK: &str = "…";
 
 pub fn query(repo_path: &Path, config_file: Option<&Path>) -> Result<String> {
-    let socket_path = config::socket_path();
+    let socket_path = config::socket_path()?;
     let request = Request::Query {
         repo_path: repo_path.to_string_lossy().to_string(),
         timeout_override_ms: 0,
@@ -175,7 +175,7 @@ pub fn query(repo_path: &Path, config_file: Option<&Path>) -> Result<String> {
 /// Query the running daemon for its version info.
 /// Returns (version, git_hash, features) or an error if the daemon isn't reachable.
 pub fn daemon_version() -> Result<(String, String, Vec<String>)> {
-    let socket_path = config::socket_path();
+    let socket_path = config::socket_path()?;
     let response = send_request(&socket_path, &Request::Version)?;
     match response {
         Response::Version {
@@ -189,7 +189,7 @@ pub fn daemon_version() -> Result<(String, String, Vec<String>)> {
 }
 
 pub fn shutdown() -> Result<()> {
-    let socket_path = config::socket_path();
+    let socket_path = config::socket_path()?;
     let response =
         send_request_slow(&socket_path, &Request::Shutdown).context("failed to send shutdown")?;
 
@@ -201,8 +201,8 @@ pub fn shutdown() -> Result<()> {
 }
 
 pub fn restart(config_file: Option<&Path>) -> Result<()> {
-    let socket_path = config::socket_path();
-    let pid_path = config::pid_path();
+    let socket_path = config::socket_path()?;
+    let pid_path = config::pid_path()?;
 
     // Try graceful shutdown first
     let _ = send_request_slow(&socket_path, &Request::Shutdown);
@@ -244,8 +244,8 @@ fn fmt_features(features: &[String]) -> String {
 }
 
 pub fn status() -> Result<()> {
-    let socket_path = config::socket_path();
-    let pid_path = config::pid_path();
+    let socket_path = config::socket_path()?;
+    let pid_path = config::pid_path()?;
 
     match send_request_slow(&socket_path, &Request::DaemonStatus) {
         Ok(Response::DaemonStatus {

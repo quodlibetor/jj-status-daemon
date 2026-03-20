@@ -61,6 +61,10 @@ struct Cli {
     /// Path to config file (overrides default config path)
     #[arg(long)]
     config_file: Option<PathBuf>,
+
+    /// Allow running as root (not recommended)
+    #[arg(long)]
+    allow_root: bool,
 }
 
 #[derive(Subcommand)]
@@ -154,7 +158,6 @@ fn try_fast_args() -> Option<FastArgs> {
     let mut args = std::env::args_os().skip(1);
     let mut repo = None;
     let mut config_file = None;
-
     loop {
         let arg = match args.next() {
             None => break,
@@ -201,6 +204,8 @@ fn run_query(path: Option<PathBuf>, config_file: Option<&Path>) -> anyhow::Resul
 fn main() -> anyhow::Result<()> {
     // Fast path: skip clap and tokio for the common no-subcommand client case
     if let Some(fast) = try_fast_args() {
+        // --allow-root isn't handled by the fast path so if it's provided we'll never hit here
+        config::check_not_root(false)?;
         return run_query(fast.repo, fast.config_file.as_deref());
     }
 
@@ -432,11 +437,15 @@ fn run_template(action: TemplateAction) -> anyhow::Result<()> {
 
 fn run_clap() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    config::check_not_root(cli.allow_root)?;
     let cf = cli.config_file.as_deref();
 
     match cli.command {
         Some(Commands::Daemon { dir, config_file }) => {
-            let runtime_dir = dir.unwrap_or_else(config::runtime_dir);
+            let runtime_dir = match dir {
+                Some(d) => d,
+                None => config::runtime_dir()?,
+            };
             daemon::init_logging(&runtime_dir);
             // Daemon's own --config-file takes priority over the top-level one
             let daemon_cf = config_file.as_deref().or(cf);
