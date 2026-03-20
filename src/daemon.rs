@@ -890,21 +890,27 @@ mod tests {
         serde_json::from_str(line.trim()).unwrap()
     }
 
-    /// Query the daemon and wait until it returns a Status (retrying through NotReady).
-    async fn query_until_ready(socket_path: &std::path::Path, repo_path: &str) -> String {
-        for _ in 0..100 {
+    /// Wait for the daemon socket to appear.
+    async fn wait_for_socket(socket_path: &std::path::Path) {
+        for _ in 0..2000 {
             if socket_path.exists() {
-                break;
+                return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        panic!("socket never appeared at {}", socket_path.display());
+    }
+
+    /// Query the daemon and wait until it returns a Status (retrying through NotReady).
+    async fn query_until_ready(socket_path: &std::path::Path, repo_path: &str) -> String {
+        wait_for_socket(socket_path).await;
         let request = Request::test_query(repo_path.to_string());
-        for _ in 0..50 {
+        for _ in 0..2000 {
             let resp = send_request(socket_path, &request).await;
             match resp {
                 Response::Status { formatted } => return formatted,
                 Response::NotReady { .. } => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                     continue;
                 }
                 other => panic!("expected Status or NotReady, got {other:?}"),
@@ -913,16 +919,30 @@ mod tests {
         panic!("timed out waiting for Status response");
     }
 
-    fn temp_runtime_dir(suffix: &str) -> TempDir {
-        TempDir::with_prefix(format!("vcs-test-{suffix}-")).unwrap()
+    /// Flush the daemon, query, and retry until `pred` matches the formatted status.
+    async fn query_until_match(
+        socket_path: &std::path::Path,
+        repo_path: &str,
+        pred: impl Fn(&str) -> bool,
+    ) -> String {
+        let request = Request::test_query(repo_path.to_string());
+        for _ in 0..2000 {
+            let _ = send_request(socket_path, &Request::Flush).await;
+            let resp = send_request(socket_path, &request).await;
+            if let Response::Status { ref formatted } = resp
+                && pred(formatted)
+            {
+                return formatted.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // One final attempt to get a diagnostic message
+        let resp = send_request(socket_path, &request).await;
+        panic!("timed out waiting for condition on {repo_path}, last response: {resp:?}");
     }
 
-    /// Wait for filesystem events to arrive, then flush the daemon's refresh task.
-    async fn flush_daemon(socket_path: &std::path::Path) {
-        // Brief sleep to let filesystem events propagate to the watcher
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let resp = send_request(socket_path, &Request::Flush).await;
-        assert_eq!(resp, Response::Ok);
+    fn temp_runtime_dir(suffix: &str) -> TempDir {
+        TempDir::with_prefix(format!("vcs-test-{suffix}-")).unwrap()
     }
 
     #[tokio::test]
@@ -971,17 +991,18 @@ mod tests {
             "first query should be NotReady, got {resp:?}"
         );
 
-        // Wait for background population
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // Second query should return Status (cache is warm)
-        let resp = send_request(&socket_path, &query).await;
-        match resp {
-            Response::Status { formatted } => {
+        // Retry until background population completes and we get Status
+        let mut got_status = false;
+        for _ in 0..2000 {
+            let resp = send_request(&socket_path, &query).await;
+            if let Response::Status { formatted } = resp {
                 assert!(!formatted.is_empty(), "expected non-empty cached status");
+                got_status = true;
+                break;
             }
-            other => panic!("second query should be Status, got {other:?}"),
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        assert!(got_status, "timed out waiting for Status after NotReady");
 
         let _ = send_request(&socket_path, &Request::Shutdown).await;
         daemon.await.unwrap().unwrap();
@@ -1083,7 +1104,7 @@ mod tests {
         };
 
         let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_socket(&socket_path).await;
 
         let resp = send_request(
             &socket_path,
@@ -1115,7 +1136,7 @@ mod tests {
         };
 
         let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_socket(&socket_path).await;
 
         let resp = send_request(&socket_path, &Request::Shutdown).await;
         assert_eq!(resp, Response::Ok);
@@ -1182,11 +1203,11 @@ mod tests {
             .unwrap();
 
         // Wait for daemon to start listening
-        for _ in 0..30 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..2000 {
             if socket_path.exists() {
                 return child;
             }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("daemon did not create socket at {}", socket_path.display());
     }
@@ -1257,7 +1278,6 @@ mod tests {
         daemon.await.unwrap().unwrap();
     }
 
-    #[ignore] // failing in CI but not locally
     #[tokio::test]
     async fn test_daemon_cache_update() {
         let dir = create_jj_repo().await;
@@ -1288,34 +1308,11 @@ mod tests {
             .await
             .unwrap();
 
-        flush_daemon(&socket_path).await;
-
-        // Second query - should reflect the change
-        let resp = send_request(
-            &socket_path,
-            &Request::test_query(dir.path().to_string_lossy().to_string()),
-        )
+        // Retry flush+query until the change is reflected
+        let second = query_until_match(&socket_path, &dir.path().to_string_lossy(), |s| {
+            s.contains("changed")
+        })
         .await;
-        let mut second = match resp {
-            Response::Status { formatted } => formatted,
-            other => panic!("expected Status, got {other:?}"),
-        };
-        for _ in 0..50 {
-            if second.contains("changed") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            flush_daemon(&socket_path).await;
-            let resp = send_request(
-                &socket_path,
-                &Request::test_query(dir.path().to_string_lossy().to_string()),
-            )
-            .await;
-            second = match resp {
-                Response::Status { formatted } => formatted,
-                other => panic!("expected Status, got {other:?}"),
-            };
-        }
 
         assert!(
             second.contains("changed"),
@@ -1381,7 +1378,6 @@ mod tests {
         daemon.await.unwrap().unwrap();
     }
 
-    #[ignore] // failing in ci but not locally
     #[tokio::test]
     async fn test_daemon_multi_repo_concurrent() {
         // Create two repos with different bookmarks
@@ -1411,10 +1407,6 @@ mod tests {
         };
 
         let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let req_a = Request::test_query(dir_a.path().to_string_lossy().to_string());
-        let req_b = Request::test_query(dir_b.path().to_string_lossy().to_string());
 
         // Round 1: initial queries — wait for cache to populate
         let path_a = dir_a.path().to_string_lossy().to_string();
@@ -1467,21 +1459,11 @@ mod tests {
             .await
             .unwrap();
 
-        flush_daemon(&socket_path).await;
-
-        // Round 2: concurrent queries after mutations
-        let (resp_a, resp_b) = tokio::join!(
-            send_request(&socket_path, &req_a),
-            send_request(&socket_path, &req_b),
+        // Round 2: retry until mutations are reflected
+        let (status_a, status_b) = tokio::join!(
+            query_until_match(&socket_path, &path_a, |s| s.contains("alpha-change")),
+            query_until_match(&socket_path, &path_b, |s| !s.contains("EMPTY")),
         );
-        let status_a = match resp_a {
-            Response::Status { formatted } => formatted,
-            other => panic!("expected Status for repo A round 2, got {other:?}"),
-        };
-        let status_b = match resp_b {
-            Response::Status { formatted } => formatted,
-            other => panic!("expected Status for repo B round 2, got {other:?}"),
-        };
         assert!(
             status_a.contains("alpha-change"),
             "repo A round 2: expected 'alpha-change', got: {status_a:?}"
@@ -1522,21 +1504,11 @@ mod tests {
             .await
             .unwrap();
 
-        flush_daemon(&socket_path).await;
-
-        // Round 3: verify both caches updated independently
-        let (resp_a, resp_b) = tokio::join!(
-            send_request(&socket_path, &req_a),
-            send_request(&socket_path, &req_b),
+        // Round 3: retry until both caches updated independently
+        let (status_a, status_b) = tokio::join!(
+            query_until_match(&socket_path, &path_a, |s| s.contains("feature")),
+            query_until_match(&socket_path, &path_b, |s| s.contains("beta-change")),
         );
-        let status_a = match resp_a {
-            Response::Status { formatted } => formatted,
-            other => panic!("expected Status for repo A round 3, got {other:?}"),
-        };
-        let status_b = match resp_b {
-            Response::Status { formatted } => formatted,
-            other => panic!("expected Status for repo B round 3, got {other:?}"),
-        };
         assert!(
             status_a.contains("main"),
             "repo A round 3: expected 'main', got: {status_a:?}"
@@ -1586,7 +1558,7 @@ mod tests {
         };
 
         let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_socket(&socket_path).await;
 
         let query = Request::test_query(dir.path().to_string_lossy().to_string());
 
@@ -1620,7 +1592,7 @@ mod tests {
         };
 
         let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf()));
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_socket(&socket_path).await;
 
         let query = Request::test_query(dir.path().to_string_lossy().to_string());
 
