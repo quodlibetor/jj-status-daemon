@@ -1,8 +1,8 @@
 {% if is_jj -%}
-  {{ "󱗆 " | magenta }}{{ change_id }}
+  {{ "󱗆 " | magenta }}{{ change_id_prefix | magenta | bold }}{{ change_id_rest | bright_black }}
   {%- for b in bookmarks %} {{ b.display | blue }}{% endfor %}
 {%- elif is_git -%}
-  {{ "󰊢 " | blue }}{{ branch | blue }} {{ commit_id }}
+  {{ "󰊢 " | blue }}{{ branch | blue }} {{ commit_id_prefix | blue | bold }}{{ commit_id_rest | bright_black }}
 {%- endif -%}
 {% if total_files_changed > 0 %} {{ "[" | blue }}
   {{- total_files_changed | bright_blue }} {{ "+" ~ total_lines_added | bright_green }} {{ "-" ~ total_lines_removed | bright_red }}

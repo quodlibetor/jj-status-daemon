@@ -231,6 +231,8 @@ pub const DEFAULT_CONFIG_TOML: &str = r##"# vcs-status-daemon configuration
 #
 # Shared:
 #   commit_id                      — short commit hash
+#   commit_id_prefix               — unique-prefix portion of commit_id (for coloring)
+#   commit_id_rest                 — remainder after the unique prefix
 #   description                    — commit message summary (first line)
 #   empty                          — true if the working copy has no changes
 #   conflict                       — true if there are conflicts
@@ -246,6 +248,8 @@ pub const DEFAULT_CONFIG_TOML: &str = r##"# vcs-status-daemon configuration
 #
 # jj-only:
 #   change_id                      — jj change ID (short)
+#   change_id_prefix               — unique-prefix portion of change_id (for coloring)
+#   change_id_rest                 — remainder after the unique prefix
 #   bookmarks                      — list of { name, distance, display }
 #   divergent, hidden, immutable   — booleans
 #
