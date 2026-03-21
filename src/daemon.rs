@@ -913,6 +913,49 @@ async fn refresh_task(
                                 );
                             }
                         }
+
+                        // Force a fresh refresh for all known repos.
+                        // This ensures correctness even if the file watcher
+                        // hasn't delivered events yet (e.g. on slow CI runners).
+                        {
+                            let st = state.lock().await;
+                            let mut seen = HashSet::new();
+                            let repos: Vec<(PathBuf, VcsKind)> = st
+                                .dir_to_repo
+                                .values()
+                                .filter(|(rp, _)| seen.insert(rp.clone()))
+                                .cloned()
+                                .collect();
+                            drop(st);
+                            for (repo_path, vcs_kind) in repos {
+                                if !in_flight.contains_key(&repo_path) {
+                                    in_flight.insert(
+                                        repo_path.clone(),
+                                        RepoRefreshState::InFlight,
+                                    );
+                                    tokio::spawn(refresh_repo(
+                                        repo_path,
+                                        vcs_kind,
+                                        false,
+                                        vec![],
+                                        state.clone(),
+                                        jj_worker.clone(),
+                                        git_worker.clone(),
+                                        done_tx.clone(),
+                                    ));
+                                }
+                            }
+                        }
+
+                        // Wait for the forced refreshes to complete
+                        while !in_flight.is_empty() {
+                            if let Some(done) = done_rx.recv().await {
+                                handle_refresh_done(
+                                    &done, &mut in_flight, &jj_worker, &git_worker, &state, &done_tx,
+                                );
+                            }
+                        }
+
                         let _ = tx.send(());
                     }
                     WatchEvent::Change { repo_path, vcs_kind, working_copy_changed, changed_paths } => {
@@ -962,8 +1005,10 @@ fn handle_refresh_done(
     done_tx: &mpsc::UnboundedSender<RefreshDone>,
 ) {
     match in_flight.remove(&done.repo_path) {
-        Some(RepoRefreshState::Pending(vcs_kind, wc, paths)) if wc => {
-            // Working copy changed while refreshing — re-refresh immediately
+        Some(RepoRefreshState::Pending(vcs_kind, wc, paths)) => {
+            // Changes arrived while refreshing — re-refresh immediately.
+            // This covers both working-copy changes and VCS-internal changes
+            // (e.g. jj describe, bookmark create) that modify op_heads.
             in_flight.insert(done.repo_path.clone(), RepoRefreshState::InFlight);
             tokio::spawn(refresh_repo(
                 done.repo_path.clone(),
@@ -975,11 +1020,6 @@ fn handle_refresh_done(
                 git_worker.clone(),
                 done_tx.clone(),
             ));
-        }
-        Some(RepoRefreshState::Pending(..)) => {
-            // Only VCS-internal changes arrived during refresh — skip to
-            // avoid infinite loop (our own queries create VCS events).
-            tracing::debug!(repo = %done.repo_path.display(), "skipping re-refresh for VCS-internal-only events");
         }
         _ => {
             // Done, no pending work for this repo
