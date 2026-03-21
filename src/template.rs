@@ -1,22 +1,26 @@
 use serde::Serialize;
 use tera::Tera;
 
+/// Shared detail template — included by ascii, nerdfont, and unicode templates.
+/// Expects `{% set %}` variables for icons/symbols to be defined before inclusion.
+pub const DETAIL_FORMAT: &str = include_str!("templates/detail.tera");
+
 /// Built-in "ascii" template — works in any terminal.
 ///
 /// jj: `JJ xlvlt main [3 +10-5]`
-/// git: `+- main abc1234 [3 +10-5]`
+/// git: `+- main [3 +10-5]`  (detached: `+- abc1234`)
 pub const ASCII_FORMAT: &str = include_str!("templates/ascii.tera");
 
 /// Built-in "nerdfont" template — requires a Nerd Font.
 ///
-/// jj: `󱗆 xlvlt  main [3 +10 -5]`
-/// git: ` main abc1234 [3 +10 -5]`
+/// jj: `󱗆 xlvlt main [3 +10 -5]`
+/// git: `󰊢 main abc1234 [3 +10 -5]`
 pub const NERDFONT_FORMAT: &str = include_str!("templates/nerdfont.tera");
 
 /// Built-in "unicode" template — uses Unicode symbols (no Nerd Fonts needed).
 ///
-/// jj: `※ xlvlt ≡ main [3 +10-5]`
-/// git: `± main abc1234 [3 +10-5]`
+/// jj: `⋈ xlvlt ≡ main [3 +10 -5]`
+/// git: `± main abc1234 [3 +10 -5]`
 pub const UNICODE_FORMAT: &str = include_str!("templates/unicode.tera");
 
 /// Built-in "simple" template — just branch/bookmark, color-coded by dirty state.
@@ -54,16 +58,28 @@ pub struct RepoStatus {
     pub files_changed: u32,
     pub lines_added: u32,
     pub lines_removed: u32,
+    pub files_modified: u32,
+    pub files_added: u32,
+    pub files_deleted: u32,
 
     // Staged changes (index vs HEAD for git, always 0 for jj)
     pub staged_files_changed: u32,
     pub staged_lines_added: u32,
     pub staged_lines_removed: u32,
+    pub staged_files_modified: u32,
+    pub staged_files_added: u32,
+    pub staged_files_deleted: u32,
 
     // Total changes (working tree vs HEAD for git, same as unstaged for jj)
     pub total_files_changed: u32,
     pub total_lines_added: u32,
     pub total_lines_removed: u32,
+    pub total_files_modified: u32,
+    pub total_files_added: u32,
+    pub total_files_deleted: u32,
+
+    // Git-only: files not in index or HEAD
+    pub untracked: u32,
 
     // jj-specific
     pub change_id: String,
@@ -102,12 +118,22 @@ impl Default for RepoStatus {
             files_changed: 0,
             lines_added: 0,
             lines_removed: 0,
+            files_modified: 0,
+            files_added: 0,
+            files_deleted: 0,
             staged_files_changed: 0,
             staged_lines_added: 0,
             staged_lines_removed: 0,
+            staged_files_modified: 0,
+            staged_files_added: 0,
+            staged_files_deleted: 0,
             total_files_changed: 0,
             total_lines_added: 0,
             total_lines_removed: 0,
+            total_files_modified: 0,
+            total_files_added: 0,
+            total_files_deleted: 0,
+            untracked: 0,
             change_id: String::new(),
             change_id_prefix_len: usize::MAX,
             commit_id_prefix_len: usize::MAX,
@@ -146,8 +172,21 @@ fn make_color_filter(code: &'static str, color: bool) -> impl tera::Filter + 'st
 }
 
 /// Create a Tera instance with color filters registered.
+/// Format a tera error with its full cause chain for actionable diagnostics.
+fn format_tera_error(err: &tera::Error) -> String {
+    use std::fmt::Write;
+    let mut msg = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        write!(msg, "\n  caused by: {cause}").unwrap();
+        source = std::error::Error::source(cause);
+    }
+    msg
+}
+
 fn build_tera(template: &str, color: bool) -> Result<Tera, tera::Error> {
     let mut tera = Tera::default();
+    tera.add_raw_template("detail.tera", DETAIL_FORMAT)?;
     tera.add_raw_template("tpl", template)?;
 
     // Register a filter for each color name (lowercase).
@@ -155,6 +194,8 @@ fn build_tera(template: &str, color: bool) -> Result<Tera, tera::Error> {
     let colors: &[(&str, &str)] = &[
         ("bold", "\x1b[1m"),
         ("dim", "\x1b[2m"),
+        ("italic", "\x1b[3m"),
+        ("underline", "\x1b[4m"),
         ("black", "\x1b[30m"),
         ("red", "\x1b[31m"),
         ("green", "\x1b[32m"),
@@ -196,16 +237,28 @@ pub fn format_status(status: &RepoStatus, template: &str, color: bool) -> String
     ctx.insert("files_changed", &status.files_changed);
     ctx.insert("lines_added", &status.lines_added);
     ctx.insert("lines_removed", &status.lines_removed);
+    ctx.insert("files_modified", &status.files_modified);
+    ctx.insert("files_added", &status.files_added);
+    ctx.insert("files_deleted", &status.files_deleted);
 
     // Staged changes (index vs HEAD for git, always 0 for jj)
     ctx.insert("staged_files_changed", &status.staged_files_changed);
     ctx.insert("staged_lines_added", &status.staged_lines_added);
     ctx.insert("staged_lines_removed", &status.staged_lines_removed);
+    ctx.insert("staged_files_modified", &status.staged_files_modified);
+    ctx.insert("staged_files_added", &status.staged_files_added);
+    ctx.insert("staged_files_deleted", &status.staged_files_deleted);
 
     // Total changes (working tree vs HEAD for git, same as unstaged for jj)
     ctx.insert("total_files_changed", &status.total_files_changed);
     ctx.insert("total_lines_added", &status.total_lines_added);
     ctx.insert("total_lines_removed", &status.total_lines_removed);
+    ctx.insert("total_files_modified", &status.total_files_modified);
+    ctx.insert("total_files_added", &status.total_files_added);
+    ctx.insert("total_files_deleted", &status.total_files_deleted);
+
+    // Git-only: untracked files
+    ctx.insert("untracked", &status.untracked);
 
     // jj-specific
     ctx.insert("change_id", &status.change_id);
@@ -237,9 +290,9 @@ pub fn format_status(status: &RepoStatus, template: &str, color: bool) -> String
     match build_tera(template, color) {
         Ok(tera) => match tera.render("tpl", &ctx) {
             Ok(rendered) => rendered.trim().to_string(),
-            Err(e) => format!("template error: {e}"),
+            Err(e) => format!("template error: {}", format_tera_error(&e)),
         },
-        Err(e) => format!("template error: {e}"),
+        Err(e) => format!("template error: {}", format_tera_error(&e)),
     }
 }
 
@@ -484,9 +537,9 @@ pub fn format_not_ready(template: &str, color: bool) -> String {
     match build_tera(template, color) {
         Ok(tera) => match tera.render("tpl", &ctx) {
             Ok(rendered) => rendered.trim().to_string(),
-            Err(e) => format!("template error: {e}"),
+            Err(e) => format!("template error: {}", format_tera_error(&e)),
         },
-        Err(e) => format!("template error: {e}"),
+        Err(e) => format!("template error: {}", format_tera_error(&e)),
     }
 }
 
@@ -511,13 +564,17 @@ mod tests {
             files_changed: 3,
             lines_added: 10,
             lines_removed: 5,
+            files_modified: 2,
+            files_added: 1,
             total_files_changed: 3,
             total_lines_added: 10,
             total_lines_removed: 5,
+            total_files_modified: 2,
+            total_files_added: 1,
             ..Default::default()
         };
         let formatted = format_status(&status, ASCII_FORMAT, false);
-        assert_eq!(formatted, "JJ mrtu main [3 +10-5]");
+        assert_eq!(formatted, "JJ mrtu main [f~2+1 l+10-5]");
     }
 
     #[test]
@@ -542,10 +599,13 @@ mod tests {
             total_files_changed: 3,
             total_lines_added: 10,
             total_lines_removed: 5,
+            total_files_modified: 1,
+            total_files_added: 1,
+            total_files_deleted: 1,
             ..Default::default()
         };
         let formatted = format_status(&status, ASCII_FORMAT, false);
-        assert_eq!(formatted, "+- main abc1234 [3 +10-5]");
+        assert_eq!(formatted, "+- main [f~1+1-1 l+10-5]");
     }
 
     #[test]
@@ -558,7 +618,7 @@ mod tests {
             ..Default::default()
         };
         let formatted = format_status(&status, ASCII_FORMAT, false);
-        assert_eq!(formatted, "+- main abc1234 (EMPTY)");
+        assert_eq!(formatted, "+- main (EMPTY)");
     }
 
     #[test]
@@ -583,17 +643,21 @@ mod tests {
     fn test_format_toml_multiline_matches_default() {
         let toml_str = r#"
 format = '''
-{% if is_jj %}{{ "JJ" | magenta }} {{ change_id_prefix | magenta | bold }}{{ change_id_rest | bright_black }}
-{%- for b in bookmarks %} {{ b.display | blue }}{% endfor %}
-{%- elif is_git %}{{ "+" | green }}{{ "-" | red }} {{ branch | blue }} {{ commit_id_prefix | blue | bold }}{{ commit_id_rest | bright_black }}
-{%- endif %}
-{%- if total_files_changed > 0 %} {{ "[" | blue }}{{ total_files_changed | bright_blue }} {{ "+" | bright_green }}{{ total_lines_added | bright_green }}{{ "-" | bright_red }}{{ total_lines_removed | bright_red }}{{ "]" | blue }}{% endif %}
-{%- if conflict %} {{ "CONFLICT" | bright_red }}{% endif %}
-{%- if divergent %} {{ "DIVERGENT" | bright_red }}{% endif %}
-{%- if hidden %} {{ "HIDDEN" | bright_yellow }}{% endif %}
-{%- if immutable %} {{ "IMMUTABLE" | yellow }}{% endif %}
-{%- if empty %} {{ "(" | blue }}EMPTY{{ ")" | blue }}{% endif %}
-{%- if not is_default_workspace %} {{ "/" | bright_green }}{{ workspace_name }}{{ "\\" | bright_green }}{% endif %}'''
+{% set jj_icon = "JJ" -%}
+{% set git_icon = "+-" -%}
+{% set bookmark_prefix = "" -%}
+{% set rebasing_icon = "REBASING" -%}
+{% set conflict_icon = "CONFLICT" -%}
+{% set divergent_icon = "DIVERGENT" -%}
+{% set hidden_icon = "HIDDEN" -%}
+{% set immutable_icon = "IMMUTABLE" -%}
+{% set empty_icon = "(EMPTY)" -%}
+{% set stale_icon = "STALE" -%}
+{% set files_icon = "f" -%}
+{% set lines_icon = "l" -%}
+{% set workspace_open = "/" -%}
+{% set workspace_close = "\" -%}
+{% include "detail.tera" %}'''
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
 
@@ -615,6 +679,8 @@ format = '''
                 total_files_changed: 3,
                 total_lines_added: 10,
                 total_lines_removed: 5,
+                total_files_modified: 2,
+                total_files_added: 1,
                 ..Default::default()
             },
             RepoStatus {
@@ -635,6 +701,7 @@ format = '''
                 total_files_changed: 1,
                 total_lines_added: 7,
                 total_lines_removed: 0,
+                total_files_modified: 1,
                 ..Default::default()
             },
             RepoStatus {
@@ -651,6 +718,9 @@ format = '''
                 total_files_changed: 3,
                 total_lines_added: 10,
                 total_lines_removed: 5,
+                total_files_modified: 1,
+                total_files_added: 1,
+                total_files_deleted: 1,
                 ..Default::default()
             },
             RepoStatus {
@@ -730,8 +800,8 @@ format = '''
         assert!(formatted.contains(""), "expected git icon: {formatted:?}");
         assert!(formatted.contains("main"), "expected branch: {formatted:?}");
         assert!(
-            formatted.contains("abc1234"),
-            "expected commit_id: {formatted:?}",
+            !formatted.contains("abc1234"),
+            "commit_id should not appear when on a branch: {formatted:?}",
         );
     }
 
@@ -1195,6 +1265,21 @@ format = '''
         assert!(
             formatted.contains("\x1b[91mCONFLICT\x1b[0m"),
             "expected bright_red CONFLICT: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_template_error_includes_cause() {
+        let status = RepoStatus::default();
+        let broken = "{{ foo";
+        let formatted = format_status(&status, broken, false);
+        assert!(
+            formatted.starts_with("template error:"),
+            "expected template error prefix: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("caused by:"),
+            "expected cause chain in error: {formatted:?}"
         );
     }
 }

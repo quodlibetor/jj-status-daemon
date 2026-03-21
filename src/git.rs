@@ -6,18 +6,42 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::jj::{FileDiffStats, abs_to_repo_relative, aggregate_overlay_stats};
+use crate::jj::{
+    DiffCounts, FileChangeKind, FileDiffStats, abs_to_repo_relative, aggregate_overlay_stats,
+};
 use crate::template::RepoStatus;
 
 const GIT2_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn diff_stats(diff: &git2::Diff<'_>) -> Result<(u32, u32, u32)> {
+fn diff_stats(diff: &git2::Diff<'_>) -> Result<DiffCounts> {
     let stats = diff.stats()?;
-    Ok((
-        stats.files_changed() as u32,
-        stats.insertions() as u32,
-        stats.deletions() as u32,
-    ))
+    let mut counts = DiffCounts {
+        files_changed: stats.files_changed() as u32,
+        lines_added: stats.insertions() as u32,
+        lines_removed: stats.deletions() as u32,
+        ..Default::default()
+    };
+    // Count per-delta status categories
+    for i in 0..diff.deltas().len() {
+        if let Some(delta) = diff.get_delta(i) {
+            match delta.status() {
+                git2::Delta::Added => counts.files_added += 1,
+                git2::Delta::Deleted => counts.files_deleted += 1,
+                git2::Delta::Untracked => counts.files_untracked += 1,
+                _ => counts.files_modified += 1,
+            }
+        }
+    }
+    Ok(counts)
+}
+
+fn delta_to_kind(status: git2::Delta) -> FileChangeKind {
+    match status {
+        git2::Delta::Added => FileChangeKind::Added,
+        git2::Delta::Deleted => FileChangeKind::Deleted,
+        git2::Delta::Untracked => FileChangeKind::Untracked,
+        _ => FileChangeKind::Modified,
+    }
 }
 
 /// Extract per-file line-level diff stats from a git2 Diff.
@@ -31,7 +55,10 @@ fn per_file_stats_from_diff(diff: &git2::Diff<'_>) -> Result<HashMap<String, Fil
             .or_else(|| delta.old_file().path())
             .map(|p| p.to_string_lossy().to_string());
         if let Some(path) = path {
-            let stats = result.entry(path).or_default();
+            let stats = result.entry(path).or_insert_with(|| FileDiffStats {
+                kind: delta_to_kind(delta.status()),
+                ..Default::default()
+            });
             match line.origin() {
                 '+' => stats.lines_added += 1,
                 '-' => stats.lines_removed += 1,
@@ -50,7 +77,10 @@ fn per_file_stats_from_diff(diff: &git2::Diff<'_>) -> Result<HashMap<String, Fil
                 .or_else(|| delta.old_file().path())
                 .map(|p| p.to_string_lossy().to_string());
             if let Some(path) = path {
-                result.entry(path).or_default();
+                result.entry(path).or_insert_with(|| FileDiffStats {
+                    kind: delta_to_kind(delta.status()),
+                    ..Default::default()
+                });
             }
         }
     }
@@ -58,19 +88,10 @@ fn per_file_stats_from_diff(diff: &git2::Diff<'_>) -> Result<HashMap<String, Fil
     Ok(result)
 }
 
-/// Aggregate per-file stats into (files_changed, lines_added, lines_removed).
-fn aggregate_file_stats(per_file: &HashMap<String, FileDiffStats>) -> (u32, u32, u32) {
-    let mut files = 0u32;
-    let mut added = 0u32;
-    let mut removed = 0u32;
-    for stats in per_file.values() {
-        if stats.lines_added > 0 || stats.lines_removed > 0 {
-            files += 1;
-            added += stats.lines_added;
-            removed += stats.lines_removed;
-        }
-    }
-    (files, added, removed)
+/// Aggregate per-file stats into DiffCounts.
+fn aggregate_file_stats(per_file: &HashMap<String, FileDiffStats>) -> DiffCounts {
+    let empty = HashMap::new();
+    aggregate_overlay_stats(per_file, &empty)
 }
 
 /// Retained git state for incremental working copy diffs.
@@ -92,16 +113,22 @@ pub struct GitRepoState {
 impl GitRepoState {
     /// Build a RepoStatus with current aggregate diff stats from base + overlay.
     fn current_status(&self) -> RepoStatus {
-        let (us_f, us_a, us_r) =
-            aggregate_overlay_stats(&self.base_unstaged, &self.unstaged_overlay);
-        let (tot_f, tot_a, tot_r) = aggregate_overlay_stats(&self.base_total, &self.total_overlay);
+        let us = aggregate_overlay_stats(&self.base_unstaged, &self.unstaged_overlay);
+        let tot = aggregate_overlay_stats(&self.base_total, &self.total_overlay);
         RepoStatus {
-            files_changed: us_f,
-            lines_added: us_a,
-            lines_removed: us_r,
-            total_files_changed: tot_f,
-            total_lines_added: tot_a,
-            total_lines_removed: tot_r,
+            files_changed: us.files_changed,
+            lines_added: us.lines_added,
+            lines_removed: us.lines_removed,
+            files_modified: us.files_modified,
+            files_added: us.files_added,
+            files_deleted: us.files_deleted,
+            total_files_changed: tot.files_changed,
+            total_lines_added: tot.lines_added,
+            total_lines_removed: tot.lines_removed,
+            total_files_modified: tot.files_modified,
+            total_files_added: tot.files_added,
+            total_files_deleted: tot.files_deleted,
+            untracked: tot.files_untracked,
             // Staged stats are unchanged by working copy edits
             ..self.base_status.clone()
         }
@@ -134,6 +161,7 @@ impl GitRepoState {
         // Batch unstaged diff: index → workdir with pathspec filter
         {
             let mut opts = git2::DiffOptions::new();
+            opts.include_untracked(true);
             for path in &rel_paths {
                 opts.pathspec(path);
             }
@@ -154,6 +182,7 @@ impl GitRepoState {
         // Batch total diff: HEAD tree → workdir+index with pathspec filter
         {
             let mut opts = git2::DiffOptions::new();
+            opts.include_untracked(true);
             for path in &rel_paths {
                 opts.pathspec(path);
             }
@@ -213,8 +242,12 @@ fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus,
         // head() is Ok — we checked above
         let head = repo.head().unwrap();
 
-        // Branch name (or short OID if detached)
-        status.branch = head.shorthand().unwrap_or("").to_string();
+        // Branch name (empty when HEAD is detached)
+        status.branch = if head.is_branch() {
+            head.shorthand().unwrap_or("").to_string()
+        } else {
+            String::new()
+        };
 
         // Commit ID (short), description, and tree for diff stats
         let head_tree_oid = if let Ok(commit) = head.peel_to_commit() {
@@ -251,12 +284,16 @@ fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus,
         let base_unstaged = {
             let _span = tracing::debug_span!("diff_unstaged").entered();
             let mut diff_opts = git2::DiffOptions::new();
+            diff_opts.include_untracked(true);
             if let Ok(diff) = repo.diff_index_to_workdir(None, Some(&mut diff_opts)) {
                 let per_file = per_file_stats_from_diff(&diff).unwrap_or_default();
-                let (f, a, r) = aggregate_file_stats(&per_file);
-                status.files_changed = f;
-                status.lines_added = a;
-                status.lines_removed = r;
+                let c = aggregate_file_stats(&per_file);
+                status.files_changed = c.files_changed;
+                status.lines_added = c.lines_added;
+                status.lines_removed = c.lines_removed;
+                status.files_modified = c.files_modified;
+                status.files_added = c.files_added;
+                status.files_deleted = c.files_deleted;
                 per_file
             } else {
                 HashMap::new()
@@ -267,23 +304,34 @@ fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus,
         {
             let _span = tracing::debug_span!("diff_staged").entered();
             if let Ok(diff) = repo.diff_tree_to_index(head_tree.as_ref(), None, None)
-                && let Ok((f, a, r)) = diff_stats(&diff)
+                && let Ok(c) = diff_stats(&diff)
             {
-                status.staged_files_changed = f;
-                status.staged_lines_added = a;
-                status.staged_lines_removed = r;
+                status.staged_files_changed = c.files_changed;
+                status.staged_lines_added = c.lines_added;
+                status.staged_lines_removed = c.lines_removed;
+                status.staged_files_modified = c.files_modified;
+                status.staged_files_added = c.files_added;
+                status.staged_files_deleted = c.files_deleted;
             }
         }
 
         // Total: tree → workdir (with per-file stats)
         let base_total = {
             let _span = tracing::debug_span!("diff_total").entered();
-            if let Ok(diff) = repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), None) {
+            let mut total_opts = git2::DiffOptions::new();
+            total_opts.include_untracked(true);
+            if let Ok(diff) =
+                repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut total_opts))
+            {
                 let per_file = per_file_stats_from_diff(&diff).unwrap_or_default();
-                let (f, a, r) = aggregate_file_stats(&per_file);
-                status.total_files_changed = f;
-                status.total_lines_added = a;
-                status.total_lines_removed = r;
+                let c = aggregate_file_stats(&per_file);
+                status.total_files_changed = c.files_changed;
+                status.total_lines_added = c.lines_added;
+                status.total_lines_removed = c.lines_removed;
+                status.total_files_modified = c.files_modified;
+                status.total_files_added = c.files_added;
+                status.total_files_deleted = c.files_deleted;
+                status.untracked = c.files_untracked;
                 per_file
             } else {
                 HashMap::new()
@@ -531,6 +579,23 @@ mod tests {
         // Total: same as unstaged since nothing is staged
         assert_eq!(status.total_files_changed, status.files_changed);
         assert_eq!(status.total_lines_added, status.lines_added);
+    }
+
+    #[tokio::test]
+    async fn test_git_untracked_files() {
+        let dir = create_git_repo().await;
+        // Create an untracked file (not added to index)
+        std::fs::write(dir.path().join("new_file.txt"), "hello\n").unwrap();
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+        let status = query_git_status(dir.path(), &config).await.unwrap();
+        assert_eq!(status.untracked, 1, "expected 1 untracked file");
+        // Untracked files should not count as files_changed or affect line stats
+        assert_eq!(status.total_files_changed, 0);
+        assert_eq!(status.total_lines_added, 0);
+        assert_eq!(status.total_lines_removed, 0);
     }
 
     #[tokio::test]
@@ -1036,9 +1101,12 @@ mod tests {
         assert_eq!(b.lines_removed, 0, "b.txt should have 0 removals");
 
         // Aggregate should match diff_stats
-        let (f, a_total, r_total) = aggregate_file_stats(&per_file);
-        let (sf, sa, sr) = diff_stats(&diff).unwrap();
-        assert_eq!((f, a_total, r_total), (sf, sa, sr));
+        let agg = aggregate_file_stats(&per_file);
+        let ds = diff_stats(&diff).unwrap();
+        assert_eq!(
+            (agg.files_changed, agg.lines_added, agg.lines_removed),
+            (ds.files_changed, ds.lines_added, ds.lines_removed)
+        );
     }
 
     // --- GitRepoState incremental update tests ---

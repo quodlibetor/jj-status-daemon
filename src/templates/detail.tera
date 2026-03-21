@@ -1,0 +1,33 @@
+{# Used via include, see e.g. nerdfont.tera #}
+{% if is_jj -%}
+  {{ jj_icon | magenta }} {{ change_id_prefix | magenta | bold }}{{ change_id_rest | bright_black | bold }}
+  {%- for b in bookmarks %} {{ bookmark_prefix ~ b.display | blue }}{% endfor %}
+{%- elif is_git -%}
+  {{ git_icon | blue }} {% if has_branch %}{{ branch | blue }}{% else %}{{ "HEAD " | magenta }}{{ "(" ~ commit_id ~ ")" | green | bold }}{% endif %}
+{%- endif -%}
+{% if total_files_changed > 0 or untracked > 0 %}
+  {{- " [" | blue }}
+  {%- if total_lines_added > 0 or total_lines_removed > 0 %}
+    {{- files_icon | bright_blue }}
+  {%- endif %}
+  {%- if total_files_modified > 0 %}{{ "~" ~ total_files_modified | bright_yellow }}{% endif -%}
+  {%- if total_files_added > 0 %}{{ "+" ~ total_files_added | bright_green }}{% endif -%}
+  {%- if total_files_deleted > 0 %}{{ "-" ~ total_files_deleted | bright_red }}{% endif -%}
+  {%- if untracked > 0 %}{{ "?" ~ untracked | bright_cyan }}{% endif -%}
+  {%- if total_lines_added > 0 or total_lines_removed > 0 %}
+    {{- " " }}{{ lines_icon | bright_blue }}
+    {%- if total_lines_added > 0 %}{{ "+" ~ total_lines_added | bright_green }}{% endif -%}
+    {%- if total_lines_removed > 0 %}{{ "-" ~ total_lines_removed | bright_red }}{% endif -%}
+  {%- endif %}
+  {{- "]" | blue }}
+{%- endif -%}
+{% if rebasing %} {{ rebasing_icon | bright_magenta }}{% endif -%}
+{% if conflict %} {{ conflict_icon | bright_red }}{% endif -%}
+{% if divergent %} {{ divergent_icon | bright_red }}{% endif -%}
+{% if hidden %} {{ hidden_icon | bright_yellow }}{% endif -%}
+{% if immutable %} {{ immutable_icon | yellow }}{% endif -%}
+{% if empty %} {{ empty_icon | dim }}{% endif -%}
+{% if is_stale %} {{ stale_icon | bright_yellow }}{% endif -%}
+{% if not is_default_workspace %}
+  {{- " " ~ workspace_open | bright_green }}{{ workspace_name }}{{ workspace_close | bright_green }}
+{%- endif %}

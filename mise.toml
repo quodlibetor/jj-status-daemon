@@ -2,6 +2,7 @@
 "cargo:cargo-nextest" = "latest"
 cargo-dist = "latest"
 hyperfine = "latest"
+"cargo:bacon" = "latest"
 
 [tasks.test]
 description = "Run tests with cargo nextest"

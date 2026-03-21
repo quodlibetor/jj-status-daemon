@@ -298,8 +298,8 @@ pub fn load_config_from(config_file: Option<&Path>) -> Result<Config> {
             Ok(config)
         }
         Err(e) => {
-            tracing::error!(path = %path.display(), error = %e, "failed to parse config, using defaults");
-            Ok(Config::default())
+            tracing::error!(path = %path.display(), error = %e, "failed to parse config");
+            Err(e.into())
         }
     }
 }
@@ -315,7 +315,7 @@ mod tests {
         assert_eq!(config.bookmark_search_depth, 10);
         assert_eq!(config.template_name, "ascii");
         assert!(config.format.is_none());
-        assert!(config.resolved_format().contains("change_id"));
+        assert!(config.resolved_format().contains("detail.tera"));
     }
 
     #[test]
@@ -369,7 +369,7 @@ template_name = "nonexistent"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         // Should fall back to ascii
-        assert!(config.resolved_format().contains("change_id"));
+        assert!(config.resolved_format().contains("detail.tera"));
     }
 
     #[test]
@@ -387,7 +387,7 @@ bookmark_search_depth = 5
 
     #[test]
     fn test_load_config_missing_file() {
-        let config = load_config().unwrap();
+        let config = load_config_from(Some(Path::new("/tmp/nonexistent-vsd-config.toml"))).unwrap();
         assert_eq!(config.idle_timeout_secs, 3600);
     }
 
