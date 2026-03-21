@@ -67,6 +67,11 @@ pub struct RepoStatus {
 
     // jj-specific
     pub change_id: String,
+    /// Number of reverse-hex chars that form the shortest unique prefix
+    /// (for colorized display). Defaults to the full length of `change_id`.
+    pub change_id_prefix_len: usize,
+    /// Number of hex chars that form the shortest unique prefix for commit_id.
+    pub commit_id_prefix_len: usize,
     pub bookmarks: Vec<Bookmark>,
     pub divergent: bool,
     pub hidden: bool,
@@ -104,6 +109,8 @@ impl Default for RepoStatus {
             total_lines_added: 0,
             total_lines_removed: 0,
             change_id: String::new(),
+            change_id_prefix_len: usize::MAX,
+            commit_id_prefix_len: usize::MAX,
             bookmarks: Vec::new(),
             divergent: false,
             hidden: false,
@@ -202,6 +209,12 @@ pub fn format_status(status: &RepoStatus, template: &str, color: bool) -> String
 
     // jj-specific
     ctx.insert("change_id", &status.change_id);
+    let change_pfx = status.change_id_prefix_len.min(status.change_id.len());
+    ctx.insert("change_id_prefix", &status.change_id[..change_pfx]);
+    ctx.insert("change_id_rest", &status.change_id[change_pfx..]);
+    let commit_pfx = status.commit_id_prefix_len.min(status.commit_id.len());
+    ctx.insert("commit_id_prefix", &status.commit_id[..commit_pfx]);
+    ctx.insert("commit_id_rest", &status.commit_id[commit_pfx..]);
     ctx.insert("bookmarks", &status.bookmarks);
     ctx.insert("has_bookmarks", &!status.bookmarks.is_empty());
     ctx.insert("divergent", &status.divergent);
@@ -253,6 +266,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
             RepoStatus {
                 is_jj: true,
                 change_id: "xlvltmpk".into(),
+                change_id_prefix_len: 2,
                 commit_id: "abc12345".into(),
                 description: "refactor auth".into(),
                 empty: true,
@@ -269,6 +283,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
             RepoStatus {
                 is_jj: true,
                 change_id: "mrtunzqw".into(),
+                change_id_prefix_len: 2,
                 commit_id: "def23456".into(),
                 description: "add tests".into(),
                 bookmarks: vec![Bookmark {
@@ -290,6 +305,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
             RepoStatus {
                 is_jj: true,
                 change_id: "qstvwxyz".into(),
+                change_id_prefix_len: 2,
                 commit_id: "mno45678".into(),
                 bookmarks: vec![Bookmark {
                     name: "main".into(),
@@ -310,6 +326,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
             RepoStatus {
                 is_jj: true,
                 change_id: "npqrsvyx".into(),
+                change_id_prefix_len: 2,
                 commit_id: "ghi34567".into(),
                 conflict: true,
                 empty: true,
@@ -326,6 +343,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
             RepoStatus {
                 is_jj: true,
                 change_id: "wkqolyzp".into(),
+                change_id_prefix_len: 2,
                 commit_id: "jkl45678".into(),
                 divergent: true,
                 empty: true,
@@ -342,6 +360,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
             RepoStatus {
                 is_jj: true,
                 change_id: "bfglmprs".into(),
+                change_id_prefix_len: 2,
                 commit_id: "pqr56789".into(),
                 empty: true,
                 bookmarks: vec![Bookmark {
@@ -425,6 +444,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
             RepoStatus {
                 is_jj: true,
                 change_id: "xlvltmpk".into(),
+                change_id_prefix_len: 2,
                 commit_id: "abc12345".into(),
                 bookmarks: vec![Bookmark {
                     name: "main".into(),
@@ -563,9 +583,9 @@ mod tests {
     fn test_format_toml_multiline_matches_default() {
         let toml_str = r#"
 format = '''
-{% if is_jj %}{{ "JJ" | magenta }} {{ change_id }}
+{% if is_jj %}{{ "JJ" | magenta }} {{ change_id_prefix | magenta | bold }}{{ change_id_rest | bright_black }}
 {%- for b in bookmarks %} {{ b.display | blue }}{% endfor %}
-{%- elif is_git %}{{ "+" | green }}{{ "-" | red }} {{ branch | blue }} {{ commit_id }}
+{%- elif is_git %}{{ "+" | green }}{{ "-" | red }} {{ branch | blue }} {{ commit_id_prefix | blue | bold }}{{ commit_id_rest | bright_black }}
 {%- endif %}
 {%- if total_files_changed > 0 %} {{ "[" | blue }}{{ total_files_changed | bright_blue }} {{ "+" | bright_green }}{{ total_lines_added | bright_green }}{{ "-" | bright_red }}{{ total_lines_removed | bright_red }}{{ "]" | blue }}{% endif %}
 {%- if conflict %} {{ "CONFLICT" | bright_red }}{% endif %}

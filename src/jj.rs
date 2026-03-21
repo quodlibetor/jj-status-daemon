@@ -571,11 +571,19 @@ async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<(RepoStatus, JjRep
     let change_id_full = encode_reverse_hex(commit.change_id().as_bytes());
     let id_len = 8.min(change_id_full.len());
     status.change_id = change_id_full[..id_len].to_string();
+    // Shortest unique prefix length for colorized display
+    status.change_id_prefix_len = repo
+        .shortest_unique_change_id_prefix_len(commit.change_id())
+        .unwrap_or(id_len);
 
     // Commit ID (hex, truncated to 8 chars)
     let commit_id_hex = commit.id().hex();
     let id_len = 8.min(commit_id_hex.len());
     status.commit_id = commit_id_hex[..id_len].to_string();
+    status.commit_id_prefix_len = repo
+        .index()
+        .shortest_unique_commit_id_prefix_len(commit.id())
+        .unwrap_or(id_len);
 
     // Description (first line only)
     status.description = commit
