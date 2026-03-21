@@ -204,7 +204,7 @@ bookmark_search_depth = 10
 # Enable ANSI color output (default: true)
 color = true
 
-# Built-in template to use: "ascii" (default), "nerdfont", "unicode", or "simple"
+# Built-in template to use: "ascii" (default), "nerdfont", "unicode", "simple", or "minimal"
 template_name = "ascii"
 
 # Explicit format template (Tera syntax, overrides template_name if set)
@@ -334,7 +334,7 @@ You can apply filters to variables (`{{ branch | green }}`), string literals (`{
 
 ### Built-in templates
 
-Four templates are included. Select one with `template_name` in your config:
+Five templates are included. Select one with `template_name` in your config:
 
 ```toml
 template_name = "nerdfont"
@@ -364,7 +364,11 @@ Uses standard Unicode symbols (no Nerd Fonts needed). Example output:
 
 #### `simple`
 
-Just the branch or bookmark name, color-coded by state. Green = clean, yellow = changes, red = unstaged (git) magenta = untracked (git). For jj, shows the bookmark name, description, or change ID depending on context.
+Branch/bookmark name with compact diff-type indicators. Shows `[~+-?]` when there are changes: `~` modified, `+` added, `-` deleted, `?` untracked. For jj, shows the bookmark name, description, or change ID depending on context, with immutable commits highlighted in red.
+
+#### `minimal`
+
+Just the branch or bookmark name, color-coded by state. Green = clean, yellow = changes, red = unstaged (git), magenta = untracked (git). For jj, shows the bookmark name, description, or change ID depending on context.
 
 ### User-defined templates
 
