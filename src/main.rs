@@ -330,6 +330,11 @@ pub(crate) fn run_config(action: ConfigAction, config_file: Option<&Path>) -> an
             }
             std::fs::write(&path, doc.to_string())?;
             eprintln!("Set {key} = {value} in {}", path.display());
+
+            // Tell the daemon to reload config so the next prompt picks up the change immediately
+            if let Err(e) = client::reload_config() {
+                tracing::debug!("config reload failed (daemon may not be running): {e}");
+            }
         }
         ConfigAction::Get { key } => {
             let cfg = config::load_config_from(config_file)?;

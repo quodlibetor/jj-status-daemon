@@ -36,6 +36,8 @@ struct DaemonState {
     /// Sticky config/template error appended to every formatted status.
     /// Cleared on successful config reload.
     config_error: Option<String>,
+    /// Path to the config file, for explicit reload requests.
+    config_file: Option<PathBuf>,
 }
 
 impl DaemonState {
@@ -195,6 +197,7 @@ pub async fn run_daemon(
         refreshing: HashSet::new(),
         cache_watch: HashMap::new(),
         config_error: startup_config_error,
+        config_file: config_file.clone(),
     }));
 
     // Spawn refresh task
@@ -554,6 +557,13 @@ async fn handle_connection(
             let _ = rx.await;
             send_response(&mut writer, Response::Ok).await
         }
+        Request::ReloadConfig => {
+            let config_file = state.lock().await.config_file.clone();
+            if let Some(cf) = config_file {
+                reload_config(&cf, &state).await;
+            }
+            send_response(&mut writer, Response::Ok).await
+        }
         Request::Shutdown => {
             send_response(&mut writer, Response::Ok).await?;
             shutdown.notify_one();
@@ -811,6 +821,48 @@ async fn git_full_refresh(
         .map_err(|_| anyhow::anyhow!("git worker channel closed"))?
 }
 
+/// Reload config from disk, validate the template, swap the config in DaemonState,
+/// and re-render all cached statuses.
+async fn reload_config(config_path: &Path, state: &Arc<Mutex<DaemonState>>) {
+    let (new_config, config_err) = match crate::config::load_config_from(Some(config_path)) {
+        Ok(c) => {
+            let resolved = c.resolved_format();
+            let err = crate::template::validate_template(&resolved).err();
+            if let Some(ref e) = err {
+                tracing::warn!(error = %e, "new config has invalid template");
+            }
+            (Some(c), err)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load updated config, keeping current config");
+            (None, Some(format!("config error: {e}")))
+        }
+    };
+
+    let mut st = state.lock().await;
+    if let Some(new_config) = new_config {
+        tracing::info!(
+            template_name = %new_config.template_name,
+            has_format_override = new_config.format.is_some(),
+            has_config_error = config_err.is_some(),
+            "config reloaded"
+        );
+        st.config = new_config;
+    }
+    st.config_error = config_err;
+
+    let cache_dir = st.cache_dir.clone();
+
+    let repos: Vec<PathBuf> = st.cache.keys().cloned().collect();
+    for repo_path in repos {
+        if let Some((status, _)) = st.cache.get(&repo_path).cloned() {
+            let formatted = st.format(&status);
+            write_cache_file(&cache_dir, &repo_path, &formatted);
+            st.update_cache(&repo_path, status, formatted);
+        }
+    }
+}
+
 /// Watch the config file for changes and hot-reload on valid updates.
 ///
 /// On each detected change, re-reads the file, parses it, validates the template,
@@ -869,46 +921,7 @@ async fn watch_config_file(config_path: PathBuf, state: Arc<Mutex<DaemonState>>)
         // Small delay to coalesce rapid writes (editor save patterns)
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let (new_config, config_err) = match crate::config::load_config_from(Some(&config_path)) {
-            Ok(c) => {
-                // Config parsed — validate the template
-                let resolved = c.resolved_format();
-                let err = crate::template::validate_template(&resolved).err();
-                if let Some(ref e) = err {
-                    tracing::warn!(error = %e, "new config has invalid template");
-                }
-                (Some(c), err)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to load updated config, keeping current config");
-                (None, Some(format!("config error: {e}")))
-            }
-        };
-
-        // Update state: swap config if valid, always update the error
-        let mut st = state.lock().await;
-        if let Some(new_config) = new_config {
-            tracing::info!(
-                template_name = %new_config.template_name,
-                has_format_override = new_config.format.is_some(),
-                has_config_error = config_err.is_some(),
-                "config reloaded"
-            );
-            st.config = new_config;
-        }
-        st.config_error = config_err;
-
-        let cache_dir = st.cache_dir.clone();
-
-        // Re-render all cached statuses with the new config
-        let repos: Vec<PathBuf> = st.cache.keys().cloned().collect();
-        for repo_path in repos {
-            if let Some((status, _)) = st.cache.get(&repo_path).cloned() {
-                let formatted = st.format(&status);
-                write_cache_file(&cache_dir, &repo_path, &formatted);
-                st.update_cache(&repo_path, status, formatted);
-            }
-        }
+        reload_config(&config_path, &state).await;
     }
 }
 

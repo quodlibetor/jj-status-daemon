@@ -188,6 +188,15 @@ pub fn daemon_version() -> Result<(String, String, Vec<String>)> {
     }
 }
 
+pub fn reload_config() -> Result<()> {
+    let socket_path = config::socket_path()?;
+    if !socket_path.exists() {
+        return Ok(());
+    }
+    let _ = send_request_slow(&socket_path, &Request::ReloadConfig);
+    Ok(())
+}
+
 pub fn shutdown() -> Result<()> {
     let socket_path = config::socket_path()?;
     let response =

@@ -14,6 +14,7 @@ pub enum Request {
         timeout_override_ms: u64,
     },
     Flush,
+    ReloadConfig,
     Shutdown,
     DaemonStatus,
     Version,
