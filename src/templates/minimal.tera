@@ -1,20 +1,12 @@
 {% if is_jj -%}
   {% if bookmarks and bookmarks[0].distance == 0 -%}
-    {% if immutable %}
-      {{ bookmarks[0].name | red | bold }}
-    {% else %}
-      {{ bookmarks[0].name | green }}
-    {% endif %}
+    {{ bookmarks[0].name | green }}
   {%- elif description -%}
-    {% if immutable %}
-      {{ description | red | bold }}
-    {% else %}
-      {{ description | green }}
-    {% endif %}
+    {{ description | green }}
   {%- elif bookmarks and bookmarks[0].distance == 1 -%}
     {% if empty %}{{ bookmarks[0].name | green }}{% else %}{{ bookmarks[0].name | yellow }}{% endif %}
   {%- else -%}
-    {{- change_id_prefix | bright_magenta | bold }}
+    {% if empty %}{{ change_id_prefix | green | bold }}{% else %}{{ change_id_prefix | yellow | bold }}{% endif %}
     {{- change_id_rest | bright_black | bold }}
   {%- endif -%}
 {%- elif is_git -%}
@@ -23,15 +15,15 @@
   {%- else %}
     {%- set ref = "HEAD (" ~ commit_id ~ ")" %}
   {%- endif %}
-  {{- ref | bright_blue }}
-{%- endif -%}
-{% if total_files_changed > 0 or untracked > 0 %}
-  {{- " [" | bright_black }}
-    {%- if total_files_modified > 0 %}{{ "~" | bright_yellow }}{% endif -%}
-    {%- if total_files_added > 0 %}{{ "+" | bright_green }}{% endif -%}
-    {%- if total_files_deleted > 0 %}{{ "-" | bright_red }}{% endif -%}
-    {%- if untracked > 0 %}{{ "?" | bright_magenta }}{% endif -%}
-  {{- "]" | bright_black }}
+  {%- if files_changed > 0 -%}
+    {{- ref | red }}
+  {%- elif staged_files_changed > 0 -%}
+    {{- ref | yellow }}
+  {%- elif untracked > 0 -%}
+    {{- ref | magenta }}
+  {%- else -%}
+    {{- ref | green }}
+  {%- endif -%}
 {%- endif -%}
 {% if not is_default_workspace %} {{ "木" | bright_green }}{% endif -%}
 {% if rebasing %} {{ "REBASING" | bright_magenta }}{% endif -%}

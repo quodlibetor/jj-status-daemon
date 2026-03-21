@@ -23,11 +23,16 @@ pub const NERDFONT_FORMAT: &str = include_str!("templates/nerdfont.tera");
 /// git: `± main abc1234 [3 +10 -5]`
 pub const UNICODE_FORMAT: &str = include_str!("templates/unicode.tera");
 
-/// Built-in "simple" template — just branch/bookmark, color-coded by dirty state.
+/// Built-in "simple" template — branch/bookmark with compact diff indicators.
+///
+/// jj: `main [~+-?]` or `xlvlt [~+-?]`  git: `main [~+-?]`
+pub const SIMPLE_FORMAT: &str = include_str!("templates/simple.tera");
+
+/// Built-in "minimal" template — just branch/bookmark, color-coded by dirty state.
 ///
 /// Clean: green branch name. Dirty: yellow branch name.
 /// jj: `main` or `xlvlt`  git: `main`
-pub const SIMPLE_FORMAT: &str = include_str!("templates/simple.tera");
+pub const MINIMAL_FORMAT: &str = include_str!("templates/minimal.tera");
 
 /// Built-in "not ready" template for when the daemon hasn't cached status yet.
 /// Only color variables are available — no repo status values.
@@ -309,7 +314,7 @@ pub fn validate_template(template: &str) -> Result<(), String> {
 }
 
 /// All built-in template names, in display order.
-pub const BUILTIN_NAMES: &[&str] = &["ascii", "nerdfont", "unicode", "simple"];
+pub const BUILTIN_NAMES: &[&str] = &["ascii", "nerdfont", "unicode", "simple", "minimal"];
 
 /// Representative sample statuses for template previews.
 pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
@@ -519,6 +524,7 @@ pub fn builtin_template(name: &str) -> Option<&'static str> {
         "nerdfont" => Some(NERDFONT_FORMAT),
         "unicode" => Some(UNICODE_FORMAT),
         "simple" => Some(SIMPLE_FORMAT),
+        "minimal" => Some(MINIMAL_FORMAT),
         _ => None,
     }
 }
@@ -900,11 +906,9 @@ format = '''
 
     #[test]
     fn test_simple_jj_on_bookmark() {
-        // Case 1: on a bookmark → always green, show bookmark name
         let status = RepoStatus {
             is_jj: true,
             change_id: "mrtu".to_string(),
-            files_changed: 3, // dirty doesn't matter — still green
             bookmarks: vec![Bookmark {
                 name: "main".into(),
                 distance: 0,
@@ -924,7 +928,94 @@ format = '''
     }
 
     #[test]
-    fn test_simple_jj_described() {
+    fn test_simple_jj_with_changes() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            change_id_prefix_len: 2,
+            total_files_changed: 2,
+            total_files_modified: 1,
+            total_files_added: 1,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, SIMPLE_FORMAT, false);
+        assert!(
+            formatted.contains("mrtu"),
+            "expected change_id: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("[~+]"),
+            "expected diff indicators: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_simple_git_clean() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            ..Default::default()
+        };
+        let formatted = format_status(&status, SIMPLE_FORMAT, false);
+        assert!(formatted.contains("main"), "expected branch: {formatted:?}");
+        // No diff indicators when clean
+        assert!(
+            !formatted.contains("["),
+            "expected no diff indicators: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_simple_git_with_changes() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "develop".to_string(),
+            total_files_changed: 3,
+            total_files_modified: 1,
+            total_files_deleted: 1,
+            untracked: 1,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, SIMPLE_FORMAT, false);
+        assert!(
+            formatted.contains("develop"),
+            "expected branch: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("[~-?]"),
+            "expected diff indicators: {formatted:?}"
+        );
+    }
+
+    // --- minimal template tests ---
+
+    #[test]
+    fn test_minimal_jj_on_bookmark() {
+        // Case 1: on a bookmark → always green, show bookmark name
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "mrtu".to_string(),
+            files_changed: 3, // dirty doesn't matter — still green
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 0,
+                display: "main".into(),
+            }],
+            ..Default::default()
+        };
+        let formatted = format_status(&status, MINIMAL_FORMAT, true);
+        assert!(
+            formatted.contains("main"),
+            "expected bookmark: {formatted:?}"
+        );
+        assert!(
+            formatted.contains("\x1b[32m"),
+            "expected green ANSI: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_minimal_jj_described() {
         // Case 1: has description, no bookmark → always green, show description
         let status = RepoStatus {
             is_jj: true,
@@ -933,7 +1024,7 @@ format = '''
             files_changed: 2,
             ..Default::default()
         };
-        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        let formatted = format_status(&status, MINIMAL_FORMAT, true);
         assert!(
             formatted.contains("fix auth"),
             "expected description: {formatted:?}"
@@ -945,7 +1036,7 @@ format = '''
     }
 
     #[test]
-    fn test_simple_jj_one_ahead_empty() {
+    fn test_minimal_jj_one_ahead_empty() {
         // Case 2: undescribed, 1 ahead of bookmark, empty → green, show bookmark
         let status = RepoStatus {
             is_jj: true,
@@ -958,7 +1049,7 @@ format = '''
             }],
             ..Default::default()
         };
-        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        let formatted = format_status(&status, MINIMAL_FORMAT, true);
         assert!(
             formatted.contains("main"),
             "expected bookmark: {formatted:?}"
@@ -970,7 +1061,7 @@ format = '''
     }
 
     #[test]
-    fn test_simple_jj_one_ahead_dirty() {
+    fn test_minimal_jj_one_ahead_dirty() {
         // Case 2: undescribed, 1 ahead of bookmark, has changes → yellow, show bookmark
         let status = RepoStatus {
             is_jj: true,
@@ -984,7 +1075,7 @@ format = '''
             }],
             ..Default::default()
         };
-        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        let formatted = format_status(&status, MINIMAL_FORMAT, true);
         assert!(
             formatted.contains("main"),
             "expected bookmark: {formatted:?}"
@@ -996,7 +1087,7 @@ format = '''
     }
 
     #[test]
-    fn test_simple_jj_no_nearby_bookmark_empty() {
+    fn test_minimal_jj_no_nearby_bookmark_empty() {
         // Case 3: no bookmark or description, empty → green, show change_id
         let status = RepoStatus {
             is_jj: true,
@@ -1004,7 +1095,7 @@ format = '''
             empty: true,
             ..Default::default()
         };
-        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        let formatted = format_status(&status, MINIMAL_FORMAT, true);
         assert!(
             formatted.contains("mrtu"),
             "expected change_id: {formatted:?}"
@@ -1016,7 +1107,7 @@ format = '''
     }
 
     #[test]
-    fn test_simple_jj_no_nearby_bookmark_dirty() {
+    fn test_minimal_jj_no_nearby_bookmark_dirty() {
         // Case 3: no bookmark or description, has changes → yellow, show change_id
         let status = RepoStatus {
             is_jj: true,
@@ -1025,7 +1116,7 @@ format = '''
             files_changed: 1,
             ..Default::default()
         };
-        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        let formatted = format_status(&status, MINIMAL_FORMAT, true);
         assert!(
             formatted.contains("mrtu"),
             "expected change_id: {formatted:?}"
@@ -1037,7 +1128,7 @@ format = '''
     }
 
     #[test]
-    fn test_simple_jj_far_bookmark_falls_through() {
+    fn test_minimal_jj_far_bookmark_falls_through() {
         // Bookmark at distance 3, undescribed → case 3 (show change_id)
         let status = RepoStatus {
             is_jj: true,
@@ -1051,23 +1142,23 @@ format = '''
             }],
             ..Default::default()
         };
-        let formatted = format_status(&status, SIMPLE_FORMAT, false);
+        let formatted = format_status(&status, MINIMAL_FORMAT, false);
         assert_eq!(formatted, "mrtu");
     }
 
     #[test]
-    fn test_simple_git_clean() {
+    fn test_minimal_git_clean() {
         let status = RepoStatus {
             is_git: true,
             branch: "main".to_string(),
             ..Default::default()
         };
-        let formatted = format_status(&status, SIMPLE_FORMAT, false);
+        let formatted = format_status(&status, MINIMAL_FORMAT, false);
         assert_eq!(formatted, "main");
     }
 
     #[test]
-    fn test_simple_git_unstaged() {
+    fn test_minimal_git_unstaged() {
         let status = RepoStatus {
             is_git: true,
             branch: "develop".to_string(),
@@ -1075,7 +1166,7 @@ format = '''
             total_files_changed: 2,
             ..Default::default()
         };
-        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        let formatted = format_status(&status, MINIMAL_FORMAT, true);
         assert!(
             formatted.contains("develop"),
             "expected branch: {formatted:?}"
@@ -1087,7 +1178,7 @@ format = '''
     }
 
     #[test]
-    fn test_simple_git_staged_only() {
+    fn test_minimal_git_staged_only() {
         let status = RepoStatus {
             is_git: true,
             branch: "feature".to_string(),
@@ -1097,7 +1188,7 @@ format = '''
             total_lines_added: 3,
             ..Default::default()
         };
-        let formatted = format_status(&status, SIMPLE_FORMAT, true);
+        let formatted = format_status(&status, MINIMAL_FORMAT, true);
         assert!(
             formatted.contains("feature"),
             "expected branch: {formatted:?}"
