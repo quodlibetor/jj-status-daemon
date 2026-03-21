@@ -1,18 +1,15 @@
-{% if is_jj -%}
-  {{ "JJ" | magenta }} {{ change_id_prefix | magenta | bold }}{{ change_id_rest | bright_black }}
-  {%- for b in bookmarks %} {{ b.display | blue }}{% endfor %}
-{%- elif is_git -%}
-  {{ "+" | green }}{{ "-" | red }} {{ branch | blue }} {{ commit_id_prefix | blue | bold }}{{ commit_id_rest | bright_black }}
-{%- endif -%}
-{% if total_files_changed > 0 %} {{ "[" | blue }}
-  {{- total_files_changed | bright_blue }} {{ "+" ~ total_lines_added | bright_green }}
-  {{- "-" ~ total_lines_removed | bright_red }}{{ "]" | blue }}
-{%- endif -%}
-{% if rebasing %} {{ "REBASING" | bright_magenta }}{% endif -%}
-{% if conflict %} {{ "CONFLICT" | bright_red }}{% endif -%}
-{% if divergent %} {{ "DIVERGENT" | bright_red }}{% endif -%}
-{% if hidden %} {{ "HIDDEN" | bright_yellow }}{% endif -%}
-{% if immutable %} {{ "IMMUTABLE" | yellow }}{% endif -%}
-{% if empty %} {{ "(" | blue }}EMPTY{{ ")" | blue }}{% endif -%}
-{% if is_stale %} {{ "STALE" | bright_yellow }}{% endif -%}
-{% if not is_default_workspace %} {{ "/" | bright_green }}{{ workspace_name }}{{ "\" | bright_green }}{% endif %}
+{% set jj_icon = "JJ" -%}
+{% set git_icon = "+-" -%}
+{% set bookmark_prefix = "" -%}
+{% set rebasing_icon = "REBASING" -%}
+{% set conflict_icon = "CONFLICT" -%}
+{% set divergent_icon = "DIVERGENT" -%}
+{% set hidden_icon = "HIDDEN" -%}
+{% set immutable_icon = "IMMUTABLE" -%}
+{% set empty_icon = "(EMPTY)" -%}
+{% set stale_icon = "STALE" -%}
+{% set files_icon = "f" -%}
+{% set lines_icon = "l" -%}
+{% set workspace_open = "/" -%}
+{% set workspace_close = "\" -%}
+{% include "detail.tera" %}

@@ -391,7 +391,7 @@ mod tests {
             ..Default::default()
         };
 
-        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
         wait_for_socket(&socket_path).await;
 
         let dir_path = dir.path().to_path_buf();
@@ -424,7 +424,7 @@ mod tests {
             ..Default::default()
         };
 
-        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
         wait_for_socket(&socket_path).await;
 
         // Send DaemonStatus request directly via the socket
@@ -521,7 +521,7 @@ mod tests {
             ..Default::default()
         };
 
-        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
         wait_for_socket(&socket_path).await;
 
         // Calling start_daemon when daemon is already running should be a no-op.
@@ -554,7 +554,7 @@ mod tests {
             ..Default::default()
         };
 
-        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
         wait_for_socket(&socket_path).await;
 
         // Daemon should write a version file on startup
@@ -584,7 +584,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
         wait_for_socket(&socket_path).await;
         assert!(version_path.exists());
 

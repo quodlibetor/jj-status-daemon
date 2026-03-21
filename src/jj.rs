@@ -64,11 +64,35 @@ fn count_lines(content: &[u8]) -> u32 {
     bytecount::count(content, b'\n') as u32
 }
 
+/// Classification of a file change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileChangeKind {
+    #[default]
+    Modified,
+    Added,
+    Deleted,
+    /// Git-only: file exists on disk but is not in the index or HEAD.
+    Untracked,
+}
+
 /// Per-file diff stats for incremental overlay tracking.
 #[derive(Clone, Debug, Default)]
 pub struct FileDiffStats {
     pub lines_added: u32,
     pub lines_removed: u32,
+    pub kind: FileChangeKind,
+}
+
+/// Aggregated diff statistics including per-category file counts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiffCounts {
+    pub files_changed: u32,
+    pub lines_added: u32,
+    pub lines_removed: u32,
+    pub files_modified: u32,
+    pub files_added: u32,
+    pub files_deleted: u32,
+    pub files_untracked: u32,
 }
 
 /// Retained jj-lib state for incremental working copy diffs.
@@ -98,31 +122,35 @@ pub struct JjRepoState {
 pub fn aggregate_overlay_stats(
     base: &HashMap<String, FileDiffStats>,
     overlay: &HashMap<String, Option<FileDiffStats>>,
-) -> (u32, u32, u32) {
-    let mut files = 0u32;
-    let mut added = 0u32;
-    let mut removed = 0u32;
+) -> DiffCounts {
+    let mut counts = DiffCounts::default();
+
+    fn tally(counts: &mut DiffCounts, stats: &FileDiffStats) {
+        if stats.kind == FileChangeKind::Untracked {
+            counts.files_untracked += 1;
+            return;
+        }
+        if stats.lines_added > 0 || stats.lines_removed > 0 {
+            counts.files_changed += 1;
+            counts.lines_added += stats.lines_added;
+            counts.lines_removed += stats.lines_removed;
+            match stats.kind {
+                FileChangeKind::Modified => counts.files_modified += 1,
+                FileChangeKind::Added => counts.files_added += 1,
+                FileChangeKind::Deleted => counts.files_deleted += 1,
+                FileChangeKind::Untracked => unreachable!(),
+            }
+        }
+    }
 
     // Process base entries, checking for overlay overrides
     for (path, stats) in base {
         match overlay.get(path) {
-            Some(Some(overlay_stats)) => {
-                if overlay_stats.lines_added > 0 || overlay_stats.lines_removed > 0 {
-                    files += 1;
-                    added += overlay_stats.lines_added;
-                    removed += overlay_stats.lines_removed;
-                }
-            }
+            Some(Some(overlay_stats)) => tally(&mut counts, overlay_stats),
             Some(None) => {
                 // File reverted to parent — excluded from diff
             }
-            None => {
-                if stats.lines_added > 0 || stats.lines_removed > 0 {
-                    files += 1;
-                    added += stats.lines_added;
-                    removed += stats.lines_removed;
-                }
-            }
+            None => tally(&mut counts, stats),
         }
     }
 
@@ -131,34 +159,36 @@ pub fn aggregate_overlay_stats(
         if base.contains_key(path) {
             continue;
         }
-        if let Some(stats) = entry
-            && (stats.lines_added > 0 || stats.lines_removed > 0)
-        {
-            files += 1;
-            added += stats.lines_added;
-            removed += stats.lines_removed;
+        if let Some(stats) = entry {
+            tally(&mut counts, stats);
         }
     }
 
-    (files, added, removed)
+    counts
 }
 
 impl JjRepoState {
-    fn aggregate_stats(&self) -> (u32, u32, u32) {
+    fn aggregate_stats(&self) -> DiffCounts {
         aggregate_overlay_stats(&self.base_file_stats, &self.overlay)
     }
 
     /// Build a RepoStatus with current aggregate diff stats.
     fn current_status(&self) -> RepoStatus {
-        let (f, a, r) = self.aggregate_stats();
+        let c = self.aggregate_stats();
         RepoStatus {
-            files_changed: f,
-            lines_added: a,
-            lines_removed: r,
-            total_files_changed: f,
-            total_lines_added: a,
-            total_lines_removed: r,
-            empty: f == 0 && self.base_status.empty && self.overlay.is_empty(),
+            files_changed: c.files_changed,
+            lines_added: c.lines_added,
+            lines_removed: c.lines_removed,
+            files_modified: c.files_modified,
+            files_added: c.files_added,
+            files_deleted: c.files_deleted,
+            total_files_changed: c.files_changed,
+            total_lines_added: c.lines_added,
+            total_lines_removed: c.lines_removed,
+            total_files_modified: c.files_modified,
+            total_files_added: c.files_added,
+            total_files_deleted: c.files_deleted,
+            empty: c.files_changed == 0 && self.base_status.empty && self.overlay.is_empty(),
             ..self.base_status.clone()
         }
     }
@@ -196,6 +226,7 @@ async fn compute_per_file_diff_stats(
 
         match (before_file, after_file) {
             (None, Some(id)) => {
+                stats.kind = FileChangeKind::Added;
                 if let Some(content) = read_file_content(store, &entry.path, id).await
                     && !is_binary(&content)
                 {
@@ -203,6 +234,7 @@ async fn compute_per_file_diff_stats(
                 }
             }
             (Some(id), None) => {
+                stats.kind = FileChangeKind::Deleted;
                 if let Some(content) = read_file_content(store, &entry.path, id).await
                     && !is_binary(&content)
                 {
@@ -235,18 +267,9 @@ async fn compute_per_file_diff_stats(
 }
 
 /// Compute aggregate diff stats from a per-file map.
-fn aggregate_file_stats(per_file: &HashMap<String, FileDiffStats>) -> (u32, u32, u32) {
-    let mut files = 0u32;
-    let mut added = 0u32;
-    let mut removed = 0u32;
-    for stats in per_file.values() {
-        if stats.lines_added > 0 || stats.lines_removed > 0 {
-            files += 1;
-            added += stats.lines_added;
-            removed += stats.lines_removed;
-        }
-    }
-    (files, added, removed)
+fn aggregate_file_stats(per_file: &HashMap<String, FileDiffStats>) -> DiffCounts {
+    let empty = HashMap::new();
+    aggregate_overlay_stats(per_file, &empty)
 }
 
 /// Diff a single file on disk against its parent tree version.
@@ -275,7 +298,10 @@ async fn diff_single_file(
         (None, None) => None, // Neither exists
         (None, Some(disk)) => {
             // New file
-            let mut stats = FileDiffStats::default();
+            let mut stats = FileDiffStats {
+                kind: FileChangeKind::Added,
+                ..Default::default()
+            };
             if !is_binary(disk) {
                 stats.lines_added = count_lines(disk);
             }
@@ -283,7 +309,10 @@ async fn diff_single_file(
         }
         (Some(parent), None) => {
             // Deleted file
-            let mut stats = FileDiffStats::default();
+            let mut stats = FileDiffStats {
+                kind: FileChangeKind::Deleted,
+                ..Default::default()
+            };
             if !is_binary(parent) {
                 stats.lines_removed = count_lines(parent);
             }
@@ -294,7 +323,10 @@ async fn diff_single_file(
             if parent == disk {
                 return None; // File matches parent
             }
-            let mut stats = FileDiffStats::default();
+            let mut stats = FileDiffStats {
+                kind: FileChangeKind::Modified,
+                ..Default::default()
+            };
             if !is_binary(parent) && !is_binary(disk) {
                 let diff = diff_by_line([parent, disk], &LineCompareMode::Exact);
                 for hunk in diff.hunks() {
@@ -627,14 +659,20 @@ async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<(RepoStatus, JjRep
     let current_tree = commit.tree();
     let base_file_stats = if let Some(ref parent_tree) = parent_tree {
         let per_file = compute_per_file_diff_stats(repo.store(), parent_tree, &current_tree).await;
-        let (f, a, r) = aggregate_file_stats(&per_file);
-        status.files_changed = f;
-        status.lines_added = a;
-        status.lines_removed = r;
-        status.total_files_changed = f;
-        status.total_lines_added = a;
-        status.total_lines_removed = r;
-        status.empty = f == 0;
+        let c = aggregate_file_stats(&per_file);
+        status.files_changed = c.files_changed;
+        status.lines_added = c.lines_added;
+        status.lines_removed = c.lines_removed;
+        status.files_modified = c.files_modified;
+        status.files_added = c.files_added;
+        status.files_deleted = c.files_deleted;
+        status.total_files_changed = c.files_changed;
+        status.total_lines_added = c.lines_added;
+        status.total_lines_removed = c.lines_removed;
+        status.total_files_modified = c.files_modified;
+        status.total_files_added = c.files_added;
+        status.total_files_deleted = c.files_deleted;
+        status.empty = c.files_changed == 0;
         per_file
     } else {
         status.empty = true;
@@ -1365,10 +1403,23 @@ mod tests {
 
     // --- Pure unit tests for overlay aggregation (no jj repo needed) ---
 
+    /// Helper to build DiffCounts with just (files_changed, lines_added, lines_removed).
+    /// files_changed are all counted as modified.
+    fn dcounts(files_changed: u32, lines_added: u32, lines_removed: u32) -> DiffCounts {
+        DiffCounts {
+            files_changed,
+            lines_added,
+            lines_removed,
+            files_modified: files_changed,
+            ..Default::default()
+        }
+    }
+
     fn fstats(added: u32, removed: u32) -> FileDiffStats {
         FileDiffStats {
             lines_added: added,
             lines_removed: removed,
+            kind: FileChangeKind::Modified,
         }
     }
 
@@ -1376,7 +1427,7 @@ mod tests {
     fn test_aggregate_empty() {
         let base = HashMap::new();
         let overlay = HashMap::new();
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (0, 0, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(0, 0, 0));
     }
 
     #[test]
@@ -1386,7 +1437,7 @@ mod tests {
             ("b.rs".into(), fstats(5, 0)),
         ]);
         let overlay = HashMap::new();
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (2, 15, 3));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(2, 15, 3));
     }
 
     #[test]
@@ -1394,7 +1445,7 @@ mod tests {
         let base = HashMap::from([("a.rs".into(), fstats(10, 3))]);
         // Overlay says a.rs now has 20 added, 1 removed (e.g., user added more lines)
         let overlay = HashMap::from([("a.rs".into(), Some(fstats(20, 1)))]);
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (1, 20, 1));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(1, 20, 1));
     }
 
     #[test]
@@ -1402,7 +1453,7 @@ mod tests {
         // Base shows a.rs changed, but overlay says it now matches parent
         let base = HashMap::from([("a.rs".into(), fstats(10, 3))]);
         let overlay = HashMap::from([("a.rs".into(), None)]);
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (0, 0, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(0, 0, 0));
     }
 
     #[test]
@@ -1410,7 +1461,7 @@ mod tests {
         // Base has no files, overlay adds a new file
         let base = HashMap::new();
         let overlay = HashMap::from([("new.txt".into(), Some(fstats(5, 0)))]);
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (1, 5, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(1, 5, 0));
     }
 
     #[test]
@@ -1429,7 +1480,7 @@ mod tests {
         // modified.rs:  +7  -0 (from overlay)
         // reverted.rs:  excluded
         // brand_new.rs: +20 -0 (from overlay, not in base)
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (3, 37, 2));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(3, 37, 2));
     }
 
     #[test]
@@ -1439,7 +1490,7 @@ mod tests {
         let base = HashMap::from([("a.rs".into(), fstats(10, 3))]);
         let overlay = HashMap::from([("a.rs".into(), Some(fstats(0, 0)))]);
         // File is not counted since stats are zero
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (0, 0, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(0, 0, 0));
     }
 
     #[test]
@@ -1447,7 +1498,7 @@ mod tests {
         // New file in overlay but with None (deleted before it was ever in base)
         let base = HashMap::new();
         let overlay = HashMap::from([("phantom.txt".into(), None)]);
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (0, 0, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(0, 0, 0));
     }
 
     #[test]
@@ -1464,7 +1515,7 @@ mod tests {
         // b.rs: overlay +3 -0
         // c.rs: overlay +0 -4
         // d.rs: None, not in base → excluded
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (3, 11, 6));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(3, 11, 6));
     }
 
     #[test]
@@ -1472,7 +1523,7 @@ mod tests {
         // A base entry with zero stats shouldn't count as a file
         let base = HashMap::from([("empty_diff.rs".into(), fstats(0, 0))]);
         let overlay = HashMap::new();
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (0, 0, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(0, 0, 0));
     }
 
     #[test]
@@ -1487,7 +1538,7 @@ mod tests {
             ("b.rs".into(), None),
             ("c.rs".into(), None),
         ]);
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (0, 0, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(0, 0, 0));
     }
 
     #[test]
@@ -1498,7 +1549,7 @@ mod tests {
             ("y.rs".into(), Some(fstats(0, 1))),
             ("z.rs".into(), Some(fstats(10, 5))),
         ]);
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (3, 11, 6));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(3, 11, 6));
     }
 
     // --- Sequential overlay accumulation tests ---
@@ -1524,15 +1575,15 @@ mod tests {
 
         // Event 1: new file created
         apply_event(&mut overlay, "new1.txt", Some(fstats(3, 0)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (2, 8, 1));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(2, 8, 1));
 
         // Event 2: another new file created (while event 1 was being processed)
         apply_event(&mut overlay, "new2.txt", Some(fstats(7, 0)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (3, 15, 1));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(3, 15, 1));
 
         // Event 3: yet another file
         apply_event(&mut overlay, "new3.txt", Some(fstats(1, 0)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (4, 16, 1));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(4, 16, 1));
     }
 
     #[test]
@@ -1543,19 +1594,19 @@ mod tests {
 
         // Save 1: 5 lines added
         apply_event(&mut overlay, "main.rs", Some(fstats(5, 0)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (1, 5, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(1, 5, 0));
 
         // Save 2: user adds more → 8 lines total (not cumulative, replaces)
         apply_event(&mut overlay, "main.rs", Some(fstats(8, 0)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (1, 8, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(1, 8, 0));
 
         // Save 3: user deletes some lines → 6 added, 2 removed
         apply_event(&mut overlay, "main.rs", Some(fstats(6, 2)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (1, 6, 2));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(1, 6, 2));
 
         // Save 4: user reverts to match parent exactly
         apply_event(&mut overlay, "main.rs", None);
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (0, 0, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(0, 0, 0));
     }
 
     #[test]
@@ -1566,15 +1617,15 @@ mod tests {
 
         // Create file
         apply_event(&mut overlay, "temp.txt", Some(fstats(10, 0)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (1, 10, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(1, 10, 0));
 
         // Modify it
         apply_event(&mut overlay, "temp.txt", Some(fstats(12, 0)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (1, 12, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(1, 12, 0));
 
         // Delete it — since it's not in base/parent, None means it's gone entirely
         apply_event(&mut overlay, "temp.txt", None);
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (0, 0, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(0, 0, 0));
     }
 
     #[test]
@@ -1585,23 +1636,23 @@ mod tests {
 
         // Event: a.rs modified on disk (replaces base)
         apply_event(&mut overlay, "a.rs", Some(fstats(5, 2)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (1, 5, 2));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(1, 5, 2));
 
         // Event: b.rs created
         apply_event(&mut overlay, "b.rs", Some(fstats(4, 0)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (2, 9, 2));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(2, 9, 2));
 
         // Event: a.rs modified again
         apply_event(&mut overlay, "a.rs", Some(fstats(6, 3)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (2, 10, 3));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(2, 10, 3));
 
         // Event: c.rs created
         apply_event(&mut overlay, "c.rs", Some(fstats(1, 0)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (3, 11, 3));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(3, 11, 3));
 
         // Event: b.rs deleted (was only in overlay, not parent)
         apply_event(&mut overlay, "b.rs", None);
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (2, 7, 3));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(2, 7, 3));
     }
 
     #[test]
@@ -1612,11 +1663,11 @@ mod tests {
 
         // User reverts file to match parent
         apply_event(&mut overlay, "config.toml", None);
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (0, 0, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(0, 0, 0));
 
         // User makes a different change
         apply_event(&mut overlay, "config.toml", Some(fstats(10, 5)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (1, 10, 5));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(1, 10, 5));
     }
 
     #[test]
@@ -1628,7 +1679,7 @@ mod tests {
         // Accumulate overlay events
         apply_event(&mut overlay, "new.txt", Some(fstats(5, 0)));
         apply_event(&mut overlay, "old.rs", Some(fstats(10, 2)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (2, 15, 2));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(2, 15, 2));
 
         // Full refresh: new base, overlay cleared (simulates what jj_worker_loop does)
         base = HashMap::from([
@@ -1636,11 +1687,11 @@ mod tests {
             ("new.txt".into(), fstats(5, 0)), // also snapshotted
         ]);
         overlay.clear();
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (2, 15, 2));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(2, 15, 2));
 
         // New events on the fresh base
         apply_event(&mut overlay, "old.rs", Some(fstats(11, 2)));
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (2, 16, 2));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(2, 16, 2));
     }
 
     #[test]
@@ -1653,14 +1704,17 @@ mod tests {
             let path = format!("src/gen_{i}.rs");
             apply_event(&mut overlay, &path, Some(fstats(10, 0)));
         }
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (50, 500, 0));
+        assert_eq!(
+            aggregate_overlay_stats(&base, &overlay),
+            dcounts(50, 500, 0)
+        );
 
         // Then all get deleted (e.g., clean build)
         for i in 0..50 {
             let path = format!("src/gen_{i}.rs");
             apply_event(&mut overlay, &path, None);
         }
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (0, 0, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(0, 0, 0));
     }
 
     #[test]
@@ -1678,7 +1732,7 @@ mod tests {
         apply_event(&mut overlay, "delete_me.rs", Some(fstats(0, 15)));
         // keep.rs: base +20 -5
         // delete_me.rs: overlay +0 -15 (replaces base +10 -3)
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), (2, 20, 20));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(2, 20, 20));
     }
 
     #[test]

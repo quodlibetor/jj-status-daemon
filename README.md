@@ -224,7 +224,7 @@ The `format` field is a [Tera](https://keats.github.io/tera/docs/) template stri
 The daemon detects whether a repository uses jj or git (jj wins if both `.jj/` and `.git/` are present) and exposes `is_jj` and `is_git` booleans. Use these to write templates that work for both:
 
 ```tera
-{% if is_jj %}{{ change_id }}{% elif is_git %}{{ branch }} {{ commit_id }}{% endif %}
+{% if is_jj %}{{ change_id }}{% elif is_git %}{% if has_branch %}{{ branch }}{% else %}{{ commit_id }}{% endif %}{% endif %}
 ```
 
 ### Template variables
@@ -283,8 +283,8 @@ These are populated only for git repositories. In jj repositories they are empty
 
 | Variable | Type | Description |
 |---|---|---|
-| `branch` | string | Current branch name, or short commit hash if HEAD is detached. |
-| `has_branch` | bool | `true` if `branch` is non-empty. |
+| `branch` | string | Current branch name. Empty when HEAD is detached. |
+| `has_branch` | bool | `true` if on a branch, `false` if HEAD is detached. |
 | `rebasing` | bool | `true` if a rebase is in progress (interactive or non-interactive). |
 
 #### Workspace/worktree fields
@@ -313,6 +313,8 @@ Colors are applied using Tera's filter syntax: `{{ value | green }}`. When `colo
 |---|---|
 | `bold` | `\e[1m` |
 | `dim` | `\e[2m` |
+| `italic` | `\e[3m` |
+| `underline` | `\e[4m` |
 | `red` | `\e[31m` |
 | `green` | `\e[32m` |
 | `yellow` | `\e[33m` |
@@ -344,25 +346,25 @@ template_name = "nerdfont"
 Works in any terminal. Example output:
 
 - **jj**: `JJ xlvlt main [3 +10-5]` or `JJ xlvlt (EMPTY)`
-- **git**: `+- main abc1234 [3 +10-5]` or `+- main abc1234 (EMPTY)`
+- **git**: `+- main [3 +10-5]` or `+- abc1234` (detached HEAD)
 
 #### `nerdfont`
 
 Requires a [Nerd Font](https://www.nerdfonts.com/). Uses iconic glyphs for VCS type, conflicts, divergence, etc. Example output:
 
-- **jj**: `󱗆 xlvlt main [3 +10 -5]` or `󱗆 xlvlt ∅`
-- **git**: `󰊢 main abc1234 [3 +10 -5]` or `󰊢 main abc1234 ∅`
+- **jj**: `󱗆 xlvlt main [3 +10-5]` or `󱗆 xlvlt ∅`
+- **git**: `󰊢 main [3 +10-5]` or `󰊢 abc1234` (detached HEAD)
 
 #### `unicode`
 
 Uses standard Unicode symbols (no Nerd Fonts needed). Example output:
 
-- **jj**: `※ xlvlt ≡ main [3 +10-5]`
-- **git**: `± main abc1234 [3 +10-5]`
+- **jj**: `⋈ xlvlt ≡ main [3 +10-5]`
+- **git**: `± main [3 +10-5]` or `± abc1234` (detached HEAD)
 
 #### `simple`
 
-Just the branch or bookmark name, color-coded by state. Green = clean, yellow = changes, red = unstaged (git). For jj, shows the bookmark name, description, or change ID depending on context.
+Just the branch or bookmark name, color-coded by state. Green = clean, yellow = changes, red = unstaged (git) magenta = untracked (git). For jj, shows the bookmark name, description, or change ID depending on context.
 
 ### User-defined templates
 
@@ -376,6 +378,28 @@ minimal = "{{ commit_id }} {{ description }}"
 ```
 
 User templates take priority over built-in ones — you can override `ascii` or `nerdfont` with your own version.
+
+The built-in `ascii`, `nerdfont`, and `unicode` templates all share the same body (`detail.tera`) and differ only in their icon constants. You can use the same pattern in your own templates — set icon variables with `{% set %}` and then `{% include "detail.tera" %}`:
+
+```toml
+template_name = "my_icons"
+
+[templates]
+my_icons = '''
+{% set jj_icon = "jj" -%}
+{% set git_icon = "git" -%}
+{% set bookmark_prefix = "" -%}
+{% set rebasing_icon = "REBASING" -%}
+{% set conflict_icon = "!!" -%}
+{% set divergent_icon = "DIVERGENT" -%}
+{% set hidden_icon = "HIDDEN" -%}
+{% set immutable_icon = "IMMUTABLE" -%}
+{% set empty_icon = "(empty)" -%}
+{% set stale_icon = "STALE" -%}
+{% set workspace_open = "(" -%}
+{% set workspace_close = ")" -%}
+{% include "detail.tera" %}'''
+```
 
 ### Inline format override
 
@@ -391,7 +415,7 @@ In TOML, use multi-line literal strings (`'''`) for readability. Use Tera's `{%-
 format = '''
 {% if is_jj %}{{ change_id }}
 {%- for b in bookmarks %} {{ b.display | blue }}{% endfor %}
-{%- elif is_git %}{{ branch | blue }} {{ commit_id }}
+{%- elif is_git %}{% if has_branch %}{{ branch | blue }}{% else %}{{ commit_id }}{% endif %}
 {%- endif %}'''
 ```
 
@@ -406,11 +430,11 @@ format = '''
 {%- for b in bookmarks %} {{ b.display }}{% endfor %}'''
 ```
 
-**git-only, minimal** -- just branch and commit:
+**git-only, minimal** -- branch name (or commit hash when detached):
 
 ```toml
 color = false
-format = "{{ branch }} {{ commit_id }}"
+format = "{% if has_branch %}{{ branch }}{% else %}{{ commit_id }}{% endif %}"
 ```
 
 **Verbose, both VCS** -- with description/state details:
@@ -420,7 +444,7 @@ format = '''
 {% if is_jj %}{{ change_id }} {{ commit_id | dim }}
 {%- for b in bookmarks %} {{ b.display | blue }}{% endfor %}
 {%- if description %} {{ description | dim }}{% endif %}
-{%- elif is_git %}{{ branch | blue }} {{ commit_id | dim }}
+{%- elif is_git %}{% if has_branch %}{{ branch | blue }}{% else %}{{ commit_id | dim }}{% endif %}
 {%- endif %}
 {%- if total_files_changed > 0 %} {{ total_files_changed | bright_blue }}f {{ "+" ~ total_lines_added | bright_green }} {{ "-" ~ total_lines_removed | bright_red }}{% endif %}
 {%- if empty %} {{ "empty" | yellow }}{% endif %}

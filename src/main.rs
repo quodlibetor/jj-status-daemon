@@ -449,13 +449,21 @@ fn run_clap() -> anyhow::Result<()> {
             daemon::init_logging(&runtime_dir);
             // Daemon's own --config-file takes priority over the top-level one
             let daemon_cf = config_file.as_deref().or(cf);
-            let config = config::load_config_from(daemon_cf)?;
+            let (config, config_err) = match config::load_config_from(daemon_cf) {
+                Ok(c) => (c, None),
+                Err(e) => {
+                    let msg = format!("config error: {e}");
+                    eprintln!("warning: {msg}");
+                    (config::Config::default(), Some(msg))
+                }
+            };
             // Resolve the config file path for hot-reload watching.
             // Use explicit --config-file if given, otherwise fall back to the default path.
             let watch_cf = daemon_cf
                 .map(|p| p.to_path_buf())
                 .or_else(config::config_path);
-            build_runtime().block_on(daemon::run_daemon(config, runtime_dir, watch_cf))?;
+            build_runtime()
+                .block_on(daemon::run_daemon(config, runtime_dir, watch_cf, config_err))?;
         }
         Some(Commands::Shutdown) => {
             client::shutdown()?;

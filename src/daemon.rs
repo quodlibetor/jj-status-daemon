@@ -33,9 +33,25 @@ struct DaemonState {
     refreshing: HashSet<PathBuf>,
     /// Per-repo watch channels notified when cache is updated.
     cache_watch: HashMap<PathBuf, watch::Sender<u64>>,
+    /// Sticky config/template error appended to every formatted status.
+    /// Cleared on successful config reload.
+    config_error: Option<String>,
 }
 
 impl DaemonState {
+    /// Format status, appending any sticky config error.
+    fn format(&self, status: &RepoStatus) -> String {
+        let mut formatted =
+            format_status(status, &self.config.resolved_format(), self.config.color);
+        if let Some(ref err) = self.config_error {
+            if !formatted.is_empty() {
+                formatted.push(' ');
+            }
+            formatted.push_str(err);
+        }
+        formatted
+    }
+
     /// Insert a cache entry and notify any waiting clients.
     fn update_cache(&mut self, repo_path: &Path, status: RepoStatus, formatted: String) {
         self.cache
@@ -109,6 +125,8 @@ pub async fn run_daemon(
     // Path to the config file to watch for hot-reload. None disables watching
     // (used in tests where config is constructed in-memory).
     config_file: Option<PathBuf>,
+    // Initial config/template error to display (e.g. from startup parse failure).
+    initial_config_error: Option<String>,
 ) -> Result<()> {
     let socket_path = runtime_dir.join("sock");
     let cache_dir = runtime_dir.join("cache");
@@ -118,17 +136,24 @@ pub async fn run_daemon(
         "starting daemon"
     );
 
-    // Validate the template early so the user gets immediate feedback
-    let resolved = config.resolved_format();
-    if let Err(e) = crate::template::validate_template(&resolved) {
-        let source = if config.format.is_some() {
-            "format".to_string()
+    // Use the initial config error if provided, otherwise validate the template
+    let startup_config_error = if initial_config_error.is_some() {
+        initial_config_error
+    } else {
+        let resolved = config.resolved_format();
+        if let Err(e) = crate::template::validate_template(&resolved) {
+            let source = if config.format.is_some() {
+                "format".to_string()
+            } else {
+                format!("template \"{}\"", config.template_name)
+            };
+            eprintln!("warning: invalid {source}: {e}");
+            tracing::error!(source = %source, "invalid template: {e}");
+            Some(e)
         } else {
-            format!("template \"{}\"", config.template_name)
-        };
-        eprintln!("warning: invalid {source}: {e}");
-        tracing::error!(source = %source, "invalid template: {e}");
-    }
+            None
+        }
+    };
 
     // Clean up stale socket
     if socket_path.exists() {
@@ -169,6 +194,7 @@ pub async fn run_daemon(
         stats: DaemonStats::default(),
         refreshing: HashSet::new(),
         cache_watch: HashMap::new(),
+        config_error: startup_config_error,
     }));
 
     // Spawn refresh task
@@ -479,16 +505,13 @@ async fn handle_connection(
                     };
                     match result {
                         Ok(status) => {
-                            let formatted =
-                                format_status(&status, &config.resolved_format(), config.color);
+                            let mut st = state_bg.lock().await;
+                            let formatted = st.format(&status);
                             write_cache_file(&cd_bg, &repo_path_bg, &formatted);
                             if query_path_bg != repo_path_bg {
                                 link_cache_file(&cd_bg, &repo_path_bg, &query_path_bg);
                             }
-                            state_bg
-                                .lock()
-                                .await
-                                .update_cache(&repo_path_bg, status, formatted);
+                            st.update_cache(&repo_path_bg, status, formatted);
                         }
                         Err(e) => {
                             tracing::error!(repo = %repo_path_bg.display(), error = %e, "background status query failed");
@@ -676,7 +699,7 @@ async fn refresh_repo(
             let mut stale_status = prev_status.clone();
             stale_status.is_stale = true;
             stale_status.refresh_error.clear();
-            let formatted = format_status(&stale_status, &config.resolved_format(), config.color);
+            let formatted = st.format(&stale_status);
             write_cache_file(&cd, &repo_path, &formatted);
             st.update_cache(&repo_path, stale_status, formatted);
         }
@@ -731,9 +754,9 @@ async fn refresh_repo(
 
     match result {
         Ok(status) => {
-            let formatted = format_status(&status, &config.resolved_format(), config.color);
-            write_cache_file(&cd, &repo_path, &formatted);
             let mut st = state.lock().await;
+            let formatted = st.format(&status);
+            write_cache_file(&cd, &repo_path, &formatted);
             st.refreshing.remove(&repo_path);
             st.update_cache(&repo_path, status, formatted);
             st.stats.refreshes += 1;
@@ -747,8 +770,7 @@ async fn refresh_repo(
                 let mut stale_status = prev_status.clone();
                 stale_status.is_stale = true;
                 stale_status.refresh_error = e.to_string();
-                let formatted =
-                    format_status(&stale_status, &config.resolved_format(), config.color);
+                let formatted = st.format(&stale_status);
                 write_cache_file(&cd, &repo_path, &formatted);
                 st.update_cache(&repo_path, stale_status, formatted);
             }
@@ -847,39 +869,42 @@ async fn watch_config_file(config_path: PathBuf, state: Arc<Mutex<DaemonState>>)
         // Small delay to coalesce rapid writes (editor save patterns)
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let new_config = match crate::config::load_config_from(Some(&config_path)) {
-            Ok(c) => c,
+        let (new_config, config_err) = match crate::config::load_config_from(Some(&config_path)) {
+            Ok(c) => {
+                // Config parsed — validate the template
+                let resolved = c.resolved_format();
+                let err = crate::template::validate_template(&resolved).err();
+                if let Some(ref e) = err {
+                    tracing::warn!(error = %e, "new config has invalid template");
+                }
+                (Some(c), err)
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to load updated config, keeping current config");
-                continue;
+                (None, Some(format!("config error: {e}")))
             }
         };
 
-        // Validate the template before accepting the new config
-        let resolved = new_config.resolved_format();
-        if let Err(e) = crate::template::validate_template(&resolved) {
-            tracing::warn!(error = %e, "new config has invalid template, keeping current config");
-            continue;
-        }
-
-        // Swap in the new config and re-render all cached entries
+        // Update state: swap config if valid, always update the error
         let mut st = state.lock().await;
-        tracing::info!(
-            template_name = %new_config.template_name,
-            has_format_override = new_config.format.is_some(),
-            "config reloaded successfully"
-        );
-        st.config = new_config;
+        if let Some(new_config) = new_config {
+            tracing::info!(
+                template_name = %new_config.template_name,
+                has_format_override = new_config.format.is_some(),
+                has_config_error = config_err.is_some(),
+                "config reloaded"
+            );
+            st.config = new_config;
+        }
+        st.config_error = config_err;
 
-        let format = st.config.resolved_format();
-        let color = st.config.color;
         let cache_dir = st.cache_dir.clone();
 
         // Re-render all cached statuses with the new config
         let repos: Vec<PathBuf> = st.cache.keys().cloned().collect();
         for repo_path in repos {
             if let Some((status, _)) = st.cache.get(&repo_path).cloned() {
-                let formatted = format_status(&status, &format, color);
+                let formatted = st.format(&status);
                 write_cache_file(&cache_dir, &repo_path, &formatted);
                 st.update_cache(&repo_path, status, formatted);
             }
@@ -1194,7 +1219,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
 
         let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
         assert!(!formatted.is_empty(), "expected non-empty status");
@@ -1216,7 +1241,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
 
         let query = Request::Query {
             repo_path: dir.path().to_string_lossy().to_string(),
@@ -1260,7 +1285,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
 
         // Query from a subdirectory — daemon should resolve the repo root
         let formatted = query_until_ready(&socket_path, &sub.to_string_lossy()).await;
@@ -1294,7 +1319,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
 
         // Query from the subdirectory and wait for cache to populate
         let formatted = query_until_ready(&socket_path, &sub.to_string_lossy()).await;
@@ -1342,7 +1367,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
         wait_for_socket(&socket_path).await;
 
         let resp = send_request(
@@ -1374,7 +1399,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
         wait_for_socket(&socket_path).await;
 
         let resp = send_request(&socket_path, &Request::Shutdown).await;
@@ -1396,7 +1421,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
 
         // Query to populate the cache
         let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
@@ -1507,7 +1532,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
 
         let dir = create_jj_repo().await;
         let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
@@ -1527,7 +1552,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
 
         // Make sure daemon is running and serving
         let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
@@ -1563,7 +1588,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
 
         // First query — wait for cache to populate
         let first = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
@@ -1634,7 +1659,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
 
         let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
         assert!(
@@ -1678,7 +1703,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
 
         // Round 1: initial queries — wait for cache to populate
         let path_a = dir_a.path().to_string_lossy().to_string();
@@ -1829,7 +1854,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
         wait_for_socket(&socket_path).await;
 
         let query = Request::test_query(dir.path().to_string_lossy().to_string());
@@ -1863,7 +1888,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
 
         // Populate the cache with a successful status
         let first = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
@@ -1906,7 +1931,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
 
         // Populate cache
         let first = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
@@ -1972,7 +1997,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
 
         // Populate cache
         let first = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
@@ -2012,7 +2037,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None));
+        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
         wait_for_socket(&socket_path).await;
 
         let query = Request::test_query(dir.path().to_string_lossy().to_string());
@@ -2047,6 +2072,7 @@ mod tests {
             config,
             rt.path().to_path_buf(),
             Some(config_file.clone()),
+            None,
         ));
 
         // Wait for initial status with "before:" prefix
@@ -2096,6 +2122,7 @@ mod tests {
             config,
             rt.path().to_path_buf(),
             Some(config_file.clone()),
+            None,
         ));
 
         // Wait for initial status
@@ -2105,18 +2132,36 @@ mod tests {
             "expected 'good:' prefix, got: {formatted}"
         );
 
-        // Write an invalid template — should be rejected
+        // Write an invalid template — should be accepted but with error appended
         std::fs::write(&config_file, "color = false\nformat = \"{{ broken }\"\n").unwrap();
 
         // Give the watcher time to process
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Status should still use the old template
+        // Status should include the template error
         let _ = send_request(&socket_path, &Request::Flush).await;
         let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
         assert!(
-            formatted.starts_with("good:"),
-            "invalid config should be rejected, status should still use old template, got: {formatted}"
+            formatted.contains("template error:"),
+            "invalid template should show error in output, got: {formatted}"
+        );
+
+        // Fix the template — error should clear
+        std::fs::write(
+            &config_file,
+            "color = false\nformat = \"fixed:{{ commit_id }}\"\n",
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = send_request(&socket_path, &Request::Flush).await;
+        let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
+        assert!(
+            formatted.starts_with("fixed:"),
+            "fixed template should render normally, got: {formatted}"
+        );
+        assert!(
+            !formatted.contains("template error:"),
+            "fixed template should not have error, got: {formatted}"
         );
 
         let _ = send_request(&socket_path, &Request::Shutdown).await;
