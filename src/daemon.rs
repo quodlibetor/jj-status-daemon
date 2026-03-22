@@ -3,6 +3,7 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, Notify, mpsc, watch};
@@ -77,6 +78,14 @@ use crate::config::find_repo_root;
 
 /// Maximum log file size before rotation (5 MB).
 const MAX_LOG_SIZE: u64 = 5 * 1024 * 1024;
+
+/// Monotonically increasing version for the runtime directory layout.
+/// Bump this when the layout of files in the runtime directory changes in a
+/// way that requires a clean slate (e.g. new cache format, renamed files).
+/// On binary upgrade, if the new binary's directory version is greater than
+/// the running one's, the runtime directory is cleaned (except logs) before
+/// the new daemon starts.
+pub const DIRECTORY_VERSION: u32 = 1;
 
 /// Number of recent query durations to keep for percentile stats.
 const TIMING_RING_SIZE: usize = 100;
@@ -199,6 +208,12 @@ pub async fn run_daemon(
         config_error: startup_config_error,
         config_file: config_file.clone(),
     }));
+
+    // Recover watchers from cache files left by a previous daemon instance.
+    // The shell hook reads cache files directly and only contacts the daemon on
+    // cache miss, so after an exec restart we must proactively re-watch all repos
+    // that have cached entries — otherwise working copy changes go undetected.
+    recover_watchers_from_cache(&cache_dir, &state, &watch_tx).await;
 
     // Spawn refresh task
     tokio::spawn(refresh_task(state.clone(), watch_rx));
@@ -326,6 +341,16 @@ pub async fn run_daemon(
         });
     }
 
+    // Watch for binary replacement and auto-restart
+    let restart_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_exe = shutdown.clone();
+    let restart_exe = restart_requested.clone();
+    tokio::spawn(async move {
+        if let Err(e) = watch_binary(shutdown_exe, restart_exe).await {
+            tracing::warn!(error = %e, "binary watcher failed");
+        }
+    });
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -348,6 +373,22 @@ pub async fn run_daemon(
                 });
             }
             _ = shutdown.notified() => {
+                if restart_requested.load(Ordering::Relaxed) {
+                    // Binary was replaced — exec the new binary in-place.
+                    // Skip normal shutdown cleanup: exec replaces this process,
+                    // and the new daemon will handle stale socket/pid on startup.
+                    if let Ok(exe) = std::env::current_exe() {
+                        maybe_clean_runtime_dir(&exe, &runtime_dir);
+
+                        let args: Vec<String> = std::env::args().collect();
+                        tracing::info!(exe = %exe.display(), "re-exec with new binary");
+                        let err = exec_binary(&exe, &args);
+                        // exec only returns on failure
+                        tracing::error!(error = %err, "failed to exec new binary");
+                    }
+                }
+
+                // Normal shutdown (or exec failed fallback)
                 tracing::info!("daemon shutting down");
                 if let Err(e) = std::fs::remove_file(&socket_path) {
                     tracing::warn!(path = %socket_path.display(), error = %e, "failed to remove socket");
@@ -620,6 +661,72 @@ async fn send_response(
     Ok(())
 }
 
+/// Scan the cache directory for files left by a previous daemon instance and
+/// set up watchers for the repos they represent.  Cache file names encode the
+/// directory path (`/` → `%`), so we can decode them back.  Hardlinked
+/// subdirectory entries share an inode with their repo root; we deduplicate by
+/// inode so each repo is watched exactly once.
+async fn recover_watchers_from_cache(
+    cache_dir: &Path,
+    state: &Arc<Mutex<DaemonState>>,
+    watch_tx: &mpsc::UnboundedSender<WatchEvent>,
+) {
+    let entries = match std::fs::read_dir(cache_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    // Deduplicate by inode — hardlinked subdirectory cache entries share the
+    // same inode as the repo root entry.
+    use std::collections::HashSet;
+    use std::os::unix::fs::MetadataExt;
+    let mut seen_inodes = HashSet::new();
+    let mut recovered = 0u32;
+
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !seen_inodes.insert(meta.ino()) {
+            continue; // hardlink to a repo root we already processed
+        }
+
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Decode: `%` → `/`
+        let dir_path = PathBuf::from(name.replace('%', "/"));
+
+        // Only set up a watcher if this path is actually a repo root
+        let Some((repo_path, vcs_kind)) = find_repo_root(&dir_path) else {
+            continue;
+        };
+        if repo_path != dir_path {
+            continue; // this cache entry is for a subdirectory, not the root
+        }
+
+        let mut st = state.lock().await;
+        if st.watchers.contains_key(&repo_path) {
+            continue;
+        }
+        match watch_repo(&repo_path, vcs_kind, watch_tx.clone()) {
+            Ok(watcher) => {
+                tracing::info!(repo = %repo_path.display(), vcs = ?vcs_kind, "recovered watcher from cache");
+                st.dir_to_repo
+                    .insert(repo_path.clone(), (repo_path.clone(), vcs_kind));
+                st.watchers.insert(repo_path, watcher);
+                recovered += 1;
+            }
+            Err(e) => {
+                tracing::warn!(repo = %repo_path.display(), error = %e, "failed to recover watcher");
+            }
+        }
+    }
+
+    if recovered > 0 {
+        tracing::info!(count = recovered, "recovered watchers from previous cache");
+    }
+}
+
 /// Compute the cache file path for a given directory within a specific cache dir.
 fn cache_file_in(cache_dir: &Path, dir: &Path) -> PathBuf {
     let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
@@ -875,6 +982,136 @@ async fn reload_config(config_path: &Path, state: &Arc<Mutex<DaemonState>>) {
             st.update_cache(&repo_path, status, formatted);
         }
     }
+}
+
+/// Query the new binary's directory-version and clean the runtime directory
+/// (preserving log files) if it is greater than the current one.
+fn maybe_clean_runtime_dir(new_exe: &Path, runtime_dir: &Path) {
+    let output = match std::process::Command::new(new_exe)
+        .arg("directory-version")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let new_version: u32 = match String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+    {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    if new_version <= DIRECTORY_VERSION {
+        return;
+    }
+
+    tracing::info!(
+        old = DIRECTORY_VERSION,
+        new = new_version,
+        "directory version increased, cleaning runtime directory"
+    );
+
+    // Remove everything except log files
+    if let Ok(entries) = std::fs::read_dir(runtime_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("daemon.log") {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+/// Replace the current process with a new invocation of the given binary.
+fn exec_binary(exe: &Path, args: &[String]) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    // args[0] is the program name, args[1..] are the actual arguments.
+    let mut cmd = std::process::Command::new(exe);
+    if args.len() > 1 {
+        cmd.args(&args[1..]);
+    }
+    // exec replaces the process; only returns on error.
+    cmd.exec()
+}
+
+/// Watch the daemon's own binary for replacement and trigger a restart.
+///
+/// Records the initial inode of the binary. When the file at that path changes
+/// to a different inode (i.e. it was replaced, not just touched), signals shutdown
+/// with the restart flag set.
+async fn watch_binary(shutdown: Arc<Notify>, restart: Arc<AtomicBool>) -> Result<()> {
+    use anyhow::Context;
+    use notify::{Event, EventKind, RecursiveMode, Watcher};
+    use std::os::unix::fs::MetadataExt;
+
+    let exe_path = std::env::current_exe().context("failed to get current exe")?;
+    let exe_path = exe_path
+        .canonicalize()
+        .unwrap_or_else(|_| exe_path.clone());
+
+    let original_ino = std::fs::metadata(&exe_path)
+        .context("failed to stat binary")?
+        .ino();
+
+    let watch_dir = exe_path
+        .parent()
+        .context("binary has no parent directory")?
+        .to_path_buf();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut watcher = notify::RecommendedWatcher::new(
+        move |res: std::result::Result<Event, notify::Error>| {
+            if let Ok(event) = res {
+                let _ = tx.send(event);
+            }
+        },
+        notify::Config::default(),
+    )?;
+    watcher.watch(&watch_dir, RecursiveMode::NonRecursive)?;
+    tracing::info!(path = %exe_path.display(), ino = original_ino, "watching binary for replacement");
+
+    while let Some(event) = rx.recv().await {
+        let affects_exe = match event.kind {
+            EventKind::Modify(_) | EventKind::Create(_) => {
+                event.paths.iter().any(|p| p == &exe_path)
+            }
+            _ => false,
+        };
+        if !affects_exe {
+            continue;
+        }
+
+        // Small delay to let the write/rename finish
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Check if the file at our path is now a different inode
+        let Ok(meta) = std::fs::metadata(&exe_path) else {
+            continue;
+        };
+        if meta.ino() == original_ino {
+            continue;
+        }
+
+        tracing::info!(
+            path = %exe_path.display(),
+            old_ino = original_ino,
+            new_ino = meta.ino(),
+            "binary replaced, restarting daemon"
+        );
+        restart.store(true, Ordering::Relaxed);
+        shutdown.notify_one();
+        return Ok(());
+    }
+
+    Ok(())
 }
 
 /// Watch the config file for changes and hot-reload on valid updates.

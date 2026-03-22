@@ -112,6 +112,10 @@ enum Commands {
     },
     /// Update to the latest release
     SelfUpdate,
+
+    /// Print the directory layout version (used internally for upgrade cleanup)
+    #[command(hide = true)]
+    DirectoryVersion,
 }
 
 #[derive(Subcommand)]
@@ -171,7 +175,7 @@ fn try_fast_args() -> Option<FastArgs> {
         match s {
             // Subcommands and help flags → fall through to clap
             "daemon" | "shutdown" | "query" | "config" | "init" | "restart" | "status"
-            | "template" | "self-update" | "-h" | "--help" => return None,
+            | "template" | "self-update" | "directory-version" | "-h" | "--help" => return None,
             "-V" | "--version" => {
                 print_version();
                 std::process::exit(0);
@@ -542,6 +546,9 @@ fn run_clap() -> anyhow::Result<()> {
         }
         Some(Commands::SelfUpdate) => {
             self_update()?;
+        }
+        Some(Commands::DirectoryVersion) => {
+            println!("{}", daemon::DIRECTORY_VERSION);
         }
         Some(Commands::Query { repo }) => {
             run_query(repo.or(cli.repo), cf)?;
