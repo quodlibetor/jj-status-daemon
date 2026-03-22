@@ -211,7 +211,7 @@ fn query_git_status_blocking(repo_path: &Path) -> Result<RepoStatus> {
 /// Full git status query that also returns retained state for incremental updates.
 #[tracing::instrument(fields(repo = %repo_path.display()))]
 fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus, GitRepoState)> {
-    let repo = {
+    let mut repo = {
         let _span = tracing::debug_span!("git_open").entered();
         git2::Repository::open(repo_path).context("failed to open git repo")?
     };
@@ -362,6 +362,28 @@ fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus,
 
         (head_tree_oid, base_unstaged, base_total)
     };
+
+    // Ahead/behind: compare local branch to its upstream tracking branch
+    if !status.branch.is_empty()
+        && let Ok(local) = repo.find_branch(&status.branch, git2::BranchType::Local)
+        && let Ok(upstream) = local.upstream()
+        && let Some(local_oid) = local.get().target()
+        && let Some(upstream_oid) = upstream.get().target()
+        && let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, upstream_oid)
+    {
+        status.ahead = ahead as u32;
+        status.behind = behind as u32;
+    }
+
+    // Stash count
+    {
+        let mut count: u32 = 0;
+        let _ = repo.stash_foreach(|_index, _message, _oid| {
+            count += 1;
+            true
+        });
+        status.stashes = count;
+    }
 
     let repo_root = repo_path
         .canonicalize()

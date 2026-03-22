@@ -10,7 +10,12 @@
   {%- else -%}
     {{ change_id_prefix | green }}{{ change_id_rest | bright_black }}
   {%- endif -%}
-  {%- for b in bookmarks %} {{ b.display | green }}{% endfor %}
+  {%- for b in bookmarks %} {{ b.display | green }}
+    {%- if b.tracking == "ahead" %}{{ "⇡" | green }}
+    {%- elif b.tracking == "behind" %}{{ "⇣" | green }}
+    {%- elif b.tracking == "diverged" %}{{ "⇕" | red }}
+    {%- endif %}
+  {%- endfor %}
   {%- if conflict %} {{ "~" ~ total_files_changed | red }}
   {%- elif total_files_modified > 0 %} {{ "!" ~ total_files_modified | yellow }}
   {%- endif -%}
@@ -37,6 +42,9 @@
   {%- if files_changed > 0 %} {{ "!" ~ files_changed | yellow }}{% endif -%}
   {%- if untracked > 0 %} {{ "?" ~ untracked | blue }}{% endif -%}
 {%- endif -%}
+{% if behind > 0 %} {{ "⇣" ~ behind | green }}{% endif -%}
+{% if ahead > 0 %} {{ "⇡" ~ ahead | green }}{% endif -%}
+{% if stashes > 0 %} {{ "*" ~ stashes | green }}{% endif -%}
 {% if rebasing %} {{ "merge" | red }}{% endif -%}
 {% if divergent %} {{ "DIVERGENT" | red }}{% endif -%}
 {% if hidden %} {{ "HIDDEN" | yellow }}{% endif -%}

@@ -6,6 +6,10 @@
   {%- set dirty = total_files_changed > 0 -%}
   {%- if bookmarks and bookmarks[0].distance == 0 -%}
     {{ bookmarks[0].name | bright_black }}
+    {%- if bookmarks[0].tracking == "ahead" %}{{ "⇡" | cyan }}
+    {%- elif bookmarks[0].tracking == "behind" %}{{ "⇣" | cyan }}
+    {%- elif bookmarks[0].tracking == "diverged" %}{{ "⇕" | red }}
+    {%- endif %}
   {%- else -%}
     {{ change_id_prefix | bright_black }}{{ change_id_rest | bright_black }}
   {%- endif -%}
@@ -19,6 +23,9 @@
   {%- endif -%}
   {%- if dirty %}{{ "*" | magenta }}{% endif -%}
 {%- endif -%}
+{% if behind > 0 %} {{ "⇣" | cyan }}{% endif -%}
+{% if ahead > 0 %} {{ "⇡" | cyan }}{% endif -%}
+{% if stashes > 0 %} {{ "≡" | cyan }}{% endif -%}
 {% if rebasing %} {{ "rebase" | yellow }}{% endif -%}
 {% if conflict %} {{ "✖" | red }}{% endif -%}
 {% if divergent %} {{ "divergent" | red }}{% endif -%}

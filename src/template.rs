@@ -61,12 +61,31 @@ pub const PURE_FORMAT: &str = include_str!("templates/pure.tera");
 pub const NOT_READY_ASCII: &str = include_str!("templates/not_ready.tera");
 pub const NOT_READY_NERDFONT: &str = include_str!("templates/not_ready.tera");
 
+/// Tracking status of a bookmark relative to its remote counterpart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackingStatus {
+    /// No tracked remote bookmark, or not applicable (git).
+    #[default]
+    Untracked,
+    /// Local and remote point to the same commit.
+    Tracked,
+    /// Local is ahead of remote (local has commits remote doesn't).
+    Ahead,
+    /// Local is behind remote (remote has commits local doesn't).
+    Behind,
+    /// Local and remote have diverged (neither is ancestor of the other).
+    Diverged,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Bookmark {
     pub name: String,
     pub distance: u32,
     /// Pre-formatted display string: "main" or "main+2"
     pub display: String,
+    /// Tracking status relative to the remote bookmark (jj only).
+    pub tracking: TrackingStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +142,9 @@ pub struct RepoStatus {
     // git-specific
     pub branch: String,
     pub rebasing: bool,
+    pub ahead: u32,
+    pub behind: u32,
+    pub stashes: u32,
 
     // Workspace/worktree
     pub workspace_name: String,
@@ -170,6 +192,9 @@ impl Default for RepoStatus {
             immutable: false,
             branch: String::new(),
             rebasing: false,
+            ahead: 0,
+            behind: 0,
+            stashes: 0,
             workspace_name: String::new(),
             is_default_workspace: true,
             is_stale: false,
@@ -305,6 +330,9 @@ pub fn format_status(status: &RepoStatus, template: &str, color: bool) -> String
     ctx.insert("branch", &status.branch);
     ctx.insert("has_branch", &!status.branch.is_empty());
     ctx.insert("rebasing", &status.rebasing);
+    ctx.insert("ahead", &status.ahead);
+    ctx.insert("behind", &status.behind);
+    ctx.insert("stashes", &status.stashes);
 
     // Workspace/worktree
     ctx.insert("workspace_name", &status.workspace_name);
@@ -357,6 +385,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                     name: "main".into(),
                     distance: 0,
                     display: "main".into(),
+                                ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -373,6 +402,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                     name: "main".into(),
                     distance: 2,
                     display: "main+2".into(),
+                                ..Default::default()
                 }],
                 files_changed: 3,
                 lines_added: 10,
@@ -394,6 +424,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                     name: "main".into(),
                     distance: 1,
                     display: "main+1".into(),
+                                ..Default::default()
                 }],
                 files_changed: 2,
                 lines_added: 8,
@@ -417,6 +448,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                     name: "feat".into(),
                     distance: 0,
                     display: "feat".into(),
+                                ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -434,6 +466,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                     name: "main".into(),
                     distance: 1,
                     display: "main+1".into(),
+                                ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -450,6 +483,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                     name: "main".into(),
                     distance: 0,
                     display: "main".into(),
+                                ..Default::default()
                 }],
                 workspace_name: "secondary".into(),
                 is_default_workspace: false,
@@ -523,6 +557,57 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
             },
         ),
         (
+            "jj: bookmark behind remote",
+            RepoStatus {
+                is_jj: true,
+                change_id: "kpqwvxyz".into(),
+                change_id_prefix_len: 2,
+                commit_id: "tuv67890".into(),
+                empty: true,
+                bookmarks: vec![Bookmark {
+                    name: "main".into(),
+                    distance: 0,
+                    display: "main".into(),
+                    tracking: TrackingStatus::Behind,
+                }],
+                ..Default::default()
+            },
+        ),
+        (
+            "jj: bookmark diverged",
+            RepoStatus {
+                is_jj: true,
+                change_id: "lmnopqrs".into(),
+                change_id_prefix_len: 2,
+                commit_id: "wxy89012".into(),
+                empty: true,
+                bookmarks: vec![Bookmark {
+                    name: "main".into(),
+                    distance: 0,
+                    display: "main".into(),
+                    tracking: TrackingStatus::Diverged,
+                }],
+                ..Default::default()
+            },
+        ),
+        (
+            "git: ahead/behind + stash",
+            RepoStatus {
+                is_git: true,
+                branch: "feature".into(),
+                commit_id: "xyz3456".into(),
+                description: "wip".into(),
+                ahead: 3,
+                behind: 1,
+                stashes: 2,
+                files_changed: 1,
+                files_modified: 1,
+                total_files_changed: 1,
+                total_files_modified: 1,
+                ..Default::default()
+            },
+        ),
+        (
             "jj: stale (refresh error)",
             RepoStatus {
                 is_jj: true,
@@ -533,6 +618,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                     name: "main".into(),
                     distance: 0,
                     display: "main".into(),
+                                ..Default::default()
                 }],
                 is_stale: true,
                 refresh_error: "jj exited with status 1".into(),
@@ -595,6 +681,7 @@ mod tests {
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
+                        ..Default::default()
             }],
             files_changed: 3,
             lines_added: 10,
@@ -666,6 +753,7 @@ mod tests {
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
+                        ..Default::default()
             }],
             ..Default::default()
         };
@@ -710,6 +798,7 @@ format = '''
                     name: "main".into(),
                     distance: 0,
                     display: "main".into(),
+                                ..Default::default()
                 }],
                 total_files_changed: 3,
                 total_lines_added: 10,
@@ -726,11 +815,13 @@ format = '''
                         name: "feat".into(),
                         distance: 0,
                         display: "feat".into(),
+                                        ..Default::default()
                     },
                     Bookmark {
                         name: "main".into(),
                         distance: 2,
                         display: "main+2".into(),
+                                        ..Default::default()
                     },
                 ],
                 total_files_changed: 1,
@@ -798,6 +889,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
+                        ..Default::default()
             }],
             total_files_changed: 3,
             total_lines_added: 10,
@@ -868,6 +960,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
+                        ..Default::default()
             }],
             total_files_changed: 3,
             total_lines_added: 10,
@@ -942,6 +1035,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
+                        ..Default::default()
             }],
             ..Default::default()
         };
@@ -1029,6 +1123,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
+                        ..Default::default()
             }],
             ..Default::default()
         };
@@ -1075,6 +1170,7 @@ format = '''
                 name: "main".into(),
                 distance: 1,
                 display: "main+1".into(),
+                        ..Default::default()
             }],
             ..Default::default()
         };
@@ -1101,6 +1197,7 @@ format = '''
                 name: "main".into(),
                 distance: 1,
                 display: "main+1".into(),
+                        ..Default::default()
             }],
             ..Default::default()
         };
@@ -1168,6 +1265,7 @@ format = '''
                 name: "main".into(),
                 distance: 3,
                 display: "main+3".into(),
+                        ..Default::default()
             }],
             ..Default::default()
         };
@@ -1237,6 +1335,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
+                        ..Default::default()
             }],
             is_stale: true,
             refresh_error: "jj-lib error".to_string(),
@@ -1362,6 +1461,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
+                        ..Default::default()
             }],
             conflict: true,
             ..Default::default()
@@ -1443,6 +1543,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
+                        ..Default::default()
             }],
             total_files_changed: 3,
             total_files_modified: 2,
@@ -1491,6 +1592,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
+                        ..Default::default()
             }],
             total_files_changed: 2,
             total_files_modified: 2,
@@ -1538,6 +1640,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
+                        ..Default::default()
             }],
             ..Default::default()
         };
@@ -1580,6 +1683,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
+                        ..Default::default()
             }],
             total_files_changed: 3,
             total_files_modified: 3,
@@ -1598,10 +1702,245 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
+                        ..Default::default()
             }],
             ..Default::default()
         };
         let formatted = format_status(&status, PURE_FORMAT, false);
         assert_eq!(formatted, "main");
+    }
+
+    // ── ahead/behind/stash tests ────────────────────────────────────
+
+    #[test]
+    fn test_gitstatus_ahead_behind_stash() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            ahead: 3,
+            behind: 2,
+            stashes: 1,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, GITSTATUS_FORMAT, false);
+        assert_eq!(formatted, "main ⇣2 ⇡3 *1");
+    }
+
+    #[test]
+    fn test_starship_ahead_behind_stash() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            ahead: 1,
+            behind: 2,
+            stashes: 3,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, STARSHIP_FORMAT, false);
+        assert_eq!(formatted, "on  main [$3 ⇕]");
+    }
+
+    #[test]
+    fn test_starship_ahead_only() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            ahead: 5,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, STARSHIP_FORMAT, false);
+        assert_eq!(formatted, "on  main [⇡5]");
+    }
+
+    #[test]
+    fn test_ohmyzsh_ahead_behind_stash() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            ahead: 1,
+            behind: 2,
+            stashes: 1,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, OHMYZSH_FORMAT, false);
+        assert_eq!(formatted, "(main|↓2 ↑1 ⚑1)");
+    }
+
+    #[test]
+    fn test_pure_ahead_behind_stash() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            ahead: 1,
+            behind: 2,
+            stashes: 1,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, PURE_FORMAT, false);
+        assert_eq!(formatted, "main ⇣ ⇡ ≡");
+    }
+
+    #[test]
+    fn test_ascii_ahead_behind_stash() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            ahead: 3,
+            behind: 1,
+            stashes: 2,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, ASCII_FORMAT, false);
+        assert_eq!(formatted, "+- main v1 ^3 *2");
+    }
+
+    #[test]
+    fn test_nerdfont_ahead_behind() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            ahead: 5,
+            behind: 3,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, NERDFONT_FORMAT, false);
+        assert_eq!(formatted, "󰊢  main ⇣3 ⇡5");
+    }
+
+    #[test]
+    fn test_unicode_stash() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            stashes: 4,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, UNICODE_FORMAT, false);
+        assert_eq!(formatted, "± main ≡4");
+    }
+
+    #[test]
+    fn test_simple_ahead_behind() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            ahead: 2,
+            behind: 1,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, SIMPLE_FORMAT, false);
+        assert_eq!(formatted, "main ⇣ ⇡");
+    }
+
+    #[test]
+    fn test_minimal_stash() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            stashes: 2,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, MINIMAL_FORMAT, false);
+        assert_eq!(formatted, "main *");
+    }
+
+    // ── bookmark tracking status tests ──────────────────────────────
+
+    #[test]
+    fn test_ascii_jj_bookmark_ahead() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 0,
+                display: "main".into(),
+                tracking: TrackingStatus::Ahead,
+            }],
+            ..Default::default()
+        };
+        let formatted = format_status(&status, ASCII_FORMAT, false);
+        assert!(
+            formatted.contains("main^"),
+            "expected 'main^' for ahead tracking: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_ascii_jj_bookmark_behind() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 0,
+                display: "main".into(),
+                tracking: TrackingStatus::Behind,
+            }],
+            ..Default::default()
+        };
+        let formatted = format_status(&status, ASCII_FORMAT, false);
+        assert!(
+            formatted.contains("mainv"),
+            "expected 'mainv' for behind tracking: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_gitstatus_jj_bookmark_diverged() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 0,
+                display: "main".into(),
+                tracking: TrackingStatus::Diverged,
+            }],
+            ..Default::default()
+        };
+        let formatted = format_status(&status, GITSTATUS_FORMAT, false);
+        assert!(
+            formatted.contains("main⇕"),
+            "expected 'main⇕' for diverged tracking: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_pure_jj_bookmark_behind() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 0,
+                display: "main".into(),
+                tracking: TrackingStatus::Behind,
+            }],
+            ..Default::default()
+        };
+        let formatted = format_status(&status, PURE_FORMAT, false);
+        assert!(
+            formatted.contains("main⇣"),
+            "expected 'main⇣' for behind tracking: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_jj_bookmark_tracked_no_indicator() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 0,
+                display: "main".into(),
+                tracking: TrackingStatus::Tracked,
+            }],
+            ..Default::default()
+        };
+        let formatted = format_status(&status, ASCII_FORMAT, false);
+        // "Tracked" (in sync) should not show any arrow
+        assert_eq!(formatted, "JJ xlvlt main");
     }
 }

@@ -8,8 +8,14 @@
 {% set immutable_icon = "IMMUTABLE" -%}
 {% set empty_icon = "(EMPTY)" -%}
 {% set stale_icon = "STALE" -%}
+{% set ahead_icon = "^" -%}
+{% set behind_icon = "v" -%}
+{% set stash_icon = "*" -%}
 {% set files_icon = "f" -%}
 {% set lines_icon = "l" -%}
+{% set tracking_ahead = "^" -%}
+{% set tracking_behind = "v" -%}
+{% set tracking_diverged = "!" -%}
 {% set workspace_open = "/" -%}
 {% set workspace_close = "\" -%}
 {% include "detail.tera" %}

@@ -6,7 +6,12 @@
 {% if is_jj -%}
   {{ "(" | bright_black }}
   {{- change_id_prefix | bold | magenta }}{{ change_id_rest | bright_black }}
-  {%- for b in bookmarks %} {{ b.display | bold | magenta }}{% endfor %}
+  {%- for b in bookmarks %} {{ b.display | bold | magenta }}
+    {%- if b.tracking == "ahead" %}{{ "↑" }}
+    {%- elif b.tracking == "behind" %}{{ "↓" }}
+    {%- elif b.tracking == "diverged" %}{{ "↕" | red }}
+    {%- endif %}
+  {%- endfor %}
   {%- if total_files_changed > 0 or conflict -%}
     {{ "|" | bright_black }}
     {%- set need_space = false -%}
@@ -25,7 +30,7 @@
   {%- else -%}
     {{ commit_id | bold | magenta }}
   {%- endif -%}
-  {%- set any_status = staged_files_changed > 0 or files_changed > 0 or untracked > 0 or conflict -%}
+  {%- set any_status = staged_files_changed > 0 or files_changed > 0 or untracked > 0 or conflict or ahead > 0 or behind > 0 or stashes > 0 -%}
   {%- if any_status -%}
     {{ "|" | bright_black }}
     {%- set need_space = false -%}
@@ -35,6 +40,9 @@
     {%- if files_added > 0 %}{% if need_space %} {% endif %}{{ "+" ~ files_added | blue }}{% set need_space = true %}{% endif -%}
     {%- if files_deleted > 0 %}{% if need_space %} {% endif %}{{ "–" ~ files_deleted | blue }}{% set need_space = true %}{% endif -%}
     {%- if untracked > 0 %}{% if need_space %} {% endif %}{{ "…" | cyan }}{% set need_space = true %}{% endif -%}
+    {%- if behind > 0 %}{% if need_space %} {% endif %}{{ "↓" ~ behind }}{% set need_space = true %}{% endif -%}
+    {%- if ahead > 0 %}{% if need_space %} {% endif %}{{ "↑" ~ ahead }}{% set need_space = true %}{% endif -%}
+    {%- if stashes > 0 %}{% if need_space %} {% endif %}{{ "⚑" ~ stashes | bold | blue }}{% set need_space = true %}{% endif -%}
   {%- else -%}
     {{ "|" | bright_black }}{{ "✔" | bold | green }}
   {%- endif -%}

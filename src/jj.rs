@@ -25,7 +25,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::template::{Bookmark, RepoStatus};
+use crate::template::{Bookmark, RepoStatus, TrackingStatus};
 
 /// Create minimal UserSettings for read-only operations.
 fn create_user_settings() -> Result<UserSettings> {
@@ -481,6 +481,68 @@ fn is_commit_immutable(
 /// Instead of calling `local_bookmarks_for_commit` at every BFS level (which
 /// scans all bookmarks each time), we collect all bookmark target commit IDs
 /// upfront into a HashMap, then do a single ancestor walk checking membership.
+/// Classify the tracking status of a local bookmark vs its remote counterpart.
+fn classify_tracking(
+    repo: &Arc<jj_lib::repo::ReadonlyRepo>,
+    local_id: &CommitId,
+    remote_id: &CommitId,
+) -> TrackingStatus {
+    if local_id == remote_id {
+        return TrackingStatus::Tracked;
+    }
+    let index = repo.index();
+    let local_is_ancestor = index.is_ancestor(local_id, remote_id).unwrap_or(false);
+    let remote_is_ancestor = index.is_ancestor(remote_id, local_id).unwrap_or(false);
+    match (local_is_ancestor, remote_is_ancestor) {
+        (true, false) => TrackingStatus::Behind,  // local is ancestor of remote
+        (false, true) => TrackingStatus::Ahead,   // remote is ancestor of local
+        _ => TrackingStatus::Diverged,
+    }
+}
+
+/// Build a map of bookmark name → tracking status by scanning all tracked remote refs.
+fn compute_tracking_statuses(
+    repo: &Arc<jj_lib::repo::ReadonlyRepo>,
+    view: &jj_lib::view::View,
+) -> HashMap<String, TrackingStatus> {
+    let mut result: HashMap<String, TrackingStatus> = HashMap::new();
+
+    for (symbol, remote_ref) in view.all_remote_bookmarks() {
+        if !remote_ref.is_tracked() || !remote_ref.is_present() {
+            continue;
+        }
+        let Some(remote_id) = remote_ref.target.as_normal() else {
+            continue;
+        };
+        let name = symbol.name.as_str().to_string();
+        // Look up the local bookmark target
+        let local_target = view.get_local_bookmark(symbol.name);
+        let Some(local_id) = local_target.as_normal() else {
+            continue;
+        };
+        let status = classify_tracking(repo, local_id, remote_id);
+        // If multiple remotes, escalate: Diverged > Ahead/Behind > Tracked
+        result
+            .entry(name)
+            .and_modify(|existing| {
+                // Keep the "worst" status
+                match (&existing, &status) {
+                    (TrackingStatus::Diverged, _) => {}
+                    (_, TrackingStatus::Diverged) => *existing = TrackingStatus::Diverged,
+                    (TrackingStatus::Ahead, TrackingStatus::Behind)
+                    | (TrackingStatus::Behind, TrackingStatus::Ahead) => {
+                        *existing = TrackingStatus::Diverged
+                    }
+                    (TrackingStatus::Tracked, _) => *existing = status.clone(),
+                    _ => {}
+                }
+            })
+            .or_insert(status);
+    }
+
+    result
+}
+
 fn find_ancestor_bookmarks(
     repo: &Arc<jj_lib::repo::ReadonlyRepo>,
     view: &jj_lib::view::View,
@@ -498,6 +560,9 @@ fn find_ancestor_bookmarks(
         }
     }
 
+    // Compute tracking statuses for all bookmarks against their remotes
+    let tracking_statuses = compute_tracking_statuses(repo, view);
+
     let mut queue: VecDeque<(CommitId, u32)> = VecDeque::new();
     let mut visited = HashSet::new();
     let mut seen_names = HashSet::new();
@@ -507,10 +572,15 @@ fn find_ancestor_bookmarks(
     if let Some(names) = bookmark_targets.get(wc_id) {
         for name_str in names {
             if seen_names.insert(name_str.clone()) {
+                let tracking = tracking_statuses
+                    .get(name_str)
+                    .cloned()
+                    .unwrap_or_default();
                 bookmarks.push(Bookmark {
                     name: name_str.clone(),
                     distance: 0,
                     display: name_str.clone(),
+                    tracking,
                 });
             }
         }
@@ -531,10 +601,15 @@ fn find_ancestor_bookmarks(
             for name_str in names {
                 if seen_names.insert(name_str.clone()) {
                     let display = format!("{name_str}+{depth}");
+                    let tracking = tracking_statuses
+                        .get(name_str)
+                        .cloned()
+                        .unwrap_or_default();
                     bookmarks.push(Bookmark {
                         name: name_str.clone(),
                         distance: depth,
                         display,
+                        tracking,
                     });
                 }
             }

@@ -1,16 +1,20 @@
 {% if is_jj -%}
   {% if bookmarks and bookmarks[0].distance == 0 -%}
-    {% if immutable %}
+    {% if immutable -%}
       {{ bookmarks[0].name | red | bold }}
-    {% else %}
+    {%- else -%}
       {{ bookmarks[0].name | green }}
-    {% endif %}
+    {%- endif -%}
+    {%- if bookmarks[0].tracking == "ahead" %}{{ "⇡" | cyan }}
+    {%- elif bookmarks[0].tracking == "behind" %}{{ "⇣" | cyan }}
+    {%- elif bookmarks[0].tracking == "diverged" %}{{ "⇕" | bright_red }}
+    {%- endif -%}
   {%- elif description -%}
-    {% if immutable %}
+    {% if immutable -%}
       {{ description | red | bold }}
-    {% else %}
+    {%- else -%}
       {{ description | green }}
-    {% endif %}
+    {%- endif -%}
   {%- elif bookmarks and bookmarks[0].distance == 1 -%}
     {% if empty %}{{ bookmarks[0].name | green }}{% else %}{{ bookmarks[0].name | yellow }}{% endif %}
   {%- else -%}
@@ -33,6 +37,9 @@
     {%- if untracked > 0 %}{{ "?" | bright_magenta }}{% endif -%}
   {{- "]" | bright_black }}
 {%- endif -%}
+{% if behind > 0 %} {{ "⇣" | cyan }}{% endif -%}
+{% if ahead > 0 %} {{ "⇡" | cyan }}{% endif -%}
+{% if stashes > 0 %} {{ "*" | bright_blue }}{% endif -%}
 {% if not is_default_workspace %} {{ "木" | bright_green }}{% endif -%}
 {% if rebasing %} {{ "REBASING" | bright_magenta }}{% endif -%}
 {% if conflict %} {{ "CONFLICT" | bright_red }}{% endif -%}

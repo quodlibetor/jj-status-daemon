@@ -8,8 +8,14 @@
 {% set immutable_icon = "∅" -%}
 {% set empty_icon = "∅" -%}
 {% set stale_icon = "⟳" -%}
+{% set ahead_icon = "⇡" -%}
+{% set behind_icon = "⇣" -%}
+{% set stash_icon = "≡" -%}
 {% set files_icon = "▤" -%}
 {% set lines_icon = "≡" -%}
+{% set tracking_ahead = "⇡" -%}
+{% set tracking_behind = "⇣" -%}
+{% set tracking_diverged = "⇕" -%}
 {% set workspace_open = "木(" -%}
 {% set workspace_close = ")" -%}
 {% include "detail.tera" %}

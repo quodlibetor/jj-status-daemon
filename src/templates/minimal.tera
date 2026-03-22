@@ -1,6 +1,10 @@
 {% if is_jj -%}
   {% if bookmarks and bookmarks[0].distance == 0 -%}
     {{ bookmarks[0].name | green }}
+    {%- if bookmarks[0].tracking == "ahead" %}{{ "⇡" | cyan }}
+    {%- elif bookmarks[0].tracking == "behind" %}{{ "⇣" | cyan }}
+    {%- elif bookmarks[0].tracking == "diverged" %}{{ "⇕" | bright_red }}
+    {%- endif -%}
   {%- elif description -%}
     {{ description | green }}
   {%- elif bookmarks and bookmarks[0].distance == 1 -%}
@@ -25,6 +29,9 @@
     {{- ref | green }}
   {%- endif -%}
 {%- endif -%}
+{% if behind > 0 %} {{ "⇣" | cyan }}{% endif -%}
+{% if ahead > 0 %} {{ "⇡" | cyan }}{% endif -%}
+{% if stashes > 0 %} {{ "*" | bright_blue }}{% endif -%}
 {% if not is_default_workspace %} {{ "木" | bright_green }}{% endif -%}
 {% if rebasing %} {{ "REBASING" | bright_magenta }}{% endif -%}
 {% if conflict %} {{ "CONFLICT" | bright_red }}{% endif -%}

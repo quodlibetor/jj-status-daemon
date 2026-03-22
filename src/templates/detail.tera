@@ -1,7 +1,12 @@
 {# Used via include, see e.g. nerdfont.tera #}
 {% if is_jj -%}
   {{ jj_icon | magenta }} {{ change_id_prefix | magenta | bold }}{{ change_id_rest | bright_black | bold }}
-  {%- for b in bookmarks %} {{ bookmark_prefix ~ b.display | blue }}{% endfor %}
+  {%- for b in bookmarks %} {{ bookmark_prefix ~ b.display | blue }}
+    {%- if b.tracking == "ahead" %}{{ tracking_ahead | cyan }}
+    {%- elif b.tracking == "behind" %}{{ tracking_behind | cyan }}
+    {%- elif b.tracking == "diverged" %}{{ tracking_diverged | bright_red }}
+    {%- endif -%}
+  {%- endfor -%}
 {%- elif is_git -%}
   {{ git_icon | blue }} {% if has_branch %}{{ branch | blue }}{% else %}{{ "HEAD " | magenta }}{{ "(" ~ commit_id ~ ")" | green | bold }}{% endif %}
 {%- endif -%}
@@ -21,6 +26,9 @@
   {%- endif %}
   {{- "]" | blue }}
 {%- endif -%}
+{% if behind > 0 %} {{ behind_icon ~ behind | cyan }}{% endif -%}
+{% if ahead > 0 %} {{ ahead_icon ~ ahead | cyan }}{% endif -%}
+{% if stashes > 0 %} {{ stash_icon ~ stashes | bright_blue }}{% endif -%}
 {% if rebasing %} {{ rebasing_icon | bright_magenta }}{% endif -%}
 {% if conflict %} {{ conflict_icon | bright_red }}{% endif -%}
 {% if divergent %} {{ divergent_icon | bright_red }}{% endif -%}
