@@ -204,10 +204,12 @@ pub const DEFAULT_CONFIG_TOML: &str = r##"# vcs-status-daemon configuration
 # --------------------------------------------------------------------------
 # The status output is rendered using the Tera template engine (Jinja2-like).
 #
-# Built-in templates: "ascii" (default), "nerdfont", "unicode", "simple", "minimal"
+# Built-in templates: "ascii" (default), "nerdfont", "unicode", "simple", "minimal",
+#                     "gitstatus", "starship", "ohmyzsh", "pure"
 # Select one with template_name, or define your own below.
 
-# Which template to use. Built-in options: "ascii", "nerdfont", "unicode", "simple", "minimal"
+# Which template to use. Built-in options: "ascii", "nerdfont", "unicode", "simple", "minimal",
+#                                           "gitstatus", "starship", "ohmyzsh", "pure"
 # template_name = "ascii"
 
 # Override template_name with an inline format string.

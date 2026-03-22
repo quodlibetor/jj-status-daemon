@@ -34,6 +34,28 @@ pub const SIMPLE_FORMAT: &str = include_str!("templates/simple.tera");
 /// jj: `main` or `xlvlt`  git: `main`
 pub const MINIMAL_FORMAT: &str = include_str!("templates/minimal.tera");
 
+/// Built-in "gitstatus" template — clones the gitstatus / Powerlevel10k lean prompt style.
+///
+/// Colors: green=clean, yellow=modified, blue=untracked, red=conflicted.
+/// git: `main ~1 +2 !3 ?4`  jj: `xlvlt main !3 +2`
+pub const GITSTATUS_FORMAT: &str = include_str!("templates/gitstatus.tera");
+
+/// Built-in "starship" template — clones Starship's default git style.
+///
+/// git: `on  main [+1 !2 ?3]`  jj: `on  xlvlt main [!2 +1]`
+pub const STARSHIP_FORMAT: &str = include_str!("templates/starship.tera");
+
+/// Built-in "ohmyzsh" template — clones the oh-my-zsh git-prompt plugin style.
+///
+/// git: `(main|●1 ✚2 …)` or `(main|✔)` when clean
+/// jj: `(xlvlt main|✚2 +1)` or `(xlvlt main|✔)` when clean
+pub const OHMYZSH_FORMAT: &str = include_str!("templates/ohmyzsh.tera");
+
+/// Built-in "pure" template — clones sindresorhus/pure's minimal style.
+///
+/// git: `main*`  jj: `main*`  (no counts, just dirty indicator)
+pub const PURE_FORMAT: &str = include_str!("templates/pure.tera");
+
 /// Built-in "not ready" template for when the daemon hasn't cached status yet.
 /// Only color variables are available — no repo status values.
 pub const NOT_READY_ASCII: &str = include_str!("templates/not_ready.tera");
@@ -314,7 +336,10 @@ pub fn validate_template(template: &str) -> Result<(), String> {
 }
 
 /// All built-in template names, in display order.
-pub const BUILTIN_NAMES: &[&str] = &["ascii", "nerdfont", "unicode", "simple", "minimal"];
+pub const BUILTIN_NAMES: &[&str] = &[
+    "ascii", "nerdfont", "unicode", "simple", "minimal", "gitstatus", "starship", "ohmyzsh",
+    "pure",
+];
 
 /// Representative sample statuses for template previews.
 pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
@@ -525,6 +550,10 @@ pub fn builtin_template(name: &str) -> Option<&'static str> {
         "unicode" => Some(UNICODE_FORMAT),
         "simple" => Some(SIMPLE_FORMAT),
         "minimal" => Some(MINIMAL_FORMAT),
+        "gitstatus" => Some(GITSTATUS_FORMAT),
+        "starship" => Some(STARSHIP_FORMAT),
+        "ohmyzsh" => Some(OHMYZSH_FORMAT),
+        "pure" => Some(PURE_FORMAT),
         _ => None,
     }
 }
@@ -1372,5 +1401,207 @@ format = '''
             formatted.contains("caused by:"),
             "expected cause chain in error: {formatted:?}"
         );
+    }
+
+    // ── gitstatus template ──────────────────────────────────────────
+
+    #[test]
+    fn test_gitstatus_git_dirty() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            staged_files_changed: 2,
+            staged_files_added: 1,
+            staged_files_modified: 1,
+            files_changed: 3,
+            files_modified: 2,
+            files_added: 1,
+            untracked: 4,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, GITSTATUS_FORMAT, false);
+        assert_eq!(formatted, "main +2 !3 ?4");
+    }
+
+    #[test]
+    fn test_gitstatus_git_clean() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            ..Default::default()
+        };
+        let formatted = format_status(&status, GITSTATUS_FORMAT, false);
+        assert_eq!(formatted, "main");
+    }
+
+    #[test]
+    fn test_gitstatus_jj_dirty() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 0,
+                display: "main".into(),
+            }],
+            total_files_changed: 3,
+            total_files_modified: 2,
+            total_files_added: 1,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, GITSTATUS_FORMAT, false);
+        assert_eq!(formatted, "xlvlt main !2 +1");
+    }
+
+    // ── starship template ───────────────────────────────────────────
+
+    #[test]
+    fn test_starship_git_dirty() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            staged_files_added: 1,
+            staged_files_changed: 1,
+            files_modified: 2,
+            files_changed: 2,
+            untracked: 3,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, STARSHIP_FORMAT, false);
+        assert_eq!(formatted, "on  main [+1 !2 ?3]");
+    }
+
+    #[test]
+    fn test_starship_git_clean() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            ..Default::default()
+        };
+        let formatted = format_status(&status, STARSHIP_FORMAT, false);
+        assert_eq!(formatted, "on  main");
+    }
+
+    #[test]
+    fn test_starship_jj() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 0,
+                display: "main".into(),
+            }],
+            total_files_changed: 2,
+            total_files_modified: 2,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, STARSHIP_FORMAT, false);
+        assert_eq!(formatted, "on  xlvlt main [!2]");
+    }
+
+    // ── ohmyzsh template ────────────────────────────────────────────
+
+    #[test]
+    fn test_ohmyzsh_git_dirty() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            staged_files_changed: 1,
+            staged_files_modified: 1,
+            files_modified: 2,
+            files_changed: 2,
+            untracked: 1,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, OHMYZSH_FORMAT, false);
+        assert_eq!(formatted, "(main|●1 ✚2 …)");
+    }
+
+    #[test]
+    fn test_ohmyzsh_git_clean() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            ..Default::default()
+        };
+        let formatted = format_status(&status, OHMYZSH_FORMAT, false);
+        assert_eq!(formatted, "(main|✔)");
+    }
+
+    #[test]
+    fn test_ohmyzsh_jj_clean() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 0,
+                display: "main".into(),
+            }],
+            ..Default::default()
+        };
+        let formatted = format_status(&status, OHMYZSH_FORMAT, false);
+        assert_eq!(formatted, "(xlvlt main|✔)");
+    }
+
+    // ── pure template ───────────────────────────────────────────────
+
+    #[test]
+    fn test_pure_git_dirty() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            files_changed: 1,
+            files_modified: 1,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, PURE_FORMAT, false);
+        assert_eq!(formatted, "main*");
+    }
+
+    #[test]
+    fn test_pure_git_clean() {
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            ..Default::default()
+        };
+        let formatted = format_status(&status, PURE_FORMAT, false);
+        assert_eq!(formatted, "main");
+    }
+
+    #[test]
+    fn test_pure_jj_dirty() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 0,
+                display: "main".into(),
+            }],
+            total_files_changed: 3,
+            total_files_modified: 3,
+            ..Default::default()
+        };
+        let formatted = format_status(&status, PURE_FORMAT, false);
+        assert_eq!(formatted, "main*");
+    }
+
+    #[test]
+    fn test_pure_jj_clean() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                distance: 0,
+                display: "main".into(),
+            }],
+            ..Default::default()
+        };
+        let formatted = format_status(&status, PURE_FORMAT, false);
+        assert_eq!(formatted, "main");
     }
 }

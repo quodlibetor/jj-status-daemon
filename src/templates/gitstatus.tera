@@ -1,0 +1,45 @@
+{#- Clones the gitstatus / Powerlevel10k lean prompt style.
+    Format: `branch ~N +N !N ?N`
+    Colors: green=clean, yellow=modified, blue=untracked, red=conflicted.
+    Indicators: ~=conflicts, +=staged, !=unstaged, ?=untracked
+-#}
+{% if is_jj -%}
+  {% set dirty = total_files_changed > 0 -%}
+  {%- if dirty -%}
+    {{ change_id_prefix | yellow }}{{ change_id_rest | bright_black }}
+  {%- else -%}
+    {{ change_id_prefix | green }}{{ change_id_rest | bright_black }}
+  {%- endif -%}
+  {%- for b in bookmarks %} {{ b.display | green }}{% endfor %}
+  {%- if conflict %} {{ "~" ~ total_files_changed | red }}
+  {%- elif total_files_modified > 0 %} {{ "!" ~ total_files_modified | yellow }}
+  {%- endif -%}
+  {%- if total_files_added > 0 %} {{ "+" ~ total_files_added | yellow }}{% endif -%}
+  {%- if total_files_deleted > 0 %} {{ "-" ~ total_files_deleted | yellow }}{% endif -%}
+{%- elif is_git -%}
+  {%- set dirty = files_changed > 0 or staged_files_changed > 0 -%}
+  {%- set has_untracked = untracked > 0 -%}
+  {%- if has_branch -%}
+    {%- if conflict -%}
+      {{ branch | red }}
+    {%- elif dirty -%}
+      {{ branch | yellow }}
+    {%- elif has_untracked -%}
+      {{ branch | blue }}
+    {%- else -%}
+      {{ branch | green }}
+    {%- endif -%}
+  {%- else -%}
+    {{ "@" ~ commit_id | green }}
+  {%- endif -%}
+  {%- if conflict %} {{ "~" ~ total_files_changed | red }}{% endif -%}
+  {%- if staged_files_changed > 0 %} {{ "+" ~ staged_files_changed | yellow }}{% endif -%}
+  {%- if files_changed > 0 %} {{ "!" ~ files_changed | yellow }}{% endif -%}
+  {%- if untracked > 0 %} {{ "?" ~ untracked | blue }}{% endif -%}
+{%- endif -%}
+{% if rebasing %} {{ "merge" | red }}{% endif -%}
+{% if divergent %} {{ "DIVERGENT" | red }}{% endif -%}
+{% if hidden %} {{ "HIDDEN" | yellow }}{% endif -%}
+{% if empty %} {{ "(empty)" | bright_black }}{% endif -%}
+{% if is_stale %} {{ "─" | bright_black }}{% endif -%}
+{% if not is_default_workspace %} {{ workspace_name | green }}{% endif %}

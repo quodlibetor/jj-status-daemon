@@ -1,0 +1,26 @@
+{#- Clones the sindresorhus/pure zsh prompt style.
+    Format: `branch*` — branch in gray, * if dirty, action shown.
+    Intentionally minimal: no counts, no breakdown.
+-#}
+{% if is_jj -%}
+  {%- set dirty = total_files_changed > 0 -%}
+  {%- if bookmarks and bookmarks[0].distance == 0 -%}
+    {{ bookmarks[0].name | bright_black }}
+  {%- else -%}
+    {{ change_id_prefix | bright_black }}{{ change_id_rest | bright_black }}
+  {%- endif -%}
+  {%- if dirty %}{{ "*" | magenta }}{% endif -%}
+{%- elif is_git -%}
+  {%- set dirty = files_changed > 0 or staged_files_changed > 0 or untracked > 0 -%}
+  {%- if has_branch -%}
+    {{ branch | bright_black }}
+  {%- else -%}
+    {{ commit_id | bright_black }}
+  {%- endif -%}
+  {%- if dirty %}{{ "*" | magenta }}{% endif -%}
+{%- endif -%}
+{% if rebasing %} {{ "rebase" | yellow }}{% endif -%}
+{% if conflict %} {{ "✖" | red }}{% endif -%}
+{% if divergent %} {{ "divergent" | red }}{% endif -%}
+{% if hidden %} {{ "hidden" | yellow }}{% endif -%}
+{% if not is_default_workspace %} {{ workspace_name | cyan }}{% endif %}

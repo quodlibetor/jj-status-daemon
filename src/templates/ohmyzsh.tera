@@ -1,0 +1,46 @@
+{#- Clones the oh-my-zsh git-prompt plugin style.
+    Format: `(branch|●N ✚N …)` or `(branch|✔)` when clean
+    Branch: bold magenta. Indicators: ●=staged (red), ✚=changed (blue),
+    –=deleted (blue), …=untracked (cyan), ✔=clean (bold green)
+-#}
+{% if is_jj -%}
+  {{ "(" | bright_black }}
+  {{- change_id_prefix | bold | magenta }}{{ change_id_rest | bright_black }}
+  {%- for b in bookmarks %} {{ b.display | bold | magenta }}{% endfor %}
+  {%- if total_files_changed > 0 or conflict -%}
+    {{ "|" | bright_black }}
+    {%- set need_space = false -%}
+    {%- if conflict %}{{ "✖" | red }}{% set need_space = true %}{% endif -%}
+    {%- if total_files_modified > 0 %}{% if need_space %} {% endif %}{{ "✚" ~ total_files_modified | blue }}{% set need_space = true %}{% endif -%}
+    {%- if total_files_added > 0 %}{% if need_space %} {% endif %}{{ "+" ~ total_files_added | blue }}{% set need_space = true %}{% endif -%}
+    {%- if total_files_deleted > 0 %}{% if need_space %} {% endif %}{{ "–" ~ total_files_deleted | blue }}{% set need_space = true %}{% endif -%}
+  {%- else -%}
+    {{ "|" | bright_black }}{{ "✔" | bold | green }}
+  {%- endif -%}
+  {{ ")" | bright_black }}
+{%- elif is_git -%}
+  {{ "(" | bright_black }}
+  {%- if has_branch -%}
+    {{ branch | bold | magenta }}
+  {%- else -%}
+    {{ commit_id | bold | magenta }}
+  {%- endif -%}
+  {%- set any_status = staged_files_changed > 0 or files_changed > 0 or untracked > 0 or conflict -%}
+  {%- if any_status -%}
+    {{ "|" | bright_black }}
+    {%- set need_space = false -%}
+    {%- if staged_files_changed > 0 %}{{ "●" ~ staged_files_changed | red }}{% set need_space = true %}{% endif -%}
+    {%- if conflict %}{% if need_space %} {% endif %}{{ "✖" | red }}{% set need_space = true %}{% endif -%}
+    {%- if files_modified > 0 %}{% if need_space %} {% endif %}{{ "✚" ~ files_modified | blue }}{% set need_space = true %}{% endif -%}
+    {%- if files_added > 0 %}{% if need_space %} {% endif %}{{ "+" ~ files_added | blue }}{% set need_space = true %}{% endif -%}
+    {%- if files_deleted > 0 %}{% if need_space %} {% endif %}{{ "–" ~ files_deleted | blue }}{% set need_space = true %}{% endif -%}
+    {%- if untracked > 0 %}{% if need_space %} {% endif %}{{ "…" | cyan }}{% set need_space = true %}{% endif -%}
+  {%- else -%}
+    {{ "|" | bright_black }}{{ "✔" | bold | green }}
+  {%- endif -%}
+  {{ ")" | bright_black }}
+{%- endif -%}
+{% if rebasing %} {{ "rebase" | yellow }}{% endif -%}
+{% if divergent %} {{ "DIVERGENT" | red }}{% endif -%}
+{% if hidden %} {{ "HIDDEN" | yellow }}{% endif -%}
+{% if not is_default_workspace %} {{ workspace_name | green }}{% endif %}
