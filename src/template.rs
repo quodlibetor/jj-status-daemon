@@ -365,7 +365,14 @@ pub fn validate_template(template: &str) -> Result<(), String> {
 
 /// All built-in template names, in display order.
 pub const BUILTIN_NAMES: &[&str] = &[
-    "ascii", "nerdfont", "unicode", "simple", "minimal", "gitstatus", "starship", "ohmyzsh",
+    "ascii",
+    "nerdfont",
+    "unicode",
+    "simple",
+    "minimal",
+    "gitstatus",
+    "starship",
+    "ohmyzsh",
     "pure",
 ];
 
@@ -385,7 +392,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                     name: "main".into(),
                     distance: 0,
                     display: "main".into(),
-                                ..Default::default()
+                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -402,7 +409,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                     name: "main".into(),
                     distance: 2,
                     display: "main+2".into(),
-                                ..Default::default()
+                    ..Default::default()
                 }],
                 files_changed: 3,
                 lines_added: 10,
@@ -424,7 +431,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                     name: "main".into(),
                     distance: 1,
                     display: "main+1".into(),
-                                ..Default::default()
+                    ..Default::default()
                 }],
                 files_changed: 2,
                 lines_added: 8,
@@ -448,7 +455,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                     name: "feat".into(),
                     distance: 0,
                     display: "feat".into(),
-                                ..Default::default()
+                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -466,7 +473,7 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                     name: "main".into(),
                     distance: 1,
                     display: "main+1".into(),
-                                ..Default::default()
+                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -483,10 +490,62 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                     name: "main".into(),
                     distance: 0,
                     display: "main".into(),
-                                ..Default::default()
+                    ..Default::default()
                 }],
                 workspace_name: "secondary".into(),
                 is_default_workspace: false,
+                ..Default::default()
+            },
+        ),
+        (
+            "jj: bookmark behind remote",
+            RepoStatus {
+                is_jj: true,
+                change_id: "kpqwvxyz".into(),
+                change_id_prefix_len: 2,
+                commit_id: "tuv67890".into(),
+                empty: true,
+                bookmarks: vec![Bookmark {
+                    name: "main".into(),
+                    distance: 0,
+                    display: "main".into(),
+                    tracking: TrackingStatus::Behind,
+                }],
+                ..Default::default()
+            },
+        ),
+        (
+            "jj: bookmark diverged",
+            RepoStatus {
+                is_jj: true,
+                change_id: "lmnopqrs".into(),
+                change_id_prefix_len: 2,
+                commit_id: "wxy89012".into(),
+                empty: true,
+                bookmarks: vec![Bookmark {
+                    name: "main".into(),
+                    distance: 0,
+                    display: "main".into(),
+                    tracking: TrackingStatus::Diverged,
+                }],
+                ..Default::default()
+            },
+        ),
+        (
+            "jj: stale (refresh error)",
+            RepoStatus {
+                is_jj: true,
+                change_id: "xlvltmpk".into(),
+                change_id_prefix_len: 2,
+                commit_id: "abc12345".into(),
+                bookmarks: vec![Bookmark {
+                    name: "main".into(),
+                    distance: 0,
+                    display: "main".into(),
+                    ..Default::default()
+                }],
+                is_stale: true,
+                refresh_error: "jj exited with status 1".into(),
                 ..Default::default()
             },
         ),
@@ -557,40 +616,6 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
             },
         ),
         (
-            "jj: bookmark behind remote",
-            RepoStatus {
-                is_jj: true,
-                change_id: "kpqwvxyz".into(),
-                change_id_prefix_len: 2,
-                commit_id: "tuv67890".into(),
-                empty: true,
-                bookmarks: vec![Bookmark {
-                    name: "main".into(),
-                    distance: 0,
-                    display: "main".into(),
-                    tracking: TrackingStatus::Behind,
-                }],
-                ..Default::default()
-            },
-        ),
-        (
-            "jj: bookmark diverged",
-            RepoStatus {
-                is_jj: true,
-                change_id: "lmnopqrs".into(),
-                change_id_prefix_len: 2,
-                commit_id: "wxy89012".into(),
-                empty: true,
-                bookmarks: vec![Bookmark {
-                    name: "main".into(),
-                    distance: 0,
-                    display: "main".into(),
-                    tracking: TrackingStatus::Diverged,
-                }],
-                ..Default::default()
-            },
-        ),
-        (
             "git: ahead/behind + stash",
             RepoStatus {
                 is_git: true,
@@ -604,24 +629,6 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
                 files_modified: 1,
                 total_files_changed: 1,
                 total_files_modified: 1,
-                ..Default::default()
-            },
-        ),
-        (
-            "jj: stale (refresh error)",
-            RepoStatus {
-                is_jj: true,
-                change_id: "xlvltmpk".into(),
-                change_id_prefix_len: 2,
-                commit_id: "abc12345".into(),
-                bookmarks: vec![Bookmark {
-                    name: "main".into(),
-                    distance: 0,
-                    display: "main".into(),
-                                ..Default::default()
-                }],
-                is_stale: true,
-                refresh_error: "jj exited with status 1".into(),
                 ..Default::default()
             },
         ),
@@ -681,7 +688,7 @@ mod tests {
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             files_changed: 3,
             lines_added: 10,
@@ -753,7 +760,7 @@ mod tests {
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -798,7 +805,7 @@ format = '''
                     name: "main".into(),
                     distance: 0,
                     display: "main".into(),
-                                ..Default::default()
+                    ..Default::default()
                 }],
                 total_files_changed: 3,
                 total_lines_added: 10,
@@ -815,13 +822,13 @@ format = '''
                         name: "feat".into(),
                         distance: 0,
                         display: "feat".into(),
-                                        ..Default::default()
+                        ..Default::default()
                     },
                     Bookmark {
                         name: "main".into(),
                         distance: 2,
                         display: "main+2".into(),
-                                        ..Default::default()
+                        ..Default::default()
                     },
                 ],
                 total_files_changed: 1,
@@ -889,7 +896,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             total_files_changed: 3,
             total_lines_added: 10,
@@ -960,7 +967,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             total_files_changed: 3,
             total_lines_added: 10,
@@ -1035,7 +1042,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1123,7 +1130,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1170,7 +1177,7 @@ format = '''
                 name: "main".into(),
                 distance: 1,
                 display: "main+1".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1197,7 +1204,7 @@ format = '''
                 name: "main".into(),
                 distance: 1,
                 display: "main+1".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1265,7 +1272,7 @@ format = '''
                 name: "main".into(),
                 distance: 3,
                 display: "main+3".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1335,7 +1342,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             is_stale: true,
             refresh_error: "jj-lib error".to_string(),
@@ -1461,7 +1468,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             conflict: true,
             ..Default::default()
@@ -1543,7 +1550,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             total_files_changed: 3,
             total_files_modified: 2,
@@ -1592,7 +1599,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             total_files_changed: 2,
             total_files_modified: 2,
@@ -1640,7 +1647,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1683,7 +1690,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             total_files_changed: 3,
             total_files_modified: 3,
@@ -1702,7 +1709,7 @@ format = '''
                 name: "main".into(),
                 distance: 0,
                 display: "main".into(),
-                        ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };

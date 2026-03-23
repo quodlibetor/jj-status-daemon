@@ -808,6 +808,42 @@ enum RepoRefreshState {
     Pending(VcsKind, bool, Vec<PathBuf>),
 }
 
+impl RepoRefreshState {
+    /// Coalesce a new event into the current state.
+    ///
+    /// A VCS-internal event (`!working_copy_changed`) forces a full refresh by
+    /// clearing accumulated paths, because operations like rebase invalidate
+    /// the incremental state (parent tree, base status, etc.).
+    /// Returns true if a full refresh was forced (VCS-internal event present).
+    fn coalesce(
+        &mut self,
+        vcs_kind: VcsKind,
+        working_copy_changed: bool,
+        changed_paths: Vec<PathBuf>,
+    ) -> bool {
+        match self {
+            RepoRefreshState::InFlight => {
+                *self = RepoRefreshState::Pending(vcs_kind, working_copy_changed, changed_paths);
+                !working_copy_changed
+            }
+            RepoRefreshState::Pending(_, wc, paths) => {
+                if !working_copy_changed || !*wc {
+                    // Either the new event or the already-pending event is
+                    // VCS-internal — force full refresh. Incremental state is
+                    // invalid after operations like rebase that change parent
+                    // tree/bookmarks.
+                    *wc = false;
+                    paths.clear();
+                    true
+                } else {
+                    paths.extend(changed_paths);
+                    false
+                }
+            }
+        }
+    }
+}
+
 /// Channel message sent when a per-repo refresh task completes.
 struct RefreshDone {
     repo_path: PathBuf,
@@ -826,6 +862,13 @@ async fn refresh_repo(
     done_tx: mpsc::UnboundedSender<RefreshDone>,
 ) {
     let refresh_start = Instant::now();
+    tracing::debug!(
+        repo = %repo_path.display(),
+        vcs = ?vcs_kind,
+        working_copy_changed,
+        changed_paths = changed_paths.len(),
+        "refresh starting"
+    );
     let (config, cd) = {
         let mut st = state.lock().await;
         st.refreshing.insert(repo_path.clone());
@@ -859,14 +902,20 @@ async fn refresh_repo(
                 Ok(Ok(status)) => (Ok(status), true),
                 Ok(Err(_)) => {
                     // No incremental state — fall back to full refresh
-                    (jj_full_refresh(&repo_path, &config, &jj_worker).await, false)
+                    (
+                        jj_full_refresh(&repo_path, &config, &jj_worker).await,
+                        false,
+                    )
                 }
                 Err(_) => (Err(anyhow::anyhow!("jj worker channel closed")), false),
             }
         }
         VcsKind::Jj => {
             // VCS-internal event or no paths — full refresh
-            (jj_full_refresh(&repo_path, &config, &jj_worker).await, false)
+            (
+                jj_full_refresh(&repo_path, &config, &jj_worker).await,
+                false,
+            )
         }
         VcsKind::Git if working_copy_changed && !changed_paths.is_empty() => {
             // Try incremental update via git worker
@@ -892,12 +941,20 @@ async fn refresh_repo(
     };
 
     match result {
-        Ok(status) => {
+        Ok(ref status) => {
+            tracing::debug!(
+                repo = %repo_path.display(),
+                elapsed_ms = refresh_start.elapsed().as_millis() as u64,
+                incremental = was_incremental,
+                change_id = %status.change_id,
+                files_changed = status.files_changed,
+                "refresh complete"
+            );
             let mut st = state.lock().await;
-            let formatted = st.format(&status);
+            let formatted = st.format(status);
             write_cache_file(&cd, &repo_path, &formatted);
             st.refreshing.remove(&repo_path);
-            st.update_cache(&repo_path, status, formatted);
+            st.update_cache(&repo_path, status.clone(), formatted);
             record_refresh_timing(&mut st.stats, refresh_start.elapsed(), was_incremental);
         }
         Err(e) => {
@@ -1001,10 +1058,7 @@ fn maybe_clean_runtime_dir(new_exe: &Path, runtime_dir: &Path) {
         Ok(o) if o.status.success() => o,
         _ => return,
     };
-    let new_version: u32 = match String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-    {
+    let new_version: u32 = match String::from_utf8_lossy(&output.stdout).trim().parse() {
         Ok(v) => v,
         Err(_) => return,
     };
@@ -1060,9 +1114,7 @@ async fn watch_binary(shutdown: Arc<Notify>, restart: Arc<AtomicBool>) -> Result
     use std::os::unix::fs::MetadataExt;
 
     let exe_path = std::env::current_exe().context("failed to get current exe")?;
-    let exe_path = exe_path
-        .canonicalize()
-        .unwrap_or_else(|_| exe_path.clone());
+    let exe_path = exe_path.canonicalize().unwrap_or_else(|_| exe_path.clone());
 
     let original_meta = std::fs::metadata(&exe_path).context("failed to stat binary")?;
     let original_ino = original_meta.ino();
@@ -1273,16 +1325,18 @@ async fn refresh_task(
                                 ));
                             }
                             Some(entry) => {
-                                // Refresh already running — queue a re-refresh.
-                                // working_copy_changed=true wins; accumulate paths.
-                                match entry {
-                                    RepoRefreshState::InFlight => {
-                                        *entry = RepoRefreshState::Pending(vcs_kind, working_copy_changed, changed_paths);
-                                    }
-                                    RepoRefreshState::Pending(_, wc, paths) => {
-                                        *wc = *wc || working_copy_changed;
-                                        paths.extend(changed_paths);
-                                    }
+                                let forced_full = entry.coalesce(vcs_kind, working_copy_changed, changed_paths);
+                                if forced_full {
+                                    tracing::debug!(
+                                        repo = %repo_path.display(),
+                                        "VCS-internal event coalesced — forcing full refresh"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        repo = %repo_path.display(),
+                                        working_copy_changed,
+                                        "event coalesced while refresh in-flight"
+                                    );
                                 }
                             }
                         }
@@ -1337,6 +1391,98 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::process::Command;
     use tokio::time::Duration;
+
+    // --- RepoRefreshState::coalesce unit tests ---
+
+    #[test]
+    fn test_coalesce_inflight_to_wc_event() {
+        let mut state = RepoRefreshState::InFlight;
+        let paths = vec![PathBuf::from("/repo/file.txt")];
+        state.coalesce(VcsKind::Jj, true, paths.clone());
+        match &state {
+            RepoRefreshState::Pending(_, wc, p) => {
+                assert!(*wc);
+                assert_eq!(p, &paths);
+            }
+            _ => panic!("expected Pending"),
+        }
+    }
+
+    #[test]
+    fn test_coalesce_inflight_to_vcs_internal_event() {
+        let mut state = RepoRefreshState::InFlight;
+        state.coalesce(VcsKind::Jj, false, vec![]);
+        match &state {
+            RepoRefreshState::Pending(_, wc, p) => {
+                assert!(!*wc);
+                assert!(p.is_empty());
+            }
+            _ => panic!("expected Pending"),
+        }
+    }
+
+    #[test]
+    fn test_coalesce_wc_then_wc_accumulates() {
+        // Two working-copy events: paths should accumulate
+        let mut state =
+            RepoRefreshState::Pending(VcsKind::Jj, true, vec![PathBuf::from("/repo/a.txt")]);
+        state.coalesce(VcsKind::Jj, true, vec![PathBuf::from("/repo/b.txt")]);
+        match &state {
+            RepoRefreshState::Pending(_, wc, paths) => {
+                assert!(*wc);
+                assert_eq!(paths.len(), 2);
+            }
+            _ => panic!("expected Pending"),
+        }
+    }
+
+    #[test]
+    fn test_coalesce_wc_then_vcs_internal_forces_full() {
+        // Working-copy event pending, then VCS-internal arrives (e.g. rebase
+        // completes while file event is queued) — must force full refresh
+        let mut state =
+            RepoRefreshState::Pending(VcsKind::Jj, true, vec![PathBuf::from("/repo/a.txt")]);
+        state.coalesce(VcsKind::Jj, false, vec![]);
+        match &state {
+            RepoRefreshState::Pending(_, wc, paths) => {
+                assert!(!*wc, "should force full refresh (wc=false)");
+                assert!(paths.is_empty(), "should clear paths for full refresh");
+            }
+            _ => panic!("expected Pending"),
+        }
+    }
+
+    #[test]
+    fn test_coalesce_vcs_internal_then_wc_forces_full() {
+        // VCS-internal event pending, then working-copy event arrives (e.g.
+        // rebase rewrites files after op_heads update) — must still force
+        // full refresh because incremental state is stale
+        let mut state = RepoRefreshState::Pending(VcsKind::Jj, false, vec![]);
+        state.coalesce(VcsKind::Jj, true, vec![PathBuf::from("/repo/a.txt")]);
+        match &state {
+            RepoRefreshState::Pending(_, wc, paths) => {
+                assert!(!*wc, "should force full refresh (wc=false)");
+                assert!(paths.is_empty(), "should clear paths for full refresh");
+            }
+            _ => panic!("expected Pending"),
+        }
+    }
+
+    #[test]
+    fn test_coalesce_vcs_internal_then_vcs_internal_stays_full() {
+        // Two VCS-internal events — still a full refresh
+        let mut state = RepoRefreshState::Pending(VcsKind::Jj, false, vec![]);
+        state.coalesce(VcsKind::Jj, false, vec![]);
+        match &state {
+            RepoRefreshState::Pending(_, wc, paths) => {
+                assert!(!*wc);
+                assert!(paths.is_empty());
+            }
+            _ => panic!("expected Pending"),
+        }
+    }
+
+    // --- Existing tests ---
 
     #[test]
     fn test_find_repo_root() {
