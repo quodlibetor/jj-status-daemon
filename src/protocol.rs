@@ -18,6 +18,9 @@ pub enum Request {
     Shutdown,
     DaemonStatus,
     Version,
+    SetLogFilter {
+        filter: String,
+    },
 }
 
 impl Request {

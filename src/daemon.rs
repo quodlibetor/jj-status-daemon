@@ -10,6 +10,9 @@ use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::time::{Duration, Instant};
 
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::reload;
+
+pub type LogFilterHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
 use crate::config::Config;
 use crate::git::{GitWorkerRequest, query_git_status, spawn_git_worker};
@@ -38,6 +41,8 @@ struct DaemonState {
     config_error: Option<String>,
     /// Path to the config file, for explicit reload requests.
     config_file: Option<PathBuf>,
+    /// Handle for dynamically changing the log filter at runtime.
+    log_filter_handle: LogFilterHandle,
 }
 
 impl DaemonState {
@@ -89,8 +94,7 @@ pub const DIRECTORY_VERSION: u32 = 1;
 /// Number of recent query durations to keep for percentile stats.
 const TIMING_RING_SIZE: usize = 100;
 
-pub fn init_logging(runtime_dir: &Path) {
-    use tracing_subscriber::Layer;
+pub fn init_logging(runtime_dir: &Path) -> LogFilterHandle {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -110,12 +114,13 @@ pub fn init_logging(runtime_dir: &Path) {
     let filter =
         EnvFilter::try_from_env("VCS_STATUS_DAEMON_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
 
+    let (filter, reload_handle) = reload::Layer::new(filter);
+
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(file_appender)
-        .with_ansi(false)
-        .with_filter(filter);
+        .with_ansi(false);
 
-    let registry = tracing_subscriber::registry().with(fmt_layer);
+    let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
 
     #[cfg(feature = "tokio-console")]
     {
@@ -127,6 +132,8 @@ pub fn init_logging(runtime_dir: &Path) {
     {
         registry.init();
     }
+
+    reload_handle
 }
 
 pub async fn run_daemon(
@@ -137,6 +144,7 @@ pub async fn run_daemon(
     config_file: Option<PathBuf>,
     // Initial config/template error to display (e.g. from startup parse failure).
     initial_config_error: Option<String>,
+    log_filter_handle: LogFilterHandle,
 ) -> Result<()> {
     let socket_path = runtime_dir.join("sock");
     let cache_dir = runtime_dir.join("cache");
@@ -209,6 +217,7 @@ pub async fn run_daemon(
         cache_watch: HashMap::new(),
         config_error: startup_config_error,
         config_file: config_file.clone(),
+        log_filter_handle,
     }));
 
     // Recover watchers from cache files left by a previous daemon instance.
@@ -654,6 +663,38 @@ async fn handle_connection(
                 },
             )
             .await
+        }
+        Request::SetLogFilter { filter } => {
+            let new_filter = match EnvFilter::try_new(&filter) {
+                Ok(f) => f,
+                Err(e) => {
+                    return send_response(
+                        &mut writer,
+                        Response::Error {
+                            message: format!("invalid filter \"{filter}\": {e}"),
+                        },
+                    )
+                    .await;
+                }
+            };
+            let st = state.lock().await;
+            match st.log_filter_handle.reload(new_filter) {
+                Ok(()) => {
+                    tracing::info!(filter = %filter, "log filter updated");
+                    drop(st);
+                    send_response(&mut writer, Response::Ok).await
+                }
+                Err(e) => {
+                    drop(st);
+                    send_response(
+                        &mut writer,
+                        Response::Error {
+                            message: format!("failed to reload filter: {e}"),
+                        },
+                    )
+                    .await
+                }
+            }
         }
     }
 }
@@ -1383,6 +1424,41 @@ fn handle_refresh_done(
     }
 }
 
+/// Create a log filter handle for tests (not attached to a global subscriber).
+#[cfg(test)]
+fn test_log_filter_handle() -> LogFilterHandle {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let filter = EnvFilter::new("off");
+    let (filter_layer, handle) = reload::Layer::new(filter);
+    let _subscriber = tracing_subscriber::registry().with(filter_layer);
+    handle
+}
+
+/// Convenience wrapper for tests: calls `run_daemon` with no config file, no
+/// startup error, and a dummy log-filter handle.
+#[cfg(test)]
+pub async fn run_daemon_for_test(config: Config, runtime_dir: PathBuf) -> Result<()> {
+    run_daemon(config, runtime_dir, None, None, test_log_filter_handle()).await
+}
+
+/// Like `run_daemon_for_test` but with a config file for hot-reload testing.
+#[cfg(test)]
+pub async fn run_daemon_for_test_with_config(
+    config: Config,
+    runtime_dir: PathBuf,
+    config_file: PathBuf,
+) -> Result<()> {
+    run_daemon(
+        config,
+        runtime_dir,
+        Some(config_file),
+        None,
+        test_log_filter_handle(),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1620,7 +1696,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
 
         let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
         assert!(!formatted.is_empty(), "expected non-empty status");
@@ -1642,7 +1718,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
 
         let query = Request::Query {
             repo_path: dir.path().to_string_lossy().to_string(),
@@ -1686,7 +1762,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
 
         // Query from a subdirectory — daemon should resolve the repo root
         let formatted = query_until_ready(&socket_path, &sub.to_string_lossy()).await;
@@ -1720,7 +1796,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
 
         // Query from the subdirectory and wait for cache to populate
         let formatted = query_until_ready(&socket_path, &sub.to_string_lossy()).await;
@@ -1768,7 +1844,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
         wait_for_socket(&socket_path).await;
 
         let resp = send_request(
@@ -1800,7 +1876,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
         wait_for_socket(&socket_path).await;
 
         let resp = send_request(&socket_path, &Request::Shutdown).await;
@@ -1822,7 +1898,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
 
         // Query to populate the cache
         let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
@@ -1931,7 +2007,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
 
         let dir = create_jj_repo().await;
         let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
@@ -1951,7 +2027,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
 
         // Make sure daemon is running and serving
         let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
@@ -1987,7 +2063,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
 
         // First query — wait for cache to populate
         let first = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
@@ -2030,7 +2106,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
 
         let formatted = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
         assert!(
@@ -2074,7 +2150,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
 
         // Round 1: initial queries — wait for cache to populate
         let path_a = dir_a.path().to_string_lossy().to_string();
@@ -2225,7 +2301,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
         wait_for_socket(&socket_path).await;
 
         let query = Request::test_query(dir.path().to_string_lossy().to_string());
@@ -2259,7 +2335,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
 
         // Populate the cache with a successful status
         let first = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
@@ -2302,7 +2378,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
 
         // Populate cache
         let first = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
@@ -2368,7 +2444,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
 
         // Populate cache
         let first = query_until_ready(&socket_path, &dir.path().to_string_lossy()).await;
@@ -2408,7 +2484,7 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
         wait_for_socket(&socket_path).await;
 
         let query = Request::test_query(dir.path().to_string_lossy().to_string());
@@ -2439,11 +2515,10 @@ mod tests {
         .unwrap();
 
         let config = crate::config::load_config_from(Some(&config_file)).unwrap();
-        let daemon = tokio::spawn(run_daemon(
+        let daemon = tokio::spawn(run_daemon_for_test_with_config(
             config,
             rt.path().to_path_buf(),
-            Some(config_file.clone()),
-            None,
+            config_file.clone(),
         ));
 
         // Wait for initial status with "before:" prefix
@@ -2489,11 +2564,10 @@ mod tests {
         .unwrap();
 
         let config = crate::config::load_config_from(Some(&config_file)).unwrap();
-        let daemon = tokio::spawn(run_daemon(
+        let daemon = tokio::spawn(run_daemon_for_test_with_config(
             config,
             rt.path().to_path_buf(),
-            Some(config_file.clone()),
-            None,
+            config_file.clone(),
         ));
 
         // Wait for initial status

@@ -197,6 +197,23 @@ pub fn reload_config() -> Result<()> {
     Ok(())
 }
 
+pub fn set_log_filter(filter: &str) -> Result<()> {
+    let socket_path = config::socket_path()?;
+    let response = send_request_slow(
+        &socket_path,
+        &Request::SetLogFilter {
+            filter: filter.to_string(),
+        },
+    )
+    .context("failed to send set-log-filter (is the daemon running?)")?;
+
+    match response {
+        Response::Ok => Ok(()),
+        Response::Error { message } => anyhow::bail!("{message}"),
+        _ => anyhow::bail!("unexpected response from daemon"),
+    }
+}
+
 pub fn shutdown() -> Result<()> {
     let socket_path = config::socket_path()?;
     let response =
@@ -381,7 +398,6 @@ pub fn status() -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::daemon::run_daemon;
     use crate::test_util::{create_jj_repo_async as create_jj_repo, wait_for_socket};
     use tempfile::TempDir;
     use tokio::process::Command;
@@ -397,7 +413,10 @@ mod tests {
             ..Default::default()
         };
 
-        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let _daemon = tokio::spawn(crate::daemon::run_daemon_for_test(
+            config,
+            rt.path().to_path_buf(),
+        ));
         wait_for_socket(&socket_path).await;
 
         // Retry loop: the daemon returns NotReady until jj-lib finishes the
@@ -444,7 +463,10 @@ mod tests {
             ..Default::default()
         };
 
-        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let _daemon = tokio::spawn(crate::daemon::run_daemon_for_test(
+            config,
+            rt.path().to_path_buf(),
+        ));
         wait_for_socket(&socket_path).await;
 
         // Send DaemonStatus request directly via the socket
@@ -541,7 +563,10 @@ mod tests {
             ..Default::default()
         };
 
-        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let _daemon = tokio::spawn(crate::daemon::run_daemon_for_test(
+            config,
+            rt.path().to_path_buf(),
+        ));
         wait_for_socket(&socket_path).await;
 
         // Calling start_daemon when daemon is already running should be a no-op.
@@ -574,7 +599,10 @@ mod tests {
             ..Default::default()
         };
 
-        let _daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let _daemon = tokio::spawn(crate::daemon::run_daemon_for_test(
+            config,
+            rt.path().to_path_buf(),
+        ));
         wait_for_socket(&socket_path).await;
 
         // Daemon should write a version file on startup
@@ -604,7 +632,10 @@ mod tests {
             ..Default::default()
         };
 
-        let daemon = tokio::spawn(run_daemon(config, rt.path().to_path_buf(), None, None));
+        let daemon = tokio::spawn(crate::daemon::run_daemon_for_test(
+            config,
+            rt.path().to_path_buf(),
+        ));
         wait_for_socket(&socket_path).await;
         assert!(version_path.exists());
 

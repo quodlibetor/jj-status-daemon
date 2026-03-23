@@ -494,8 +494,8 @@ fn classify_tracking(
     let local_is_ancestor = index.is_ancestor(local_id, remote_id).unwrap_or(false);
     let remote_is_ancestor = index.is_ancestor(remote_id, local_id).unwrap_or(false);
     match (local_is_ancestor, remote_is_ancestor) {
-        (true, false) => TrackingStatus::Behind,  // local is ancestor of remote
-        (false, true) => TrackingStatus::Ahead,   // remote is ancestor of local
+        (true, false) => TrackingStatus::Behind, // local is ancestor of remote
+        (false, true) => TrackingStatus::Ahead,  // remote is ancestor of local
         _ => TrackingStatus::Diverged,
     }
 }
@@ -572,10 +572,7 @@ fn find_ancestor_bookmarks(
     if let Some(names) = bookmark_targets.get(wc_id) {
         for name_str in names {
             if seen_names.insert(name_str.clone()) {
-                let tracking = tracking_statuses
-                    .get(name_str)
-                    .cloned()
-                    .unwrap_or_default();
+                let tracking = tracking_statuses.get(name_str).cloned().unwrap_or_default();
                 bookmarks.push(Bookmark {
                     name: name_str.clone(),
                     distance: 0,
@@ -601,10 +598,7 @@ fn find_ancestor_bookmarks(
             for name_str in names {
                 if seen_names.insert(name_str.clone()) {
                     let display = format!("{name_str}+{depth}");
-                    let tracking = tracking_statuses
-                        .get(name_str)
-                        .cloned()
-                        .unwrap_or_default();
+                    let tracking = tracking_statuses.get(name_str).cloned().unwrap_or_default();
                     bookmarks.push(Bookmark {
                         name: name_str.clone(),
                         distance: depth,

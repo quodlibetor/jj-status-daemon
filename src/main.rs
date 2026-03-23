@@ -117,6 +117,12 @@ enum Commands {
         check: bool,
     },
 
+    /// Change the daemon's log filter at runtime (e.g. "debug", "vcs_status_daemon=trace")
+    SetLogFilter {
+        /// Filter directive (e.g. "debug", "info", "vcs_status_daemon=trace")
+        filter: String,
+    },
+
     /// Print the directory layout version (used internally for upgrade cleanup)
     #[command(hide = true)]
     DirectoryVersion,
@@ -179,7 +185,8 @@ fn try_fast_args() -> Option<FastArgs> {
         match s {
             // Subcommands and help flags → fall through to clap
             "daemon" | "shutdown" | "query" | "config" | "init" | "restart" | "status"
-            | "template" | "self-update" | "directory-version" | "-h" | "--help" => return None,
+            | "template" | "self-update" | "set-log-filter" | "directory-version" | "-h"
+            | "--help" => return None,
             "-V" | "--version" => {
                 print_version();
                 std::process::exit(0);
@@ -561,7 +568,7 @@ fn run_clap() -> anyhow::Result<()> {
                 Some(d) => d,
                 None => config::runtime_dir()?,
             };
-            daemon::init_logging(&runtime_dir);
+            let log_filter_handle = daemon::init_logging(&runtime_dir);
             // Daemon's own --config-file takes priority over the top-level one
             let daemon_cf = config_file.as_deref().or(cf);
             let (config, config_err) = match config::load_config_from(daemon_cf) {
@@ -583,6 +590,7 @@ fn run_clap() -> anyhow::Result<()> {
                 runtime_dir,
                 watch_cf,
                 config_err,
+                log_filter_handle,
             ))?;
             // Bound the shutdown: don't wait forever for in-flight spawn_blocking
             // tasks (e.g. jj-lib refresh) when the daemon is exiting.
@@ -605,6 +613,10 @@ fn run_clap() -> anyhow::Result<()> {
         }
         Some(Commands::Template { action }) => {
             run_template(action)?;
+        }
+        Some(Commands::SetLogFilter { filter }) => {
+            client::set_log_filter(&filter)?;
+            eprintln!("Log filter set to: {filter}");
         }
         Some(Commands::SelfUpdate { check }) => {
             self_update(check)?;
