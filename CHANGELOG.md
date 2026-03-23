@@ -1,3 +1,44 @@
+# v0.0.9
+
+Richer status information, seamless upgrades, and better observability.
+
+**Richer status output**
+- **ahead/behind and stash counts**: git repos now show ahead/behind
+  counts (via `graph_ahead_behind`) and stash count. Jj repos show
+  per-bookmark tracking status (tracked/ahead/behind/sideways) using
+  index-based ancestor checks. All 9 templates updated with indicators.
+- **built-in templates cloning popular prompts**: new `gitstatus`
+  (Powerlevel10k lean), `starship`, `ohmyzsh`, and `pure` template
+  presets.
+- **renamed diff fields for clarity**: `files_changed` → `file_mad_count`,
+  unstaged fields gain `_working_tree` suffix, staged/total prefixes
+  moved to suffixes (e.g. `lines_added_staged`). `TrackingStatus::Diverged`
+  renamed to `Sideways`.
+
+**Seamless upgrades**
+- **self-update subcommand**: `self-update` downloads the latest release
+  via `curl | sh`. `self-update --check` queries GitHub for the latest
+  version without installing.
+- **auto-restart on binary replacement**: the daemon watches its own
+  executable and automatically exec's the new version when replaced.
+- **SIGHUP restart**: sending SIGHUP to the daemon triggers a restart,
+  useful for post-install scripts.
+- **version logged at startup**: the daemon logs its version and git hash
+  on startup for upgrade traceability.
+
+**Observability and operations**
+- **set-log-filter command**: dynamically change the daemon's log level
+  at runtime.
+- **notification timing metrics**: the `status` subcommand now shows
+  full vs incremental refresh counts.
+- **remove idle shutdown**: the daemon no longer exits after a period of
+  inactivity. The `idle_timeout_secs` config key is removed.
+
+**Bug fixes**
+- **fix coalesced VCS-internal events**: when a VCS-internal event
+  arrived while an incremental refresh was pending, it was absorbed
+  without forcing a full refresh — now fixed.
+
 # v0.0.8
 
 - **expanded templating**: many new template variables available —

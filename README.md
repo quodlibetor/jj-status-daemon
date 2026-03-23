@@ -9,25 +9,17 @@ A background daemon that pre-caches [Jujutsu](https://github.com/jj-vcs/jj) and 
 
 VCS tools like `jj` and `git` can be slow in large repositories. Shell prompt integrations that call them on every prompt add noticeable latency. This daemon watches for repository changes via filesystem notifications and keeps a formatted status string in memory, ready to serve instantly — giving you a single, fast status tool for both Jujutsu and Git repos.
 
-## Architecture
+## Featrues
 
-```
-Shell prompt calls:   vcs-status-daemon         (client mode, the default)
-                          |
-                          | connects to Unix domain socket
-                          v
-                      vcs-status-daemon daemon   (background server)
-                          |
-                          +-- detects VCS type (jj wins if both .jj/ and .git/ exist)
-                          +-- watches repo via filesystem notifications (notify)
-                          +-- on change: shells out to jj or git, caches formatted status
-                          +-- serves cached text to clients instantly
-```
-
-- **Single binary, two modes**: `daemon` (background server) and default (client/query)
-- **Auto-start**: the client spawns the daemon automatically if it's not running
-- **Multi-repo**: the daemon tracks multiple repositories, each with its own filesystem watcher
-- **Dual VCS**: supports both jj and git repositories, with jj taking priority when both are present
+* Daemon pre-renders templates and writes them to a cache, fully formatted
+  status is read into an env var by the shell integration.
+* Very fast (~2ms when run as a binary, microseconds with shell integration)
+  prompt display for both git and jujutsu.
+* Several built-in themes, including clones of several popular ones.
+* Write your on themes in tera, a Jinja-like templating language. (Take
+  inspiration from the [src/templates](./src/templates) directory.)
+* Works well with starship since the fully rendered template can be displayed
+  directly by the env_var module.
 
 ## Installation
 
@@ -125,12 +117,26 @@ format = "$env_value "
 
 The exact output is configured via [tera templates](https://keats.github.io/tera/docs/#templates).
 
+You can set any named template with `vcs-status-daemon config set template_name NAME`.
+
 There are several built-in templates that you can view with the
 `vcs-status-daemon template list` command:
 
-![template list output](static/template-list.png)
+`vcs-status-daemon` detailed templates which include line counts in addition to
+file counts:
+<img alt="detailed templates" src="static/templates-detailed.png" width="400" />
 
-You can set any named template with `vcs-status-daemon config set template_name NAME`.
+`vcs-status-daemon` simple templates which just use color and minimal symbols
+to represent the status:
+
+<img alt="simple templates" src="./static/templates-simple.png" width="400" />
+
+Clones of templates from [gitstatus](https://github.com/romkatv/gitstatus),
+[starship](https://starship.rs/),
+[oh-my-zsh](https://github.com/ohmyzsh/ohmyzsh/blob/master/plugins/git-prompt/README.md),
+and [pure](https://github.com/factcondenser/pure-prompt):
+
+<img alt="cloned prompts" src="./static/templates-imitations.png" width="400" />
 
 And see "Format templates" and "Configuration" below to write your own.
 
@@ -463,6 +469,28 @@ format = '''
 ```
 
 ## How it works
+
+### Architecture
+
+```
+Shell prompt calls:   vcs-status-daemon         (client mode, the default)
+                          |
+                          | connects to Unix domain socket
+                          v
+                      vcs-status-daemon daemon   (background server)
+                          |
+                          +-- detects VCS type (jj wins if both .jj/ and .git/ exist)
+                          +-- watches repo via filesystem notifications (notify)
+                          +-- on change: shells out to jj or git, caches formatted status
+                          +-- serves cached text to clients instantly
+```
+
+- **Single binary, two modes**: `daemon` (background server) and default (client/query)
+- **Auto-start**: the client spawns the daemon automatically if it's not running
+- **Multi-repo**: the daemon tracks multiple repositories, each with its own filesystem watcher
+- **Dual VCS**: supports both jj and git repositories, with jj taking priority when both are present
+
+### Step by step
 
 1. **Client** connects to the daemon's Unix domain socket. If the daemon isn't running, the client spawns it as a detached background process and retries.
 
