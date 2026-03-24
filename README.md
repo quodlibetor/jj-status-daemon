@@ -121,6 +121,8 @@ Built in templates are defined in [src/templates](./src/templates), you can use 
 and define new ones in your config file via `vcs-status-daemon config edit`.
 
 You can set any named template with `vcs-status-daemon config set template_name NAME`.
+And you can view the source code defining a template with the
+`vcs-status-daemon template print NAME` command.
 
 There are several built-in templates that you can view with the
 `vcs-status-daemon template list` command:
@@ -182,7 +184,9 @@ vcs-status-daemon config edit    # open config in $EDITOR
 vcs-status-daemon config path    # print config file path
 
 # Preview templates
-vcs-status-daemon template list              # show all built-in templates with sample output
+vcs-status-daemon template list              # show all templates with sample output
+vcs-status-daemon template list -n           # list just template names
+vcs-status-daemon template print ascii       # print raw template source (includes inlined)
 vcs-status-daemon template format "{{ change_id }}"  # test a custom template
 ```
 
@@ -394,6 +398,8 @@ minimal = "{{ commit_id }} {{ description }}"
 ```
 
 User templates take priority over built-in ones — you can override `ascii` or `nerdfont` with your own version.
+
+Use `vcs-status-daemon template print <name>` to view the raw source of any template (includes are inlined automatically). This is a good starting point for writing your own.
 
 The built-in `ascii`, `nerdfont`, and `unicode` templates all share the same body (`detail.tera`) and differ only in their icon constants. You can use the same pattern in your own templates — set icon variables with `{% set %}` and then `{% include "detail.tera" %}`:
 

@@ -632,6 +632,11 @@ pub fn sample_statuses() -> Vec<(&'static str, RepoStatus)> {
     ]
 }
 
+/// Inline `{% include "detail.tera" %}` directives with the actual template source.
+pub fn inline_includes(template: &str) -> String {
+    template.replace(r#"{% include "detail.tera" %}"#, DETAIL_FORMAT)
+}
+
 /// Look up a built-in template by name.
 pub fn builtin_template(name: &str) -> Option<&'static str> {
     match name {

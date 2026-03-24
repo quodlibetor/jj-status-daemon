@@ -130,8 +130,12 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum TemplateAction {
-    /// List all built-in templates with representative outputs
-    List,
+    /// List available templates with representative outputs
+    List {
+        /// Print only template names, one per line
+        #[arg(short = 'n', long)]
+        name_only: bool,
+    },
     /// Render a template with representative examples and the current repo
     Format {
         /// Template format string (Tera/Jinja2 syntax)
@@ -139,6 +143,13 @@ enum TemplateAction {
         /// Path to a repository to show live status
         #[arg(long)]
         repo: Option<PathBuf>,
+    },
+    /// Print the raw Tera template source (includes are inlined).
+    /// Use `template list -n` to see available template names.
+    Print {
+        /// Template name (e.g. "ascii", "nerdfont", or a user-defined name).
+        /// Run `template list -n` to see available names.
+        name: String,
     },
 }
 
@@ -415,13 +426,46 @@ fn run_template(action: TemplateAction) -> anyhow::Result<()> {
     let color = std::io::IsTerminal::is_terminal(&std::io::stderr());
 
     match action {
-        TemplateAction::List => {
-            for name in template::BUILTIN_NAMES {
-                let tmpl = template::builtin_template(name).unwrap();
-                eprintln!("\x1b[1m{name}\x1b[0m:");
-                print_template_samples(tmpl, color);
-                eprintln!();
+        TemplateAction::List { name_only } => {
+            let cfg = config::load_config()?;
+            let mut user_names: Vec<&str> = cfg.templates.keys().map(|s| s.as_str()).collect();
+            user_names.sort();
+
+            if name_only {
+                for name in template::BUILTIN_NAMES {
+                    println!("{name}");
+                }
+                for name in &user_names {
+                    println!("{name}");
+                }
+            } else {
+                for name in template::BUILTIN_NAMES {
+                    let tmpl = template::builtin_template(name).unwrap();
+                    eprintln!("\x1b[1m{name}\x1b[0m:");
+                    print_template_samples(tmpl, color);
+                    eprintln!();
+                }
+                for name in &user_names {
+                    let tmpl = &cfg.templates[*name];
+                    eprintln!("\x1b[1m{name}\x1b[0m (user-defined):");
+                    print_template_samples(tmpl, color);
+                    eprintln!();
+                }
             }
+        }
+        TemplateAction::Print { name } => {
+            // Match daemon resolution order: user-defined templates first, then builtins
+            let cfg = config::load_config()?;
+            let tmpl = if let Some(user_tmpl) = cfg.templates.get(&name) {
+                user_tmpl.clone()
+            } else if let Some(builtin) = template::builtin_template(&name) {
+                builtin.to_string()
+            } else {
+                anyhow::bail!(
+                    "unknown template: {name}\nRun `vcs-status-daemon template list -n` to see available names."
+                );
+            };
+            print!("{}", template::inline_includes(&tmpl));
         }
         TemplateAction::Format {
             template: tmpl,
