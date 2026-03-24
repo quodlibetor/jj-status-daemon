@@ -91,7 +91,11 @@ enum Commands {
     /// Restart the daemon (graceful shutdown, then start)
     Restart,
     /// Show daemon status (running, PID, uptime, watched repos)
-    Status,
+    Status {
+        /// Show per-directory incremental diff breakdown
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Print shell integration code (use with eval)
     Init {
         /// Shell to generate code for
@@ -646,8 +650,8 @@ fn run_clap() -> anyhow::Result<()> {
         Some(Commands::Restart) => {
             client::restart(cf)?;
         }
-        Some(Commands::Status) => {
-            client::status()?;
+        Some(Commands::Status { verbose }) => {
+            client::status(verbose)?;
         }
         Some(Commands::Init { shell, starship }) => {
             init::run(&shell, starship)?;

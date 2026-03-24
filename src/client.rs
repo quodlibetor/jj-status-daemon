@@ -269,16 +269,18 @@ fn fmt_features(features: &[String]) -> String {
     }
 }
 
-pub fn status() -> Result<()> {
+pub fn status(verbose: bool) -> Result<()> {
     let socket_path = config::socket_path()?;
     let pid_path = config::pid_path()?;
 
-    match send_request_slow(&socket_path, &Request::DaemonStatus) {
+    match send_request_slow(&socket_path, &Request::DaemonStatus { verbose }) {
         Ok(Response::DaemonStatus {
             pid,
             uptime_secs,
             watched_repos,
             stats,
+            incremental_diff_stats,
+            dir_diff_stats,
         }) => {
             let hours = uptime_secs / 3600;
             let mins = (uptime_secs % 3600) / 60;
@@ -361,6 +363,40 @@ pub fn status() -> Result<()> {
                     eprintln!(
                         "  {label} timing (last {len}): p50={p50:.1}ms p95={p95:.1}ms p99={p99:.1}ms max={max:.1}ms"
                     );
+                }
+            }
+
+            if !incremental_diff_stats.is_empty() {
+                eprintln!();
+                eprintln!("  incremental diff state:");
+                for (repo, ids) in &incremental_diff_stats {
+                    eprintln!(
+                        "    {repo}: {files}f +{add}-{rem} (base:{base} overlay:{overlay})",
+                        files = ids.files_changed,
+                        add = ids.lines_added,
+                        rem = ids.lines_removed,
+                        base = ids.base_files,
+                        overlay = ids.overlay_entries,
+                    );
+                    // Show per-directory breakdown if verbose
+                    if let Some((_, dir_stats)) = dir_diff_stats.iter().find(|(r, _)| r == repo) {
+                        for (dir, ds) in dir_stats {
+                            if ds.files_changed == 0
+                                && ds.base_files == 0
+                                && ds.overlay_entries == 0
+                            {
+                                continue;
+                            }
+                            eprintln!(
+                                "      {dir}: {files}f +{add}-{rem} (base:{base} overlay:{overlay})",
+                                files = ds.files_changed,
+                                add = ds.lines_added,
+                                rem = ds.lines_removed,
+                                base = ds.base_files,
+                                overlay = ds.overlay_entries,
+                            );
+                        }
+                    }
                 }
             }
 
@@ -471,10 +507,12 @@ mod tests {
 
         // Send DaemonStatus request directly via the socket
         let sp = socket_path.clone();
-        let result = tokio::task::spawn_blocking(move || send_request(&sp, &Request::DaemonStatus))
-            .await
-            .unwrap()
-            .unwrap();
+        let result = tokio::task::spawn_blocking(move || {
+            send_request(&sp, &Request::DaemonStatus { verbose: false })
+        })
+        .await
+        .unwrap()
+        .unwrap();
 
         match result {
             Response::DaemonStatus {
@@ -482,6 +520,7 @@ mod tests {
                 uptime_secs,
                 watched_repos,
                 stats,
+                ..
             } => {
                 assert!(pid > 0);
                 assert!(uptime_secs < 10); // just started
@@ -507,9 +546,11 @@ mod tests {
 
         // No daemon started — send_request should fail
         let sp = socket_path.clone();
-        let result = tokio::task::spawn_blocking(move || send_request(&sp, &Request::DaemonStatus))
-            .await
-            .unwrap();
+        let result = tokio::task::spawn_blocking(move || {
+            send_request(&sp, &Request::DaemonStatus { verbose: false })
+        })
+        .await
+        .unwrap();
 
         assert!(result.is_err());
     }
@@ -525,9 +566,11 @@ mod tests {
 
         // No daemon running — send_request should fail
         let sp = socket_path.clone();
-        let result = tokio::task::spawn_blocking(move || send_request(&sp, &Request::DaemonStatus))
-            .await
-            .unwrap();
+        let result = tokio::task::spawn_blocking(move || {
+            send_request(&sp, &Request::DaemonStatus { verbose: false })
+        })
+        .await
+        .unwrap();
 
         assert!(result.is_err());
         // But the pidfile still exists (stale)

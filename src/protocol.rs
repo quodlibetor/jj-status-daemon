@@ -16,7 +16,10 @@ pub enum Request {
     Flush,
     ReloadConfig,
     Shutdown,
-    DaemonStatus,
+    DaemonStatus {
+        #[serde(default)]
+        verbose: bool,
+    },
     Version,
     SetLogFilter {
         filter: String,
@@ -51,6 +54,13 @@ pub enum Response {
         uptime_secs: u64,
         watched_repos: Vec<String>,
         stats: DaemonStats,
+        /// Per-repo incremental diff overlay stats (repo path → stats).
+        #[serde(default)]
+        incremental_diff_stats: Vec<(String, IncrementalDiffStats)>,
+        /// Per-repo per-directory breakdown (only populated when verbose=true).
+        /// Outer vec: (repo_path, vec of (dir_path, stats)).
+        #[serde(default)]
+        dir_diff_stats: Vec<(String, Vec<(String, IncrementalDiffStats)>)>,
     },
     Version {
         version: String,
@@ -68,6 +78,24 @@ pub fn version_info() -> (String, String, Vec<String>) {
         features.push("tokio-console".to_string());
     }
     (version, git_hash, features)
+}
+
+/// Per-repo per-directory verbose stats: `Vec<(repo_path, Vec<(dir, stats)>)>`.
+pub type VerboseDirStats = Vec<(String, Vec<(String, IncrementalDiffStats)>)>;
+
+/// Per-repo incremental diff overlay statistics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct IncrementalDiffStats {
+    /// Files with diff stats from the last full refresh.
+    pub base_files: u32,
+    /// Files updated incrementally since the last full refresh (overlay entries).
+    pub overlay_entries: u32,
+    /// Current aggregated file count (files with changes).
+    pub files_changed: u32,
+    /// Current aggregated lines added.
+    pub lines_added: u32,
+    /// Current aggregated lines removed.
+    pub lines_removed: u32,
 }
 
 /// Performance statistics collected by the daemon.

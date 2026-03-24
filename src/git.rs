@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::jj::{
     DiffCounts, FileChangeKind, FileDiffStats, abs_to_repo_relative, aggregate_overlay_stats,
+    aggregate_overlay_stats_by_dir,
 };
 use crate::template::RepoStatus;
 
@@ -427,6 +428,14 @@ pub enum GitWorkerRequest {
         changed_paths: Vec<PathBuf>,
         reply: tokio::sync::oneshot::Sender<Result<RepoStatus>>,
     },
+    /// Query current overlay stats for all repos.
+    QueryOverlayStats {
+        reply: tokio::sync::oneshot::Sender<Vec<(String, crate::protocol::IncrementalDiffStats)>>,
+    },
+    /// Query per-directory overlay stats for all repos.
+    QueryOverlayStatsVerbose {
+        reply: tokio::sync::oneshot::Sender<crate::protocol::VerboseDirStats>,
+    },
 }
 
 /// Spawn a dedicated blocking thread that owns git2 Repository state.
@@ -471,6 +480,39 @@ pub fn spawn_git_worker() -> mpsc::UnboundedSender<GitWorkerRequest> {
                     state.update_files(&changed_paths);
                     let status = state.current_status();
                     let _ = reply.send(Ok(status));
+                }
+                GitWorkerRequest::QueryOverlayStats { reply } => {
+                    let stats: Vec<_> = states
+                        .iter()
+                        .map(|(path, state)| {
+                            let counts =
+                                aggregate_overlay_stats(&state.base_total, &state.total_overlay);
+                            (
+                                path.to_string_lossy().to_string(),
+                                crate::protocol::IncrementalDiffStats {
+                                    base_files: state.base_total.len() as u32,
+                                    overlay_entries: state.total_overlay.len() as u32,
+                                    files_changed: counts.file_mad_count,
+                                    lines_added: counts.lines_added,
+                                    lines_removed: counts.lines_removed,
+                                },
+                            )
+                        })
+                        .collect();
+                    let _ = reply.send(stats);
+                }
+                GitWorkerRequest::QueryOverlayStatsVerbose { reply } => {
+                    let stats: Vec<_> = states
+                        .iter()
+                        .map(|(path, state)| {
+                            let dir_stats = aggregate_overlay_stats_by_dir(
+                                &state.base_total,
+                                &state.total_overlay,
+                            );
+                            (path.to_string_lossy().to_string(), dir_stats)
+                        })
+                        .collect();
+                    let _ = reply.send(stats);
                 }
             }
         }

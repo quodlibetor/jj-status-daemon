@@ -43,6 +43,9 @@ struct DaemonState {
     config_file: Option<PathBuf>,
     /// Handle for dynamically changing the log filter at runtime.
     log_filter_handle: LogFilterHandle,
+    /// Worker senders for querying overlay stats.
+    jj_worker: Option<mpsc::UnboundedSender<JjWorkerRequest>>,
+    git_worker: Option<mpsc::UnboundedSender<GitWorkerRequest>>,
 }
 
 impl DaemonState {
@@ -205,6 +208,9 @@ pub async fn run_daemon(
     let (watch_tx, watch_rx) = mpsc::unbounded_channel();
     let shutdown = Arc::new(Notify::new());
 
+    let jj_worker = spawn_jj_worker();
+    let git_worker = spawn_git_worker();
+
     let state = Arc::new(Mutex::new(DaemonState {
         cache: HashMap::new(),
         watchers: HashMap::new(),
@@ -218,6 +224,8 @@ pub async fn run_daemon(
         config_error: startup_config_error,
         config_file: config_file.clone(),
         log_filter_handle,
+        jj_worker: Some(jj_worker.clone()),
+        git_worker: Some(git_worker.clone()),
     }));
 
     // Recover watchers from cache files left by a previous daemon instance.
@@ -227,7 +235,7 @@ pub async fn run_daemon(
     recover_watchers_from_cache(&cache_dir, &state, &watch_tx).await;
 
     // Spawn refresh task
-    tokio::spawn(refresh_task(state.clone(), watch_rx));
+    tokio::spawn(refresh_task(state.clone(), watch_rx, jj_worker, git_worker));
 
     // Spawn log rotation task
     let log_dir = runtime_dir.clone();
@@ -626,7 +634,7 @@ async fn handle_connection(
             shutdown.notify_one();
             Ok(())
         }
-        Request::DaemonStatus => {
+        Request::DaemonStatus { verbose } => {
             let st = state.lock().await;
             let watched_repos = st
                 .watchers
@@ -640,7 +648,58 @@ async fn handle_connection(
                 .values()
                 .map(|w| w.ignored_events.load(std::sync::atomic::Ordering::Relaxed))
                 .sum();
+            let jj_w = st.jj_worker.clone();
+            let git_w = st.git_worker.clone();
             drop(st);
+
+            // Query workers for current overlay stats
+            let mut incremental_diff_stats = Vec::new();
+            if let Some(ref jj) = jj_w {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if jj
+                    .send(JjWorkerRequest::QueryOverlayStats { reply: tx })
+                    .is_ok()
+                    && let Ok(jj_stats) = rx.await
+                {
+                    incremental_diff_stats.extend(jj_stats);
+                }
+            }
+            if let Some(ref git) = git_w {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if git
+                    .send(GitWorkerRequest::QueryOverlayStats { reply: tx })
+                    .is_ok()
+                    && let Ok(git_stats) = rx.await
+                {
+                    incremental_diff_stats.extend(git_stats);
+                }
+            }
+
+            // Query per-directory breakdown if verbose
+            let mut dir_diff_stats = Vec::new();
+            if verbose {
+                if let Some(jj) = jj_w {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    if jj
+                        .send(JjWorkerRequest::QueryOverlayStatsVerbose { reply: tx })
+                        .is_ok()
+                        && let Ok(jj_stats) = rx.await
+                    {
+                        dir_diff_stats.extend(jj_stats);
+                    }
+                }
+                if let Some(git) = git_w {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    if git
+                        .send(GitWorkerRequest::QueryOverlayStatsVerbose { reply: tx })
+                        .is_ok()
+                        && let Ok(git_stats) = rx.await
+                    {
+                        dir_diff_stats.extend(git_stats);
+                    }
+                }
+            }
+
             send_response(
                 &mut writer,
                 Response::DaemonStatus {
@@ -648,6 +707,8 @@ async fn handle_connection(
                     uptime_secs,
                     watched_repos,
                     stats,
+                    incremental_diff_stats,
+                    dir_diff_stats,
                 },
             )
             .await
@@ -1286,12 +1347,12 @@ async fn watch_config_file(config_path: PathBuf, state: Arc<Mutex<DaemonState>>)
 async fn refresh_task(
     state: Arc<Mutex<DaemonState>>,
     mut watch_rx: mpsc::UnboundedReceiver<WatchEvent>,
+    jj_worker: mpsc::UnboundedSender<JjWorkerRequest>,
+    git_worker: mpsc::UnboundedSender<GitWorkerRequest>,
 ) {
     // Per-repo concurrency control: at most one refresh per repo at a time.
     let mut in_flight: HashMap<PathBuf, RepoRefreshState> = HashMap::new();
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<RefreshDone>();
-    let jj_worker = spawn_jj_worker();
-    let git_worker = spawn_git_worker();
 
     loop {
         tokio::select! {

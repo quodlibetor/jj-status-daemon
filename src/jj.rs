@@ -167,6 +167,77 @@ pub fn aggregate_overlay_stats(
     counts
 }
 
+/// Like `aggregate_overlay_stats` but groups results by directory.
+///
+/// Returns a vec of `(directory, IncrementalDiffStats)` sorted by directory name.
+/// The root directory is represented as `"."`.
+pub fn aggregate_overlay_stats_by_dir(
+    base: &HashMap<String, FileDiffStats>,
+    overlay: &HashMap<String, Option<FileDiffStats>>,
+) -> Vec<(String, crate::protocol::IncrementalDiffStats)> {
+    use std::collections::BTreeMap;
+
+    let mut dirs: BTreeMap<String, crate::protocol::IncrementalDiffStats> = BTreeMap::new();
+
+    fn dir_of(path: &str) -> &str {
+        match path.rfind('/') {
+            Some(i) => &path[..i],
+            None => ".",
+        }
+    }
+
+    fn tally_file(
+        acc: &mut crate::protocol::IncrementalDiffStats,
+        stats: &FileDiffStats,
+        is_base: bool,
+        is_overlay: bool,
+    ) {
+        if is_base {
+            acc.base_files += 1;
+        }
+        if is_overlay {
+            acc.overlay_entries += 1;
+        }
+        if stats.kind != FileChangeKind::Untracked
+            && (stats.lines_added > 0 || stats.lines_removed > 0)
+        {
+            acc.files_changed += 1;
+            acc.lines_added += stats.lines_added;
+            acc.lines_removed += stats.lines_removed;
+        }
+    }
+
+    // Process base entries
+    for (path, stats) in base {
+        let dir = dir_of(path);
+        let acc = dirs.entry(dir.to_string()).or_default();
+        match overlay.get(path) {
+            Some(Some(overlay_stats)) => tally_file(acc, overlay_stats, true, true),
+            Some(None) => {
+                acc.base_files += 1;
+                acc.overlay_entries += 1;
+            }
+            None => tally_file(acc, stats, true, false),
+        }
+    }
+
+    // Process overlay entries not in base
+    for (path, entry) in overlay {
+        if base.contains_key(path) {
+            continue;
+        }
+        let dir = dir_of(path);
+        let acc = dirs.entry(dir.to_string()).or_default();
+        if let Some(stats) = entry {
+            tally_file(acc, stats, false, true);
+        } else {
+            acc.overlay_entries += 1;
+        }
+    }
+
+    dirs.into_iter().collect()
+}
+
 impl JjRepoState {
     fn aggregate_stats(&self) -> DiffCounts {
         aggregate_overlay_stats(&self.base_file_stats, &self.overlay)
@@ -806,6 +877,14 @@ pub enum JjWorkerRequest {
         changed_paths: Vec<PathBuf>,
         reply: tokio::sync::oneshot::Sender<Result<RepoStatus>>,
     },
+    /// Query current overlay stats for all repos.
+    QueryOverlayStats {
+        reply: tokio::sync::oneshot::Sender<Vec<(String, crate::protocol::IncrementalDiffStats)>>,
+    },
+    /// Query per-directory overlay stats for all repos.
+    QueryOverlayStatsVerbose {
+        reply: tokio::sync::oneshot::Sender<crate::protocol::VerboseDirStats>,
+    },
 }
 
 /// Spawn a dedicated blocking thread that owns !Send jj-lib state.
@@ -883,6 +962,36 @@ async fn jj_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
 
                 let status = state.current_status();
                 let _ = reply.send(Ok(status));
+            }
+            JjWorkerRequest::QueryOverlayStats { reply } => {
+                let stats: Vec<_> = states
+                    .iter()
+                    .map(|(path, state)| {
+                        let counts = state.aggregate_stats();
+                        (
+                            path.to_string_lossy().to_string(),
+                            crate::protocol::IncrementalDiffStats {
+                                base_files: state.base_file_stats.len() as u32,
+                                overlay_entries: state.overlay.len() as u32,
+                                files_changed: counts.file_mad_count,
+                                lines_added: counts.lines_added,
+                                lines_removed: counts.lines_removed,
+                            },
+                        )
+                    })
+                    .collect();
+                let _ = reply.send(stats);
+            }
+            JjWorkerRequest::QueryOverlayStatsVerbose { reply } => {
+                let stats: Vec<_> = states
+                    .iter()
+                    .map(|(path, state)| {
+                        let dir_stats =
+                            aggregate_overlay_stats_by_dir(&state.base_file_stats, &state.overlay);
+                        (path.to_string_lossy().to_string(), dir_stats)
+                    })
+                    .collect();
+                let _ = reply.send(stats);
             }
         }
     }
