@@ -77,6 +77,18 @@ eval "$(vcs-status-daemon init bash)"
 PS1='\w ${VCS_STATUS}\$ '
 ```
 
+```fish
+# config.fish
+vcs-status-daemon init fish | source
+set -g fish_prompt_vcs_status '$VCS_STATUS '
+```
+
+```nu
+# config.nu (paste the output, or save to a file and source it)
+# vcs-status-daemon init nu | save -f ~/.cache/vcs-status-daemon.nu
+# source ~/.cache/vcs-status-daemon.nu
+```
+
 #### With starship
 
 ```zsh
@@ -87,6 +99,17 @@ eval "$(vcs-status-daemon init zsh --starship)"
 ```bash
 # .bashrc
 eval "$(vcs-status-daemon init bash --starship)"
+```
+
+```fish
+# config.fish
+vcs-status-daemon init fish --starship | source
+```
+
+```nu
+# config.nu
+# vcs-status-daemon init nu --starship | save -f ~/.cache/vcs-status-daemon.nu
+# source ~/.cache/vcs-status-daemon.nu
 ```
 
 The `--starship` flag warns if it can't find your `starship.toml` or if it's missing the `[env_var.VCS_STATUS]` section. Add this to your `starship.toml`:
@@ -156,32 +179,19 @@ And see "Format templates" and "Configuration" below to write your own.
 # Query status for the current directory (default, auto-starts daemon)
 vcs-status-daemon
 
-# Query a specific path
-vcs-status-daemon query --repo /path/to/repo
+# Generate shell integration code (sets $VCS_STATUS before each prompt)
+vcs-status-daemon init (zsh|bash|fish|nu) [--starship]
 
-# Start the daemon explicitly
-vcs-status-daemon daemon
-
-# Start the daemon with a custom runtime directory
-vcs-status-daemon daemon --dir /tmp/my-daemon
-
-# Shut down the daemon
-vcs-status-daemon shutdown
+# Manage config
+vcs-status-daemon config set  K=V  # set a config value
+vcs-status-daemon config edit      # open config in $EDITOR, with
+vcs-status-daemon config path      # print config file path
 
 # Restart the daemon (graceful shutdown + restart)
 vcs-status-daemon restart
 
 # Show daemon status (running, PID, uptime, watched repos)
 vcs-status-daemon status
-
-# Generate shell integration code (sets $VCS_STATUS before each prompt)
-vcs-status-daemon init zsh [--starship]
-vcs-status-daemon init bash [--starship]
-
-# Manage config
-vcs-status-daemon config init    # write default config file
-vcs-status-daemon config edit    # open config in $EDITOR
-vcs-status-daemon config path    # print config file path
 
 # Preview templates
 vcs-status-daemon template list              # show all templates with sample output

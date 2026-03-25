@@ -6,12 +6,16 @@ use std::path::PathBuf;
 pub enum Shell {
     Zsh,
     Bash,
+    Fish,
+    Nu,
 }
 
 pub fn run(shell: &Shell, starship: bool) -> Result<()> {
     let hook = match shell {
         Shell::Zsh => ZSH_HOOK,
         Shell::Bash => BASH_HOOK,
+        Shell::Fish => FISH_HOOK,
+        Shell::Nu => NU_HOOK,
     };
     print!("{hook}");
 
@@ -47,6 +51,29 @@ const BASH_HOOK: &str = r#"_vcs_status_precmd() {
   fi
 }
 PROMPT_COMMAND="_vcs_status_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+"#;
+
+const NU_HOOK: &str = r#"$env.config = ($env.config | upsert hooks.pre_prompt ($env.config.hooks.pre_prompt | append {||
+    let dir = if "VCS_STATUS_DAEMON_DIR" in $env { $env.VCS_STATUS_DAEMON_DIR } else { $"/tmp/vcs-status-daemon-($env.USER)" }
+    let cache = $"($dir)/cache/((pwd | path expand | str replace --all '/' '%'))"
+    if ($cache | path exists) {
+        $env.VCS_STATUS = (open --raw $cache | str trim)
+    } else {
+        $env.VCS_STATUS = (vcs-status-daemon | str trim)
+    }
+}))
+"#;
+
+const FISH_HOOK: &str = r#"function _vcs_status_precmd --on-event fish_prompt
+  set -l dir (set -q VCS_STATUS_DAEMON_DIR; and echo $VCS_STATUS_DAEMON_DIR; or echo /tmp/vcs-status-daemon-$USER)
+  set -l cwd (pwd -P)
+  set -l cache "$dir/cache/"(string replace -a / % $cwd)
+  if test -f "$cache"
+    set -gx VCS_STATUS (cat "$cache")
+  else
+    set -gx VCS_STATUS (vcs-status-daemon)
+  end
+end
 "#;
 
 fn find_starship_config() -> Option<PathBuf> {
