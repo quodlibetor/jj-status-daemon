@@ -12,7 +12,7 @@ mod watcher;
 
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 fn format_version_info(version: &str, git_hash: &str, features: &[String]) -> String {
     let features_str = if features.is_empty() {
@@ -701,7 +701,7 @@ fn run_clap() -> anyhow::Result<()> {
             client::status(verbose)?;
         }
         Some(Commands::Init { shell, starship }) => {
-            init::run(&shell, starship)?;
+            init::run(&shell, starship, &mut Cli::command())?;
         }
         Some(Commands::Config { action }) => {
             run_config(action, cf)?;

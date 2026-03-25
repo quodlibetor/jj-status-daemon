@@ -10,7 +10,7 @@ pub enum Shell {
     Nu,
 }
 
-pub fn run(shell: &Shell, starship: bool) -> Result<()> {
+pub fn run(shell: &Shell, starship: bool, cmd: &mut clap::Command) -> Result<()> {
     let hook = match shell {
         Shell::Zsh => ZSH_HOOK,
         Shell::Bash => BASH_HOOK,
@@ -18,6 +18,30 @@ pub fn run(shell: &Shell, starship: bool) -> Result<()> {
         Shell::Nu => NU_HOOK,
     };
     print!("{hook}");
+
+    // Generate shell completions
+    let mut buf = Vec::new();
+    match shell {
+        Shell::Nu => {
+            clap_complete::generate(
+                clap_complete_nushell::Nushell,
+                cmd,
+                "vcs-status-daemon",
+                &mut buf,
+            );
+        }
+        other => {
+            let clap_shell = match other {
+                Shell::Zsh => clap_complete::Shell::Zsh,
+                Shell::Bash => clap_complete::Shell::Bash,
+                Shell::Fish => clap_complete::Shell::Fish,
+                Shell::Nu => unreachable!(),
+            };
+            clap_complete::generate(clap_shell, cmd, "vcs-status-daemon", &mut buf);
+        }
+    }
+    let completions = String::from_utf8(buf)?;
+    print!("{completions}");
 
     if starship {
         check_starship_config();
