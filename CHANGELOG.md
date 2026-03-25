@@ -1,3 +1,41 @@
+# v0.0.11
+
+Shell completions, broader shell support, and improved template CLI.
+
+**Shell completions**
+- **tab completion for all subcommands**: `init completions <shell>` generates
+  completions via `clap_complete` for bash, zsh, fish, elvish, and powershell.
+
+**Broader shell support**
+- **fish and nushell init support**: `init fish` and `init nushell` generate
+  eval-able shell integration scripts, joining the existing bash and zsh support.
+
+**Template CLI improvements**
+- **`template list` renamed to `template show`**: accepts optional template
+  names to filter output (e.g. `template show ascii nerdfont`).
+- **`template set`**: new subcommand to set the active template by `--name`
+  or inline `--format`, equivalent to the corresponding `config set` calls.
+
+**Observability**
+- **verbose per-directory diff stats**: `status -v` now shows per-directory
+  breakdown of incremental diff overlay statistics (base files, overlay
+  entries, files/lines changed).
+
+**Upgrade handling**
+- **detect binary deletion for package manager updates**: when tools like
+  mise, nix, or asdf update the binary to a new path and delete the old one,
+  the daemon now detects the deletion and shuts down cleanly. The next client
+  query auto-starts the new version.
+- **auto-shutdown on version mismatch**: when a client detects it is a newer
+  version than the running daemon, it now sends a shutdown request instead of
+  just warning. The next prompt evaluation auto-starts the correct version.
+
+**Watcher improvements**
+- **lazy nested ignore file discovery**: the file watcher now discovers
+  `.gitignore`/`.jjignore` files in subdirectories as events arrive, rather
+  than only loading root-level ignore files. Uses a checked-directories cache
+  to avoid repeated filesystem probes.
+
 # v0.0.10
 
 Nested gitignore support, new template commands, and incremental diff observability.
