@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
@@ -25,42 +27,223 @@ pub struct RepoWatcher {
     pub ignored_events: Arc<AtomicU64>,
 }
 
-/// Build a gitignore matcher from the repo's ignore files.
-///
-/// For jj repos: loads `.gitignore` and `.jjignore` (jj respects both).
-/// For git repos: loads `.gitignore`.
-/// Also loads nested ignore files aren't handled here — just the root-level ones,
-/// which covers the vast majority of noisy paths (target/, node_modules/, .build/, etc.).
-fn build_ignore(repo_path: &Path, vcs_kind: VcsKind) -> Gitignore {
-    let canonical = repo_path
-        .canonicalize()
-        .unwrap_or_else(|_| repo_path.to_path_buf());
-    let mut builder = GitignoreBuilder::new(&canonical);
+/// Result of processing an event's paths through the ignore filter.
+pub struct EventVerdict {
+    /// All working-copy paths in the event are ignored — skip the event entirely.
+    pub all_ignored: bool,
+    /// Non-ignored working-copy paths for incremental diffs.
+    pub changed_paths: Vec<PathBuf>,
+}
 
-    // Always add .gitignore (both jj and git respect it)
-    let gitignore = repo_path.join(".gitignore");
-    if gitignore.exists() {
-        builder.add(gitignore);
-    }
+/// Lazily discovers and incorporates nested `.gitignore`/`.jjignore` files as
+/// filesystem events arrive. Thread-safe: `Arc<Mutex<>>` is internal, all public
+/// methods handle locking.
+#[derive(Clone)]
+pub struct IgnoreFilter {
+    inner: Arc<Mutex<IgnoreFilterInner>>,
+}
 
-    if vcs_kind == VcsKind::Jj {
-        let jjignore = repo_path.join(".jjignore");
-        if jjignore.exists() {
-            builder.add(jjignore);
+struct IgnoreFilterInner {
+    matcher: Gitignore,
+    /// Relative directories (from repo root) we have already probed for ignore files.
+    checked_dirs: HashSet<PathBuf>,
+    /// Absolute paths of all ignore files currently loaded into the matcher.
+    loaded_files: HashSet<PathBuf>,
+    canonical_root: PathBuf,
+    vcs_kind: VcsKind,
+    global_ignore: Option<PathBuf>,
+}
+
+impl IgnoreFilter {
+    /// Create a new filter, loading root-level ignore files and the global gitignore.
+    pub fn new(repo_path: &Path, vcs_kind: VcsKind) -> Self {
+        let canonical_root = repo_path
+            .canonicalize()
+            .unwrap_or_else(|_| repo_path.to_path_buf());
+        let global_ignore = global_gitignore_path().filter(|g| g.exists());
+
+        let mut loaded_files = HashSet::new();
+
+        // Always add root .gitignore (both jj and git respect it)
+        let gitignore = canonical_root.join(".gitignore");
+        if gitignore.exists() {
+            loaded_files.insert(gitignore);
+        }
+
+        if vcs_kind == VcsKind::Jj {
+            let jjignore = canonical_root.join(".jjignore");
+            if jjignore.exists() {
+                loaded_files.insert(jjignore);
+            }
+        }
+
+        let mut checked_dirs = HashSet::new();
+        checked_dirs.insert(PathBuf::new()); // root dir is checked
+
+        let matcher = Self::build_matcher(&canonical_root, &loaded_files, global_ignore.as_deref());
+
+        IgnoreFilter {
+            inner: Arc::new(Mutex::new(IgnoreFilterInner {
+                matcher,
+                checked_dirs,
+                loaded_files,
+                canonical_root,
+                vcs_kind,
+                global_ignore,
+            })),
         }
     }
 
-    // Also load the global gitignore if available
-    if let Some(global) = global_gitignore_path()
-        && global.exists()
-    {
-        builder.add(global);
+    /// Process an event's paths: lazily discover ignore files, then filter.
+    ///
+    /// Ignore files are incorporated *before* filtering so the matcher is always
+    /// up-to-date. Only working-copy paths (outside `vcs_dir`) are considered.
+    pub fn process_event(&self, vcs_dir: &Path, paths: &[PathBuf]) -> EventVerdict {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Phase 1: discover and incorporate any new ignore files before filtering.
+        inner.discover_ignore_files(paths, vcs_dir);
+
+        // Phase 2: filter paths.
+        let canonical_root = inner.canonical_root.clone();
+        let wc_paths: Vec<&PathBuf> = paths.iter().filter(|p| !p.starts_with(vcs_dir)).collect();
+
+        if wc_paths.is_empty() {
+            return EventVerdict {
+                all_ignored: false,
+                changed_paths: Vec::new(),
+            };
+        }
+
+        let all_ignored = wc_paths.iter().all(|p| {
+            let rel = p.strip_prefix(&canonical_root).unwrap_or(p);
+            let is_dir = p.is_dir();
+            inner
+                .matcher
+                .matched_path_or_any_parents(rel, is_dir)
+                .is_ignore()
+        });
+
+        let changed_paths = if all_ignored {
+            Vec::new()
+        } else {
+            wc_paths
+                .into_iter()
+                .filter(|p| {
+                    let rel = p.strip_prefix(&canonical_root).unwrap_or(p);
+                    let is_dir = p.is_dir();
+                    !inner
+                        .matcher
+                        .matched_path_or_any_parents(rel, is_dir)
+                        .is_ignore()
+                })
+                .cloned()
+                .collect()
+        };
+
+        EventVerdict {
+            all_ignored,
+            changed_paths,
+        }
     }
 
-    builder.build().unwrap_or_else(|_| {
-        // If parsing fails, return an empty matcher (nothing ignored)
-        GitignoreBuilder::new(repo_path).build().unwrap()
-    })
+    /// Build a `Gitignore` matcher from all loaded files plus the global ignore.
+    fn build_matcher(
+        canonical_root: &Path,
+        loaded_files: &HashSet<PathBuf>,
+        global_ignore: Option<&Path>,
+    ) -> Gitignore {
+        let mut builder = GitignoreBuilder::new(canonical_root);
+
+        if let Some(global) = global_ignore {
+            builder.add(global);
+        }
+
+        // Sort by path depth (shallowest first) so deeper files override shallower
+        // via addition order — the ignore crate gives later additions higher priority.
+        let mut sorted: Vec<&PathBuf> = loaded_files.iter().collect();
+        sorted.sort_by_key(|p| p.components().count());
+        for file in sorted {
+            builder.add(file);
+        }
+
+        builder
+            .build()
+            .unwrap_or_else(|_| GitignoreBuilder::new(canonical_root).build().unwrap())
+    }
+}
+
+impl IgnoreFilterInner {
+    /// Check event paths for new ignore files and rebuild the matcher if needed.
+    fn discover_ignore_files(&mut self, paths: &[PathBuf], vcs_dir: &Path) {
+        let mut needs_rebuild = false;
+
+        for path in paths {
+            // Skip VCS-internal paths
+            if path.starts_with(vcs_dir) {
+                continue;
+            }
+
+            // Check if this path IS an ignore file (create/modify/delete)
+            if self.is_ignore_filename(path) {
+                if path.exists() {
+                    // Created or modified — add/re-add
+                    self.loaded_files.insert(path.clone());
+                    needs_rebuild = true;
+                } else if self.loaded_files.remove(path) {
+                    // Deleted — remove
+                    needs_rebuild = true;
+                }
+            }
+
+            // Walk ancestor directories from this path up to repo root,
+            // probing unchecked directories for ignore files.
+            if let Ok(rel) = path.strip_prefix(&self.canonical_root) {
+                // Iterate over ancestor directories of the relative path
+                let mut dir = rel;
+                loop {
+                    dir = match dir.parent() {
+                        Some(d) => d,
+                        None => break,
+                    };
+                    if dir.as_os_str().is_empty() {
+                        break; // reached repo root, already checked at init
+                    }
+                    if !self.checked_dirs.insert(dir.to_path_buf()) {
+                        // Already checked this dir (and therefore all its ancestors)
+                        break;
+                    }
+
+                    let abs_dir = self.canonical_root.join(dir);
+                    let gitignore = abs_dir.join(".gitignore");
+                    if gitignore.exists() && self.loaded_files.insert(gitignore) {
+                        needs_rebuild = true;
+                    }
+                    if self.vcs_kind == VcsKind::Jj {
+                        let jjignore = abs_dir.join(".jjignore");
+                        if jjignore.exists() && self.loaded_files.insert(jjignore) {
+                            needs_rebuild = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if needs_rebuild {
+            self.matcher = IgnoreFilter::build_matcher(
+                &self.canonical_root,
+                &self.loaded_files,
+                self.global_ignore.as_deref(),
+            );
+        }
+    }
+
+    fn is_ignore_filename(&self, path: &Path) -> bool {
+        let Some(name) = path.file_name() else {
+            return false;
+        };
+        name == ".gitignore" || (self.vcs_kind == VcsKind::Jj && name == ".jjignore")
+    }
 }
 
 /// Find the global gitignore path from git config or the default location.
@@ -100,7 +283,7 @@ pub fn watch_repo(
         VcsKind::Jj => canonical_root.join(".jj"),
         VcsKind::Git => canonical_root.join(".git"),
     };
-    let gitignore = build_ignore(repo_path, vcs_kind);
+    let filter = IgnoreFilter::new(repo_path, vcs_kind);
     let ignored_events = Arc::new(AtomicU64::new(0));
     let ignored_events_cb = ignored_events.clone();
 
@@ -116,53 +299,20 @@ pub fn watch_repo(
             // Determine if this is a working copy change or a VCS internal change
             let working_copy_changed = event.paths.iter().any(|p| !p.starts_with(&vcs_dir));
 
-            // For working copy events, filter out ignored paths
-            if working_copy_changed {
-                let all_ignored = event.paths.iter().all(|p| {
-                    if p.starts_with(&vcs_dir) {
-                        return false; // VCS internal paths are never "ignored"
-                    }
-                    // Strip the canonical root to get a relative path for matching.
-                    // Use matched_path_or_any_parents so that a file inside an
-                    // ignored directory (e.g. build/output.o matching "build/")
-                    // is correctly detected as ignored.
-                    let rel = p.strip_prefix(&canonical_root).unwrap_or(p);
-                    let is_dir = p.is_dir();
-                    gitignore
-                        .matched_path_or_any_parents(rel, is_dir)
-                        .is_ignore()
-                });
-                if all_ignored {
-                    ignored_events_cb.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
+            // Lazily discover ignore files and filter paths in one step.
+            // Ignore files are incorporated before filtering so the matcher
+            // is always up-to-date when we check paths.
+            let verdict = filter.process_event(&vcs_dir, &event.paths);
+            if working_copy_changed && verdict.all_ignored {
+                ignored_events_cb.fetch_add(1, Ordering::Relaxed);
+                return;
             }
 
-            // Collect non-VCS, non-ignored working copy paths for incremental diffs
-            let changed_paths: Vec<PathBuf> = if working_copy_changed {
-                event
-                    .paths
-                    .iter()
-                    .filter(|p| {
-                        if p.starts_with(&vcs_dir) {
-                            return false;
-                        }
-                        let rel = p.strip_prefix(&canonical_root).unwrap_or(p);
-                        let is_dir = p.is_dir();
-                        !gitignore
-                            .matched_path_or_any_parents(rel, is_dir)
-                            .is_ignore()
-                    })
-                    .cloned()
-                    .collect()
-            } else {
-                Vec::new()
-            };
             let _ = tx.send(WatchEvent::Change {
                 repo_path: repo_path_owned.clone(),
                 vcs_kind,
                 working_copy_changed,
-                changed_paths,
+                changed_paths: verdict.changed_paths,
             });
         })?;
 
@@ -372,5 +522,151 @@ mod tests {
             found,
             "expected working_copy_changed for tracked file while ignore is active"
         );
+    }
+
+    #[tokio::test]
+    async fn test_watcher_discovers_nested_gitignore() {
+        let dir = create_jj_repo().await;
+
+        // Create sub/.gitignore that ignores *.log BEFORE starting the watcher
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/.gitignore"), "*.log\n").unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _watcher = watch_repo(dir.path(), VcsKind::Jj, tx).unwrap();
+
+        // Drain startup events
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while rx.try_recv().is_ok() {}
+
+        // Write to an ignored path in sub/ — should NOT produce working_copy_changed
+        tokio::fs::write(dir.path().join("sub/debug.log"), "log data")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut saw_wc_change = false;
+        while let Ok(event) = rx.try_recv() {
+            if let WatchEvent::Change {
+                working_copy_changed: true,
+                ..
+            } = event
+            {
+                saw_wc_change = true;
+            }
+        }
+        assert!(
+            !saw_wc_change,
+            "should not see working_copy_changed for file matched by nested .gitignore"
+        );
+
+        // Write to a non-ignored path in sub/ — SHOULD produce working_copy_changed
+        tokio::fs::write(dir.path().join("sub/code.rs"), "fn main() {}")
+            .await
+            .unwrap();
+
+        let mut found = false;
+        for _ in 0..20 {
+            match timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(WatchEvent::Change {
+                    working_copy_changed: true,
+                    ..
+                })) => {
+                    found = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(
+            found,
+            "expected working_copy_changed for non-ignored file in sub/"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_watcher_lazy_discovers_new_gitignore() {
+        let dir = create_jj_repo().await;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _watcher = watch_repo(dir.path(), VcsKind::Jj, tx).unwrap();
+
+        // Drain startup events
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while rx.try_recv().is_ok() {}
+
+        // Create sub/ and sub/.gitignore — the watcher discovers it lazily
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/.gitignore"), "*.o\n").unwrap();
+
+        // Let the watcher process the .gitignore creation events
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while rx.try_recv().is_ok() {}
+
+        // Now write to a path that the new ignore file should ignore
+        tokio::fs::write(dir.path().join("sub/output.o"), "binary")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut saw_wc_change = false;
+        while let Ok(event) = rx.try_recv() {
+            if let WatchEvent::Change {
+                working_copy_changed: true,
+                ..
+            } = event
+            {
+                saw_wc_change = true;
+            }
+        }
+        assert!(
+            !saw_wc_change,
+            "should not see working_copy_changed for file matched by lazily-discovered .gitignore"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nested_gitignore_no_sibling_effect() {
+        let dir = create_jj_repo().await;
+
+        // Create sub_a/.gitignore that ignores *.tmp, but sub_b/ has no ignore file
+        std::fs::create_dir(dir.path().join("sub_a")).unwrap();
+        std::fs::write(dir.path().join("sub_a/.gitignore"), "*.tmp\n").unwrap();
+        std::fs::create_dir(dir.path().join("sub_b")).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _watcher = watch_repo(dir.path(), VcsKind::Jj, tx).unwrap();
+
+        // Drain startup events
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while rx.try_recv().is_ok() {}
+
+        // Write *.tmp in sub_b/ — should NOT be ignored (sibling directory)
+        tokio::fs::write(dir.path().join("sub_b/file.tmp"), "temp data")
+            .await
+            .unwrap();
+
+        let mut found = false;
+        for _ in 0..20 {
+            match timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(WatchEvent::Change {
+                    working_copy_changed: true,
+                    ..
+                })) => {
+                    found = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(found, "sub_a/.gitignore should not affect files in sub_b/");
     }
 }
