@@ -10,14 +10,22 @@ The daemon watches its own binary for replacement and automatically exec's the n
 
 ### Binary watcher
 
-On startup, the daemon resolves its binary path via `std::env::current_exe()` (canonicalized to follow symlinks) and records the file's inode. It then watches the binary's parent directory with `notify` for modify/create events affecting that path.
+On startup, the daemon resolves its binary path via `std::env::current_exe()` (canonicalized to follow symlinks) and records the file's inode. It then watches the binary's parent directory with `notify` for modify/create/remove events affecting that path. It also periodically checks (every 30s) that the binary still exists on disk.
 
-When an event fires:
+When a modify/create event fires:
 1. Wait 500ms for the write/rename to finish.
 2. Stat the file at the original path and compare inodes.
-3. If the inode changed, the binary was replaced — trigger restart.
+3. If the inode changed, the binary was replaced — trigger exec-restart.
 
-Inode comparison is the key mechanism. A simple file touch or in-place write (same inode) is ignored. Only a genuine replacement (new file, different inode) triggers a restart. This matches how installers, package managers, and `cargo install` work: they write a new file and atomically rename it over the old path.
+When the binary is deleted (remove event or periodic existence check):
+1. The daemon shuts down cleanly (no exec-restart — there's nothing to re-exec).
+2. The next client query auto-starts the new daemon from whatever binary is now in PATH.
+
+This handles two update patterns:
+- **In-place replacement** (e.g. `cargo install`, `self-update`): new file at the same path, different inode → exec-restart.
+- **Path relocation** (e.g. `mise`, `nix`, `asdf`): old binary deleted, new binary at a different path → clean shutdown, client auto-starts new version.
+
+The periodic existence check (every 30s) is a fallback for cases where the filesystem watcher itself fails, e.g. when the parent directory is deleted before the file remove event is delivered.
 
 ### Restart via exec
 
@@ -49,4 +57,4 @@ The `exec()` call closes all file descriptors (tokio sets `CLOEXEC`). Any in-fli
 
 - **`self-update` subcommand**: Runs `axoupdater`, then shuts down the daemon. The next client query auto-starts the new binary. With the binary watcher, the restart happens automatically without waiting for a client query.
 - **`restart` subcommand**: Manual graceful shutdown + start. Still works as before, useful for forcing a restart regardless of binary changes.
-- **Version mismatch warning**: The client checks the `version` file and warns once if it doesn't match. With auto-restart, this warning should rarely appear.
+- **Version mismatch auto-shutdown**: The client checks the `version` file and, if it doesn't match, sends a `Shutdown` request to the stale daemon. The next client query (i.e. next shell prompt) auto-starts the new version. This acts as a safety net for update patterns that the binary watcher doesn't catch.

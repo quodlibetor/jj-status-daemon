@@ -422,7 +422,6 @@ pub async fn run_daemon(
                 }
                 let _ = std::fs::remove_file(&pid_path);
                 let _ = std::fs::remove_file(runtime_dir.join("version"));
-                let _ = std::fs::remove_file(runtime_dir.join("version_warned"));
                 return Ok(());
             }
         }
@@ -1240,42 +1239,80 @@ async fn watch_binary(shutdown: Arc<Notify>, restart: Arc<AtomicBool>) -> Result
     watcher.watch(&watch_dir, RecursiveMode::NonRecursive)?;
     tracing::info!(path = %exe_path.display(), ino = original_ino, size = original_size, "watching binary for replacement");
 
-    while let Some(event) = rx.recv().await {
-        let affects_exe = match event.kind {
-            EventKind::Modify(_) | EventKind::Create(_) => {
-                event.paths.iter().any(|p| p == &exe_path)
+    // Periodic check interval: catches cases where the watcher misses events
+    // (e.g. parent directory deleted, watcher itself removed).
+    let mut existence_check = tokio::time::interval(Duration::from_secs(30));
+    existence_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the first (immediate) tick
+    existence_check.tick().await;
+
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                let Some(event) = event else { break };
+
+                let affects_exe = match event.kind {
+                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) => {
+                        event.paths.iter().any(|p| p == &exe_path)
+                    }
+                    _ => false,
+                };
+                if !affects_exe {
+                    continue;
+                }
+
+                // Small delay to let the write/rename finish
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                // Binary was deleted (e.g. package manager installed new version
+                // at a different path). Shut down cleanly — the next client query
+                // will auto-start the new daemon from the updated PATH.
+                if !exe_path.exists() {
+                    tracing::info!(
+                        path = %exe_path.display(),
+                        "binary deleted, shutting down so next client starts the new version"
+                    );
+                    // Don't set restart flag — there's no binary to re-exec.
+                    shutdown.notify_one();
+                    return Ok(());
+                }
+
+                // Check if the file at our path changed (different inode, mtime, or size)
+                let Ok(meta) = std::fs::metadata(&exe_path) else {
+                    continue;
+                };
+                let new_ino = meta.ino();
+                let new_mtime = meta.mtime();
+                let new_size = meta.size();
+                if new_ino == original_ino && new_mtime == original_mtime && new_size == original_size {
+                    continue;
+                }
+
+                tracing::info!(
+                    path = %exe_path.display(),
+                    old_ino = original_ino,
+                    new_ino,
+                    old_size = original_size,
+                    new_size,
+                    "binary replaced, restarting daemon"
+                );
+                restart.store(true, Ordering::Relaxed);
+                shutdown.notify_one();
+                return Ok(());
             }
-            _ => false,
-        };
-        if !affects_exe {
-            continue;
+            _ = existence_check.tick() => {
+                // Periodic fallback: check if the binary still exists on disk.
+                // Covers cases where the watcher fails (e.g. parent dir deleted).
+                if !exe_path.exists() {
+                    tracing::info!(
+                        path = %exe_path.display(),
+                        "binary no longer exists (periodic check), shutting down"
+                    );
+                    shutdown.notify_one();
+                    return Ok(());
+                }
+            }
         }
-
-        // Small delay to let the write/rename finish
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Check if the file at our path changed (different inode, mtime, or size)
-        let Ok(meta) = std::fs::metadata(&exe_path) else {
-            continue;
-        };
-        let new_ino = meta.ino();
-        let new_mtime = meta.mtime();
-        let new_size = meta.size();
-        if new_ino == original_ino && new_mtime == original_mtime && new_size == original_size {
-            continue;
-        }
-
-        tracing::info!(
-            path = %exe_path.display(),
-            old_ino = original_ino,
-            new_ino,
-            old_size = original_size,
-            new_size,
-            "binary replaced, restarting daemon"
-        );
-        restart.store(true, Ordering::Relaxed);
-        shutdown.notify_one();
-        return Ok(());
     }
 
     Ok(())

@@ -37,45 +37,44 @@ fn send_request_with_timeout(
 }
 
 /// Check the daemon's version file (written on startup) against the client version.
-/// Warns once per daemon instance by writing a marker file.
-fn check_version_file(socket_path: &Path) {
+/// Returns true if the daemon is stale and was told to shut down.
+fn check_version_file(socket_path: &Path) -> bool {
     let Some(runtime_dir) = socket_path.parent() else {
-        return;
+        return false;
     };
     let version_path = runtime_dir.join("version");
-    let warned_path = runtime_dir.join("version_warned");
 
     let Ok(daemon_version_str) = std::fs::read_to_string(&version_path) else {
-        return; // Old daemon that doesn't write version file
+        return false; // Old daemon that doesn't write version file
     };
     let daemon_version = daemon_version_str.split_whitespace().next().unwrap_or("");
     let (client_version, _, _) = crate::protocol::version_info();
 
     if daemon_version == client_version {
-        // Versions match — clean up any stale warning marker
-        let _ = std::fs::remove_file(&warned_path);
-        return;
+        return false;
     }
 
-    // Only warn once: check if we already warned for this daemon version
-    if let Ok(warned_for) = std::fs::read_to_string(&warned_path)
-        && warned_for.trim() == daemon_version
-    {
-        return;
-    }
-
-    eprintln!(
-        "vcs-status-daemon: warning: client is v{client_version} but daemon is v{daemon_version}, \
-         run `vcs-status-daemon restart` to upgrade"
-    );
-    let _ = std::fs::write(&warned_path, daemon_version);
+    eprintln!("vcs-status-daemon: upgrading daemon from v{daemon_version} to v{client_version}");
+    let _ = send_request_slow(socket_path, &Request::Shutdown);
+    true
 }
 
 fn start_daemon(socket_path: &Path, config_file: Option<&Path>) -> Result<()> {
-    // If the socket is already connectable, a daemon is running — nothing to do.
+    // If the socket is already connectable, a daemon is running — check version.
     if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
-        check_version_file(socket_path);
-        return Ok(());
+        if !check_version_file(socket_path) {
+            return Ok(()); // Version matches, daemon is fine
+        }
+        // Version mismatch: we sent Shutdown, wait briefly for it to take effect
+        // then fall through to start the new daemon.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while socket_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Clean up stale socket if the daemon didn't remove it in time
+        if socket_path.exists() {
+            let _ = std::fs::remove_file(socket_path);
+        }
     }
 
     // Canonicalize to resolve symlinks — ensures we start this exact binary,
@@ -695,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn test_check_version_file_no_warn_on_match() {
+    fn test_check_version_file_noop_on_match() {
         let rt = TempDir::with_prefix("vcs-test-version-match-").unwrap();
         let socket_path = rt.path().join("sock");
         let (version, hash, _) = crate::protocol::version_info();
@@ -703,63 +702,20 @@ mod tests {
         // Write matching version file
         std::fs::write(rt.path().join("version"), format!("{version} {hash}")).unwrap();
 
-        // Should not create warned marker
-        check_version_file(&socket_path);
-        assert!(
-            !rt.path().join("version_warned").exists(),
-            "should not create warned marker when versions match"
-        );
+        // Should return false — versions match, no restart needed
+        assert!(!check_version_file(&socket_path));
     }
 
     #[test]
-    fn test_check_version_file_warns_on_mismatch() {
+    fn test_check_version_file_sends_shutdown_on_mismatch() {
         let rt = TempDir::with_prefix("vcs-test-version-mismatch-").unwrap();
         let socket_path = rt.path().join("sock");
 
         // Write mismatched version file
         std::fs::write(rt.path().join("version"), "0.0.1 abc123").unwrap();
 
-        // Should create warned marker
-        check_version_file(&socket_path);
-        assert!(
-            rt.path().join("version_warned").exists(),
-            "should create warned marker on version mismatch"
-        );
-        assert_eq!(
-            std::fs::read_to_string(rt.path().join("version_warned"))
-                .unwrap()
-                .trim(),
-            "0.0.1"
-        );
-    }
-
-    #[test]
-    fn test_check_version_file_warns_only_once() {
-        let rt = TempDir::with_prefix("vcs-test-version-once-").unwrap();
-        let socket_path = rt.path().join("sock");
-        let warned_path = rt.path().join("version_warned");
-
-        // Write mismatched version file
-        std::fs::write(rt.path().join("version"), "0.0.1 abc123").unwrap();
-
-        // First check creates marker
-        check_version_file(&socket_path);
-        assert!(warned_path.exists());
-        assert_eq!(std::fs::read_to_string(&warned_path).unwrap(), "0.0.1");
-
-        // Record mtime of the warned marker
-        let mtime_before = std::fs::metadata(&warned_path).unwrap().modified().unwrap();
-
-        // Small delay so mtime would differ if rewritten
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
-        // Second check should see marker and not rewrite
-        check_version_file(&socket_path);
-        let mtime_after = std::fs::metadata(&warned_path).unwrap().modified().unwrap();
-        assert_eq!(
-            mtime_before, mtime_after,
-            "warned marker should not be rewritten on subsequent checks"
-        );
+        // Should return true and attempt Shutdown (fails silently with no socket)
+        assert!(check_version_file(&socket_path));
     }
 
     #[tokio::test]
