@@ -1,4 +1,5 @@
 {# Used via include, see e.g. nerdfont.tera #}
+{% if git_head_diverged %}{{ diverged_icon | bright_red }} {% endif -%}
 {% if is_jj -%}
   {{ jj_icon | magenta }} {{ change_id_prefix | magenta | bold }}{{ change_id_rest | bright_black | bold }}
   {%- for b in bookmarks %} {{ bookmark_prefix ~ b.display | blue }}

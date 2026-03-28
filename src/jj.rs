@@ -757,6 +757,13 @@ async fn load_jj_repo(repo_path: &Path, depth: u32) -> Result<JjLoadedRepo> {
         .unwrap_or(id_len);
 
     let commit_id_hex = commit.id().hex();
+    // Store the first parent's git commit hash — in colocated repos,
+    // .git/HEAD points to the parent commit, not the working copy commit.
+    status.expected_git_head = commit
+        .parent_ids()
+        .first()
+        .map(|id| id.hex())
+        .unwrap_or_default();
     let id_len = 8.min(commit_id_hex.len());
     status.commit_id = commit_id_hex[..id_len].to_string();
     status.commit_id_prefix_len = repo

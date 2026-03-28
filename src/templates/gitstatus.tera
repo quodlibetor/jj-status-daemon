@@ -3,6 +3,7 @@
     Colors: green=clean, yellow=modified, blue=untracked, red=conflicted.
     Indicators: ~=conflicts, +=staged, !=unstaged, ?=untracked
 -#}
+{% if git_head_diverged %}{{ "▮jj" | bright_red }} {% endif -%}
 {% if is_jj -%}
   {% set dirty = file_mad_count > 0 -%}
   {%- if dirty -%}

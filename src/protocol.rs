@@ -61,6 +61,9 @@ pub enum Response {
         /// Outer vec: (repo_path, vec of (dir_path, stats)).
         #[serde(default)]
         dir_diff_stats: Vec<(String, Vec<(String, IncrementalDiffStats)>)>,
+        /// Per-repo warnings (e.g. colocated git HEAD diverged from jj).
+        #[serde(default)]
+        warnings: Vec<String>,
     },
     Version {
         version: String,

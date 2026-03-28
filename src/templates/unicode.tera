@@ -8,6 +8,7 @@
 {% set immutable_icon = "∅" -%}
 {% set empty_icon = "∅" -%}
 {% set stale_icon = "⟳" -%}
+{% set diverged_icon = "▮jj" -%}
 {% set ahead_icon = "⇡" -%}
 {% set behind_icon = "⇣" -%}
 {% set stash_icon = "≡" -%}

@@ -2,6 +2,7 @@
     Format: `branch*` — branch in gray, * if dirty, action shown.
     Intentionally minimal: no counts, no breakdown.
 -#}
+{% if git_head_diverged %}{{ "▮jj" | bright_red }} {% endif -%}
 {% if is_jj -%}
   {%- set dirty = file_mad_count > 0 -%}
   {%- if bookmarks and bookmarks[0].distance == 0 -%}

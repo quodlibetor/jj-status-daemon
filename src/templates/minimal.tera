@@ -1,3 +1,4 @@
+{% if git_head_diverged %}{{ "▮jj" | bright_red }} {% endif -%}
 {% if is_jj -%}
   {% if bookmarks and bookmarks[0].distance == 0 -%}
     {{ bookmarks[0].name | green }}

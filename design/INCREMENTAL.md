@@ -111,6 +111,12 @@ flowchart TD
     CLASSIFY_JJ -->|.jj/repo/op_heads/heads/*| HEAD_HINT_JJ[HeadMayHaveChanged]
 ```
 
+The hint is computed only from the **primary** VCS directory (`.jj/` for jj
+repos, `.git/` for git repos). In colocated jj+git repos, `.git/` paths are
+excluded from working-copy classification but do **not** contribute to the hint
+— they are handled separately by the colocated stale flag mechanism (see
+below).
+
 When a single event contains multiple VCS-internal paths with different hints,
 the **most severe** hint wins:
 
@@ -287,3 +293,73 @@ independent layer:
 Both overlays are merged with their respective base stats using the same
 algorithm as jj. Staged stats (HEAD→index) are not tracked incrementally — they
 are part of the base status and are fully recomputed on index changes.
+
+## Colocated Jj+Git Repos
+
+When both `.jj/` and `.git/` exist in a repository, jj is the primary VCS.
+Git-internal paths (`.git/HEAD`, `.git/refs/heads/*`, etc.) are excluded from
+working-copy classification so they don't pollute incremental diffs. However,
+external git operations (e.g. `git checkout REF`) create a subtlety that
+requires special handling.
+
+### The reconciliation race
+
+Jj colocated repos maintain parallel state in `.jj/` and `.git/`. When jj
+performs an operation (e.g. `jj new`, `jj rebase`), it updates both directories
+atomically — `.jj/repo/op_heads/heads/*` and `.git/HEAD`/refs change together.
+The daemon sees a `HeadMayHaveChanged` hint from the `.jj/` paths and processes
+it normally via `ValidateAndRefresh`.
+
+When an **external** git operation runs (e.g. `git checkout HEAD~2`), only
+`.git/` state updates immediately. Jj's internal state (`.jj/repo/op_heads/`)
+remains unchanged until jj's next **snapshot** — which happens on the next jj
+command the user runs (e.g. `jj status`, `jj log`). The daemon never triggers
+snapshots.
+
+This creates a window where:
+
+1. `.git/HEAD`, `.git/index`, and working-copy files change simultaneously
+2. `.jj/` state still reflects the **old** commit
+3. Jj's parent tree is out of sync with the actual working copy
+
+Computing incremental diffs against jj's stale parent tree during this window
+would produce wrong results — the diff would be relative to the old commit, not
+the new one.
+
+### Stale flag mechanism
+
+To handle this, the daemon tracks a per-repo **colocated git stale** flag:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Normal
+
+    Normal --> Stale: .git/ HeadMayHaveChanged\nwithout .jj/ hint
+    Note right of Stale: External git operation\n(jj hasn't reconciled)
+
+    Stale --> Stale: Any event\n(suppressed)
+    Stale --> Normal: .jj/ hint arrives\n(jj reconciled)
+
+    Normal --> Normal: .git/ + .jj/ change\ntogether (jj operation)
+```
+
+**Setting the flag**: When `.git/` paths produce a `HeadMayHaveChanged`
+classification AND no `.jj/` hint is present in the same event, the daemon
+marks the repo as stale. The cached status is updated with
+`git_head_diverged = true` so the prompt shows a divergence indicator distinct
+from the transient `is_stale` flag used during normal refreshes.
+
+**While stale**: All events for the repo are suppressed — no incremental
+updates, no `ValidateAndRefresh`, nothing. Diffs would be against the wrong
+baseline. Flush requests also skip forced refreshes for stale repos.
+
+**Clearing the flag**: When a `.jj/repo/op_heads/heads/*` event arrives
+(producing a `vcs_change_hint`), the stale flag is cleared and the event
+proceeds normally. The `ValidateAndRefresh` handler detects the parent tree
+change and performs a full refresh, producing correct results.
+
+**Jj-initiated changes**: When jj itself updates `.git/` (during any jj
+operation), both `.jj/` and `.git/` change in the same event batch. The `.jj/`
+paths produce a `vcs_change_hint`, so the stale flag condition
+(`colocated_git_head_changed && vcs_change_hint.is_none()`) is never satisfied.
+Normal processing proceeds without interruption.

@@ -280,6 +280,7 @@ pub fn status(verbose: bool) -> Result<()> {
             stats,
             incremental_diff_stats,
             dir_diff_stats,
+            warnings,
         }) => {
             let hours = uptime_secs / 3600;
             let mins = (uptime_secs % 3600) / 60;
@@ -396,6 +397,14 @@ pub fn status(verbose: bool) -> Result<()> {
                             );
                         }
                     }
+                }
+            }
+
+            if !warnings.is_empty() {
+                eprintln!();
+                eprintln!("  warnings:");
+                for w in &warnings {
+                    eprintln!("    ⚠ {w}");
                 }
             }
 

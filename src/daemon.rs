@@ -647,6 +647,17 @@ async fn handle_connection(
                 .values()
                 .map(|w| w.ignored_events.load(std::sync::atomic::Ordering::Relaxed))
                 .sum();
+            let warnings: Vec<String> = st
+                .cache
+                .iter()
+                .filter(|(_, (status, _))| status.git_head_diverged)
+                .map(|(repo, _)| {
+                    format!(
+                        "{}: git HEAD diverged from jj — run a jj command (e.g. `jj status`) to reconcile",
+                        repo.display()
+                    )
+                })
+                .collect();
             let jj_w = st.jj_worker.clone();
             let git_w = st.git_worker.clone();
             drop(st);
@@ -708,6 +719,7 @@ async fn handle_connection(
                     stats,
                     incremental_diff_stats,
                     dir_diff_stats,
+                    warnings,
                 },
             )
             .await
@@ -1428,9 +1440,28 @@ async fn refresh_task(
 ) {
     // Per-repo concurrency control: at most one refresh per repo at a time.
     let mut in_flight: HashMap<PathBuf, RepoRefreshState> = HashMap::new();
+    // Colocated jj+git repos where an external git operation changed HEAD.
+    // While a repo is in this set, all events are suppressed because jj's parent
+    // tree is out of sync with the working copy. Cleared when a jj op_head event
+    // arrives (vcs_change_hint is Some), indicating jj has reconciled.
+    let mut colocated_git_stale: HashSet<PathBuf> = HashSet::new();
+    // Pending colocated git HEAD changes awaiting debounce confirmation.
+    // When .git/HEAD changes, we wait briefly before marking stale, because
+    // jj operations update both .jj/ and .git/ but events may arrive in
+    // separate batches. If a vcs_change_hint arrives before the deadline,
+    // the change was jj-originated and we cancel.
+    let mut colocated_git_pending: HashMap<PathBuf, tokio::time::Instant> = HashMap::new();
+    const COLOCATED_DEBOUNCE: Duration = Duration::from_millis(100);
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<RefreshDone>();
 
     loop {
+        // Compute the next pending colocated deadline for the select.
+        let next_colocated_deadline = colocated_git_pending
+            .values()
+            .min()
+            .copied()
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86400));
+
         tokio::select! {
             event = watch_rx.recv() => {
                 let Some(event) = event else { return };
@@ -1460,7 +1491,9 @@ async fn refresh_task(
                                 .collect();
                             drop(st);
                             for (repo_path, vcs_kind) in repos {
-                                if !in_flight.contains_key(&repo_path) {
+                                if !in_flight.contains_key(&repo_path)
+                                    && !colocated_git_stale.contains(&repo_path)
+                                {
                                     in_flight.insert(
                                         repo_path.clone(),
                                         RepoRefreshState::InFlight,
@@ -1491,8 +1524,55 @@ async fn refresh_task(
 
                         let _ = tx.send(());
                     }
-                    WatchEvent::Change { repo_path, vcs_kind, working_copy_changed, vcs_change_hint, changed_paths } => {
+                    WatchEvent::Change { repo_path, vcs_kind, working_copy_changed, vcs_change_hint, changed_paths, colocated_git_head_changed } => {
                         state.lock().await.stats.fs_events += 1;
+
+                        // Colocated stale flag: clear when jj reconciles (op_head event).
+                        if vcs_change_hint.is_some() {
+                            // Cancel any pending debounce — this was a jj-originated operation.
+                            if colocated_git_pending.remove(&repo_path).is_some() {
+                                tracing::debug!(
+                                    repo = %repo_path.display(),
+                                    "colocated git pending cancelled — jj op_head arrived in time"
+                                );
+                            }
+                            if colocated_git_stale.remove(&repo_path) {
+                                tracing::info!(
+                                    repo = %repo_path.display(),
+                                    "colocated git stale cleared — jj reconciled"
+                                );
+                            }
+                        }
+
+                        // Colocated: when .git/HEAD changes without a jj hint in the
+                        // same event batch, start a debounce timer. If no jj hint
+                        // arrives before the deadline, we'll mark the repo as stale.
+                        if colocated_git_head_changed && vcs_change_hint.is_none() {
+                            colocated_git_pending
+                                .entry(repo_path.clone())
+                                .or_insert_with(|| {
+                                    tracing::debug!(
+                                        repo = %repo_path.display(),
+                                        "colocated git HEAD change — starting debounce"
+                                    );
+                                    tokio::time::Instant::now() + COLOCATED_DEBOUNCE
+                                });
+                            // Don't skip the event entirely — it may also have
+                            // working_copy_changed that needs processing.
+                            if !working_copy_changed && vcs_change_hint.is_none() {
+                                continue;
+                            }
+                        }
+
+                        // While repo is stale from an external git operation, suppress
+                        // all events — diffs would be against jj's stale parent tree.
+                        if colocated_git_stale.contains(&repo_path) {
+                            tracing::debug!(
+                                repo = %repo_path.display(),
+                                "event suppressed — colocated git stale"
+                            );
+                            continue;
+                        }
 
                         match in_flight.get_mut(&repo_path) {
                             None => {
@@ -1522,7 +1602,98 @@ async fn refresh_task(
                     handle_refresh_done(&done, &mut in_flight, &jj_worker, &git_worker, &state, &done_tx);
                 }
             }
+            _ = tokio::time::sleep_until(next_colocated_deadline), if !colocated_git_pending.is_empty() => {
+                // Promote any expired pending entries to stale.
+                let now = tokio::time::Instant::now();
+                let expired: Vec<PathBuf> = colocated_git_pending
+                    .iter()
+                    .filter(|(_, deadline)| **deadline <= now)
+                    .map(|(repo, _)| repo.clone())
+                    .collect();
+                for repo_path in expired {
+                    colocated_git_pending.remove(&repo_path);
+
+                    // Compare git HEAD with jj's working copy commit hash.
+                    // If they match, this was a jj-originated operation (or a
+                    // no-op like `touch .git/HEAD`) — not a real divergence.
+                    let git_dir = repo_path.join(".git");
+                    let git_head = resolve_git_head(&git_dir);
+                    let jj_hash = state.lock().await
+                        .cache.get(&repo_path)
+                        .map(|(s, _)| s.expected_git_head.clone());
+
+                    let diverged = match (&git_head, &jj_hash) {
+                        (Some(gh), Some(jh)) if !jh.is_empty() => gh != jh,
+                        // If we can't read either hash, don't mark as diverged.
+                        _ => false,
+                    };
+
+                    if !diverged {
+                        tracing::debug!(
+                            repo = %repo_path.display(),
+                            git_head = ?git_head,
+                            expected_git_head = ?jj_hash,
+                            "colocated git HEAD matches jj — not diverged"
+                        );
+                        continue;
+                    }
+
+                    if colocated_git_stale.insert(repo_path.clone()) {
+                        tracing::info!(
+                            repo = %repo_path.display(),
+                            git_head = ?git_head,
+                            expected_git_head = ?jj_hash,
+                            "colocated git stale set — git HEAD diverged from jj after debounce"
+                        );
+                        // Write stale marker to cache so the prompt reflects it.
+                        let mut st = state.lock().await;
+                        if let Some((prev_status, _)) = st.cache.get(&repo_path) {
+                            let mut stale_status = prev_status.clone();
+                            stale_status.git_head_diverged = true;
+                            stale_status.refresh_error.clear();
+                            let formatted = st.format(&stale_status);
+                            write_cache_file(&st.cache_dir, &repo_path, &formatted);
+                            st.update_cache(&repo_path, stale_status, formatted);
+                        }
+                    }
+                }
+            }
         }
+    }
+}
+
+/// Resolve `.git/HEAD` to a full commit hash.
+///
+/// Handles both detached HEAD (raw hex) and symbolic refs (`ref: refs/heads/...`).
+/// Falls back to `.git/packed-refs` when the loose ref file doesn't exist.
+fn resolve_git_head(git_dir: &Path) -> Option<String> {
+    let head_contents = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head_trimmed = head_contents.trim();
+
+    if let Some(ref_path) = head_trimmed.strip_prefix("ref: ") {
+        // Symbolic ref — try loose ref first, then packed-refs.
+        let loose = git_dir.join(ref_path);
+        if let Ok(hash) = std::fs::read_to_string(&loose) {
+            let h = hash.trim();
+            if !h.is_empty() {
+                return Some(h.to_string());
+            }
+        }
+        // Fall back to packed-refs.
+        if let Ok(packed) = std::fs::read_to_string(git_dir.join("packed-refs")) {
+            let suffix = format!(" {ref_path}");
+            for line in packed.lines() {
+                if line.ends_with(&suffix)
+                    && let Some(hash) = line.split_whitespace().next()
+                {
+                    return Some(hash.to_string());
+                }
+            }
+        }
+        None
+    } else {
+        // Detached HEAD — raw hex hash.
+        Some(head_trimmed.to_string())
     }
 }
 
@@ -2854,6 +3025,169 @@ mod tests {
         assert!(
             !formatted.contains("template error:"),
             "fixed template should not have error, got: {formatted}"
+        );
+
+        let _ = send_request(&socket_path, &Request::Shutdown).await;
+        daemon.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_daemon_colocated_git_checkout_shows_diverged() {
+        let dir = create_jj_repo().await;
+        let rt = temp_runtime_dir("git-diverged");
+        let socket_path = rt.path().join("sock");
+        let config = Config {
+            color: false,
+            format: Some(
+                "diverged={{ git_head_diverged }} files={{ file_mad_count }}".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        // Build history: two committed changes with different files so that
+        // `git checkout HEAD~1` actually modifies the working directory (removing
+        // b.txt), which triggers a filesystem event from the recursive watcher.
+        std::fs::write(dir.path().join("a.txt"), "aaa\n").unwrap();
+        Command::new("jj")
+            .args(["commit", "-m", "first"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("b.txt"), "bbb\n").unwrap();
+        Command::new("jj")
+            .args(["commit", "-m", "second"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        // Snapshot so jj sees the current state
+        Command::new("jj")
+            .args(["status"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
+
+        // Wait for initial status — should show diverged=false, files=0
+        let initial = query_until_match(
+            &socket_path,
+            &dir.path().to_string_lossy(),
+            |s| s.contains("diverged=false") && s.contains("files=0"),
+        )
+        .await;
+        assert!(
+            initial.contains("diverged=false"),
+            "initial status should not be diverged: {initial:?}"
+        );
+
+        // Run `git checkout HEAD~1` to move git HEAD without jj knowing.
+        // This removes b.txt from the working copy, triggering a filesystem event.
+        let git_out = Command::new("git")
+            .args(["checkout", "HEAD~1"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            git_out.status.success(),
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&git_out.stderr)
+        );
+
+        // Wait for git_head_diverged to become true
+        let diverged = query_until_match(
+            &socket_path,
+            &dir.path().to_string_lossy(),
+            |s| s.contains("diverged=true"),
+        )
+        .await;
+        assert!(
+            diverged.contains("diverged=true"),
+            "should show git_head_diverged after git checkout: {diverged:?}"
+        );
+
+        // Now run `jj status` to trigger reconciliation
+        Command::new("jj")
+            .args(["status"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        // Wait for diverged to clear
+        let reconciled = query_until_match(
+            &socket_path,
+            &dir.path().to_string_lossy(),
+            |s| s.contains("diverged=false"),
+        )
+        .await;
+        assert!(
+            reconciled.contains("diverged=false"),
+            "should clear diverged after jj reconciliation: {reconciled:?}"
+        );
+
+        let _ = send_request(&socket_path, &Request::Shutdown).await;
+        daemon.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_daemon_colocated_touch_git_head_no_diverged() {
+        let dir = create_jj_repo().await;
+        let rt = temp_runtime_dir("git-touch");
+        let socket_path = rt.path().join("sock");
+        let config = Config {
+            color: false,
+            template: TemplateConfig {
+                format: Some(
+                    "diverged={{ git_head_diverged }} files={{ file_mad_count }}".to_string(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Create a commit so there's history
+        std::fs::write(dir.path().join("a.txt"), "aaa\n").unwrap();
+        Command::new("jj")
+            .args(["commit", "-m", "first"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        let daemon = tokio::spawn(run_daemon_for_test(config, rt.path().to_path_buf()));
+
+        // Wait for initial status — diverged=false
+        let initial = query_until_match(&socket_path, &dir.path().to_string_lossy(), |s| {
+            s.contains("diverged=false")
+        })
+        .await;
+        assert!(
+            initial.contains("diverged=false"),
+            "initial status should not be diverged: {initial:?}"
+        );
+
+        // Touch .git/HEAD — changes mtime but not content.
+        // This produces a filesystem Modify event that the watcher will see,
+        // but the hash comparison should prevent it from being marked diverged.
+        let git_head = dir.path().join(".git/HEAD");
+        let contents = std::fs::read(&git_head).unwrap();
+        std::fs::write(&git_head, &contents).unwrap();
+
+        // Wait a bit for the debounce + hash comparison to complete, then
+        // verify diverged is still false. We use a short sleep + flush cycle
+        // since there's no state change to wait for — we're asserting absence.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let status = query_until_match(&socket_path, &dir.path().to_string_lossy(), |s| {
+            s.contains("diverged=false")
+        })
+        .await;
+        assert!(
+            status.contains("diverged=false"),
+            "touch .git/HEAD should not trigger diverged: {status:?}"
         );
 
         let _ = send_request(&socket_path, &Request::Shutdown).await;

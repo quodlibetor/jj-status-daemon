@@ -3,6 +3,7 @@
     Branch: bold magenta. Indicators: ●=staged (red), ✚=changed (blue),
     –=deleted (blue), …=untracked (cyan), ✔=clean (bold green)
 -#}
+{% if git_head_diverged %}{{ "▮jj" | bright_red }} {% endif -%}
 {% if is_jj -%}
   {{ "(" | bright_black }}
   {{- change_id_prefix | bold | magenta }}{{ change_id_rest | bright_black }}

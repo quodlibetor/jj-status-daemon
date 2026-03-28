@@ -8,6 +8,7 @@
 {% set immutable_icon = "IMMUTABLE" -%}
 {% set empty_icon = "(EMPTY)" -%}
 {% set stale_icon = "STALE" -%}
+{% set diverged_icon = "[]jj" -%}
 {% set ahead_icon = "^" -%}
 {% set behind_icon = "v" -%}
 {% set stash_icon = "*" -%}

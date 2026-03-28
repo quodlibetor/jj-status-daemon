@@ -160,6 +160,17 @@ pub struct RepoStatus {
     // Staleness (set when refresh fails with cached data)
     pub is_stale: bool,
     pub refresh_error: String,
+
+    // Colocated jj+git: external git operation changed HEAD but jj hasn't
+    // reconciled yet. Unlike is_stale, this won't self-resolve — the user
+    // must run a jj command to trigger a snapshot.
+    pub git_head_diverged: bool,
+
+    // In colocated jj+git repos, the git commit hash that .git/HEAD should
+    // point to (i.e. the first parent of the working copy commit). Used by
+    // the daemon to detect external git checkouts. Not exposed to templates.
+    #[serde(skip)]
+    pub expected_git_head: String,
 }
 
 impl Default for RepoStatus {
@@ -206,6 +217,8 @@ impl Default for RepoStatus {
             is_default_workspace: true,
             is_stale: false,
             refresh_error: String::new(),
+            git_head_diverged: false,
+            expected_git_head: String::new(),
         }
     }
 }
@@ -360,6 +373,7 @@ pub fn format_status(status: &RepoStatus, template: &str, color: bool) -> String
     // Staleness
     ctx.insert("is_stale", &status.is_stale);
     ctx.insert("refresh_error", &status.refresh_error);
+    ctx.insert("git_head_diverged", &status.git_head_diverged);
 
     match build_tera(template, color) {
         Ok(tera) => match tera.render("tpl", &ctx) {
@@ -792,6 +806,7 @@ format = '''
 {% set immutable_icon = "IMMUTABLE" -%}
 {% set empty_icon = "(EMPTY)" -%}
 {% set stale_icon = "STALE" -%}
+{% set diverged_icon = "[]jj" -%}
 {% set files_icon = "f" -%}
 {% set lines_icon = "l" -%}
 {% set workspace_open = "/" -%}

@@ -3,6 +3,7 @@
     Branch: bold purple with  icon.
     Status: bold red, symbols: +=staged, !=modified, ✘=deleted, ?=untracked, ==conflicted
 -#}
+{% if git_head_diverged %}{{ "▮jj" | bright_red }} {% endif -%}
 {% if is_jj -%}
   {{ "on" | bright_black }} {{ " " | bold | magenta }}
   {{- change_id_prefix | bold | magenta }}{{ change_id_rest | bright_black }}

@@ -31,6 +31,12 @@ pub enum WatchEvent {
         vcs_change_hint: Option<VcsChangeHint>,
         /// Absolute paths of changed files (non-ignored working copy files only).
         changed_paths: Vec<PathBuf>,
+        /// In colocated jj+git repos: `.git/HEAD` or branch refs changed, indicating an
+        /// external git operation (e.g. `git checkout`). The daemon should mark the repo
+        /// as stale until jj reconciles, because jj's parent tree is now out of sync
+        /// with the working copy and incremental diffs would be computed against the
+        /// wrong baseline.
+        colocated_git_head_changed: bool,
     },
     Flush(tokio::sync::oneshot::Sender<()>),
 }
@@ -385,6 +391,17 @@ pub fn watch_repo(
             let working_copy_changed = event.paths.iter().any(|p| !is_vcs_internal(p));
             let vcs_change_hint = merge_vcs_hints(&vcs_dir, vcs_kind, &event.paths);
 
+            // In colocated jj+git repos, detect external git operations (e.g. `git checkout`)
+            // that change HEAD. jj won't reconcile until its next snapshot, so diffs computed
+            // against jj's stale parent tree would be wrong.
+            let colocated_git_head_changed = colocated_git_dir.as_ref().is_some_and(|gd| {
+                event.paths.iter().any(|p| {
+                    p.starts_with(gd)
+                        && classify_git_internal_path(gd, p)
+                            .is_some_and(|h| h >= VcsChangeHint::HeadMayHaveChanged)
+                })
+            });
+
             // Lazily discover ignore files and filter paths in one step.
             // Ignore files are incorporated before filtering so the matcher
             // is always up-to-date when we check paths.
@@ -402,7 +419,7 @@ pub fn watch_repo(
             }
 
             // Drop events that are purely VCS-internal noise (all paths classified as skip).
-            if !working_copy_changed && vcs_change_hint.is_none() {
+            if !working_copy_changed && vcs_change_hint.is_none() && !colocated_git_head_changed {
                 return;
             }
 
@@ -412,6 +429,7 @@ pub fn watch_repo(
                 working_copy_changed,
                 vcs_change_hint,
                 changed_paths: verdict.changed_paths,
+                colocated_git_head_changed,
             });
         })?;
 
@@ -423,6 +441,23 @@ pub fn watch_repo(
                 watcher
                     .watch(&op_heads_dir, RecursiveMode::NonRecursive)
                     .context("failed to watch op_heads")?;
+            }
+            // In colocated repos, watch .git/ for external git operations
+            // (e.g. `git checkout`). The recursive watch on repo_path covers
+            // .git/ in theory, but .git/HEAD changes may arrive in separate
+            // event batches from working copy changes, so we need explicit
+            // watches to reliably detect HEAD divergence.
+            let colocated_git = repo_path.join(".git");
+            if colocated_git.is_dir() {
+                watcher
+                    .watch(&colocated_git, RecursiveMode::NonRecursive)
+                    .context("failed to watch colocated .git")?;
+                let refs_dir = colocated_git.join("refs");
+                if refs_dir.is_dir() {
+                    watcher
+                        .watch(&refs_dir, RecursiveMode::Recursive)
+                        .context("failed to watch colocated .git/refs")?;
+                }
             }
         }
         VcsKind::Git => {
@@ -513,6 +548,63 @@ mod tests {
             }
         }
         assert!(found, "expected working_copy_changed event");
+    }
+
+    #[tokio::test]
+    async fn test_watcher_colocated_git_checkout_event() {
+        let dir = create_jj_repo().await;
+
+        // Build history: two commits with different files
+        std::fs::write(dir.path().join("a.txt"), "aaa\n").unwrap();
+        Command::new("jj")
+            .args(["commit", "-m", "first"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("b.txt"), "bbb\n").unwrap();
+        Command::new("jj")
+            .args(["commit", "-m", "second"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        // Let jj events settle
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _watcher = watch_repo(dir.path(), VcsKind::Jj, tx).unwrap();
+
+        // Drain startup events
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while rx.try_recv().is_ok() {}
+
+        // git checkout to previous commit — changes .git/HEAD and removes b.txt
+        let out = Command::new("git")
+            .args(["checkout", "HEAD~1"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success(), "git checkout failed: {}", String::from_utf8_lossy(&out.stderr));
+
+        // Look for a colocated_git_head_changed event
+        let mut found_diverged = false;
+        for _ in 0..200 {
+            match timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Some(WatchEvent::Change {
+                    colocated_git_head_changed: true,
+                    ..
+                })) => {
+                    found_diverged = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(found_diverged, "expected colocated_git_head_changed event after git checkout");
     }
 
     #[tokio::test]
