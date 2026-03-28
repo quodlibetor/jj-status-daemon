@@ -88,6 +88,13 @@ pub struct Bookmark {
     pub tracking: TrackingStatus,
 }
 
+/// VCS status for a single repository, used as the template rendering context.
+///
+/// **Metadata fields** (branch, description, bookmarks, conflict, etc.) are updated
+/// by `jj::update_base_status_metadata` during metadata-only refreshes. If you add
+/// a new metadata field here, you must also update that function to propagate it.
+/// Diff stats fields (lines_added_*, file_mad_count_*, etc.) are managed by the
+/// incremental overlay and should NOT be copied there.
 #[derive(Debug, Clone)]
 pub struct RepoStatus {
     // VCS type flags

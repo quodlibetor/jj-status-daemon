@@ -102,6 +102,8 @@ pub struct DiffCounts {
 pub struct JjRepoState {
     store: Arc<jj_lib::store::Store>,
     parent_tree: jj_lib::merged_tree::MergedTree,
+    /// Tree IDs of the parent tree, used to detect baseline changes without full diff.
+    parent_tree_ids: jj_lib::merge::Merge<jj_lib::backend::TreeId>,
     /// Per-file stats from the last full jj-lib diff (parent_tree vs commit.tree()).
     base_file_stats: HashMap<String, FileDiffStats>,
     /// Overlay: per-file stats computed from disk reads for working copy files.
@@ -259,7 +261,7 @@ impl JjRepoState {
             files_modified_total: c.files_modified,
             files_added_total: c.files_added,
             files_deleted_total: c.files_deleted,
-            empty: c.file_mad_count == 0 && self.base_status.empty && self.overlay.is_empty(),
+            empty: c.file_mad_count == 0,
             ..self.base_status.clone()
         }
     }
@@ -695,35 +697,36 @@ fn find_ancestor_bookmarks(
 }
 
 /// Core jj-lib query logic. Returns both the status and retained state for incremental updates.
-///
-/// This produces `!Send` futures (due to jj-lib internals),
-/// so it must be run via `block_on` inside `spawn_blocking`.
-#[tracing::instrument(fields(repo = %repo_path.display()))]
-async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<(RepoStatus, JjRepoState)> {
+/// Loaded jj workspace state — shared by full refresh and validate-and-refresh paths.
+struct JjLoadedRepo {
+    repo: Arc<jj_lib::repo::ReadonlyRepo>,
+    commit: jj_lib::commit::Commit,
+    parent_tree_ids: jj_lib::merge::Merge<jj_lib::backend::TreeId>,
+    /// Metadata-only status (no diff stats populated).
+    metadata_status: RepoStatus,
+}
+
+/// Load a jj workspace/repo and compute metadata. This is the shared first step
+/// for both full refresh and validate-and-refresh — call once, then branch on
+/// whether the parent tree IDs changed.
+async fn load_jj_repo(repo_path: &Path, depth: u32) -> Result<JjLoadedRepo> {
     let settings = create_user_settings()?;
-    let workspace = {
-        let _span = tracing::debug_span!("load_workspace").entered();
-        Workspace::load(
-            &settings,
-            repo_path,
-            &StoreFactories::default(),
-            &default_working_copy_factories(),
-        )
-        .context("load jj workspace")?
-    };
+    let workspace = Workspace::load(
+        &settings,
+        repo_path,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    )
+    .context("load jj workspace")?;
 
     let workspace_name = workspace.workspace_name().to_owned();
-    let repo: Arc<jj_lib::repo::ReadonlyRepo> = {
-        let _span = tracing::debug_span!("load_repo").entered();
-        workspace
-            .repo_loader()
-            .load_at_head()
-            .await
-            .context("load jj repo at head")?
-    };
+    let repo: Arc<jj_lib::repo::ReadonlyRepo> = workspace
+        .repo_loader()
+        .load_at_head()
+        .await
+        .context("load jj repo at head")?;
 
     let view = repo.view();
-
     let wc_id = view
         .get_wc_commit_id(&workspace_name)
         .context("no working copy commit for workspace")?
@@ -734,21 +737,25 @@ async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<(RepoStatus, JjRep
         .get_commit(&wc_id)
         .context("get working copy commit")?;
 
+    let parent_tree = commit.parent_tree(repo.as_ref()).await.ok();
+    let parent_tree_ids = parent_tree
+        .as_ref()
+        .map(|t| t.tree_ids().clone())
+        .unwrap_or_else(|| commit.tree().tree_ids().clone());
+
+    // Compute metadata-only status (no diff stats)
     let mut status = RepoStatus {
         is_jj: true,
         ..Default::default()
     };
 
-    // Change ID (reverse hex, truncated to 8 chars)
     let change_id_full = encode_reverse_hex(commit.change_id().as_bytes());
     let id_len = 8.min(change_id_full.len());
     status.change_id = change_id_full[..id_len].to_string();
-    // Shortest unique prefix length for colorized display
     status.change_id_prefix_len = repo
         .shortest_unique_change_id_prefix_len(commit.change_id())
         .unwrap_or(id_len);
 
-    // Commit ID (hex, truncated to 8 chars)
     let commit_id_hex = commit.id().hex();
     let id_len = 8.min(commit_id_hex.len());
     status.commit_id = commit_id_hex[..id_len].to_string();
@@ -757,7 +764,6 @@ async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<(RepoStatus, JjRep
         .shortest_unique_commit_id_prefix_len(commit.id())
         .unwrap_or(id_len);
 
-    // Description (first line only)
     status.description = commit
         .description()
         .lines()
@@ -765,40 +771,41 @@ async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<(RepoStatus, JjRep
         .unwrap_or("")
         .to_string();
 
-    // Conflict
     status.conflict = commit.has_conflict();
-
-    // Divergent
     status.divergent = repo
         .resolve_change_id(commit.change_id())
         .ok()
         .flatten()
         .is_some_and(|targets| targets.visible_with_offsets().count() > 1);
-
-    // Hidden
     status.hidden = commit.is_hidden(repo.as_ref()).unwrap_or(false);
+    status.immutable = is_commit_immutable(&repo, &workspace_name, &wc_id);
+    status.bookmarks = find_ancestor_bookmarks(&repo, view, &wc_id, depth)?;
+    status.workspace_name = workspace_name.as_str().to_string();
+    status.is_default_workspace = status.workspace_name == "default";
 
-    // Immutable: check if commit is an immutable head or an ancestor of one
-    // (trunk bookmarks, tags, untracked remote bookmarks).
-    status.immutable = {
-        let _span = tracing::debug_span!("check_immutable").entered();
-        is_commit_immutable(&repo, &workspace_name, &wc_id)
-    };
+    Ok(JjLoadedRepo {
+        repo,
+        commit,
+        parent_tree_ids,
+        metadata_status: status,
+    })
+}
 
-    // Bookmarks
-    status.bookmarks = {
-        let _span = tracing::debug_span!("find_bookmarks").entered();
-        find_ancestor_bookmarks(&repo, view, &wc_id, depth)?
-    };
+/// Given an already-loaded repo, compute full diff stats and build JjRepoState.
+async fn compute_jj_full_status(
+    repo_path: &Path,
+    loaded: JjLoadedRepo,
+) -> Result<(RepoStatus, JjRepoState)> {
+    let mut status = loaded.metadata_status;
 
-    // Diff stats (per-file, also used for incremental overlay)
     let parent_tree = {
         let _span = tracing::debug_span!("load_parent_tree").entered();
-        commit.parent_tree(repo.as_ref()).await.ok()
+        loaded.commit.parent_tree(loaded.repo.as_ref()).await.ok()
     };
-    let current_tree = commit.tree();
+    let current_tree = loaded.commit.tree();
     let base_file_stats = if let Some(ref parent_tree) = parent_tree {
-        let per_file = compute_per_file_diff_stats(repo.store(), parent_tree, &current_tree).await;
+        let per_file =
+            compute_per_file_diff_stats(loaded.repo.store(), parent_tree, &current_tree).await;
         let c = aggregate_file_stats(&per_file);
         status.file_mad_count_working_tree = c.file_mad_count;
         status.lines_added_working_tree = c.lines_added;
@@ -819,19 +826,15 @@ async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<(RepoStatus, JjRep
         HashMap::new()
     };
 
-    // Workspace name
-    status.workspace_name = workspace_name.as_str().to_string();
-    status.is_default_workspace = status.workspace_name == "default";
-
     let repo_root = repo_path
         .canonicalize()
         .unwrap_or_else(|_| repo_path.to_path_buf());
 
-    // Need the parent_tree for incremental updates; if absent, use current_tree as fallback
     let retained_parent_tree = parent_tree.unwrap_or(current_tree);
 
     let jj_state = JjRepoState {
-        store: repo.store().clone(),
+        store: loaded.repo.store().clone(),
+        parent_tree_ids: retained_parent_tree.tree_ids().clone(),
         parent_tree: retained_parent_tree,
         base_file_stats,
         overlay: HashMap::new(),
@@ -840,6 +843,36 @@ async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<(RepoStatus, JjRep
     };
 
     Ok((status, jj_state))
+}
+
+/// Copy metadata fields from a freshly computed status into the retained base_status.
+/// Does NOT touch diff stats fields — those are managed by the overlay.
+///
+/// **Keep in sync with `RepoStatus`**: if you add a metadata field to `RepoStatus`,
+/// you must add it here too. Diff stats fields (lines_added_*, file_mad_count_*, etc.)
+/// and `empty` (derived from diffs for jj, from commit tree for git) should NOT be
+/// copied here — they are maintained by the incremental diff overlay.
+fn update_base_status_metadata(base: &mut RepoStatus, fresh: &RepoStatus) {
+    base.change_id.clone_from(&fresh.change_id);
+    base.change_id_prefix_len = fresh.change_id_prefix_len;
+    base.commit_id.clone_from(&fresh.commit_id);
+    base.commit_id_prefix_len = fresh.commit_id_prefix_len;
+    base.description.clone_from(&fresh.description);
+    base.conflict = fresh.conflict;
+    base.divergent = fresh.divergent;
+    base.hidden = fresh.hidden;
+    base.immutable = fresh.immutable;
+    base.bookmarks.clone_from(&fresh.bookmarks);
+    base.workspace_name.clone_from(&fresh.workspace_name);
+    base.is_default_workspace = fresh.is_default_workspace;
+}
+
+/// This produces `!Send` futures (due to jj-lib internals),
+/// so it must be run via `block_on` inside `spawn_blocking`.
+#[tracing::instrument(fields(repo = %repo_path.display()))]
+async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<(RepoStatus, JjRepoState)> {
+    let loaded = load_jj_repo(repo_path, depth).await?;
+    compute_jj_full_status(repo_path, loaded).await
 }
 
 #[tracing::instrument(skip(config), fields(repo = %repo_path.display()))]
@@ -868,6 +901,15 @@ pub enum JjWorkerRequest {
     /// Full refresh: reload workspace/repo, compute all status fields.
     FullRefresh {
         repo_path: PathBuf,
+        depth: u32,
+        reply: tokio::sync::oneshot::Sender<Result<RepoStatus>>,
+    },
+    /// Validate baseline and refresh: reload workspace/repo, check if parent tree
+    /// changed. If unchanged, do metadata-only update (and optional incremental WC
+    /// diffs). If changed, fall through to full refresh.
+    ValidateAndRefresh {
+        repo_path: PathBuf,
+        changed_paths: Vec<PathBuf>,
         depth: u32,
         reply: tokio::sync::oneshot::Sender<Result<RepoStatus>>,
     },
@@ -917,6 +959,86 @@ async fn jj_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                     }
                     Err(e) => {
                         let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            JjWorkerRequest::ValidateAndRefresh {
+                repo_path,
+                changed_paths,
+                depth,
+                reply,
+            } => {
+                let Some(state) = states.get_mut(&repo_path) else {
+                    // No retained state — fall through to full refresh
+                    let result = query_jj_lib(&repo_path, depth).await;
+                    match result {
+                        Ok((status, jj_state)) => {
+                            states.insert(repo_path, jj_state);
+                            let _ = reply.send(Ok(status));
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                    continue;
+                };
+
+                // Load workspace/repo once — then branch on parent tree IDs
+                let loaded = match load_jj_repo(&repo_path, depth).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                        continue;
+                    }
+                };
+
+                if loaded.parent_tree_ids == state.parent_tree_ids {
+                    // Parent tree unchanged — metadata-only update.
+                    // Keep parent_tree, base_file_stats, overlay intact.
+                    tracing::debug!(
+                        repo = %repo_path.display(),
+                        "parent tree unchanged — metadata-only refresh"
+                    );
+                    update_base_status_metadata(&mut state.base_status, &loaded.metadata_status);
+
+                    // Apply incremental WC diffs if any paths changed
+                    for abs_path in &changed_paths {
+                        let Some(rel_str) = abs_to_repo_relative(&state.repo_root, abs_path) else {
+                            continue;
+                        };
+                        let Ok(repo_path_buf) =
+                            jj_lib::repo_path::RepoPathBuf::from_relative_path(&rel_str)
+                        else {
+                            continue;
+                        };
+                        let disk_content = std::fs::read(abs_path).ok();
+                        let diff_result = diff_single_file(
+                            &state.store,
+                            &state.parent_tree,
+                            &repo_path_buf,
+                            disk_content.as_deref(),
+                        )
+                        .await;
+                        state.overlay.insert(rel_str, diff_result);
+                    }
+
+                    let status = state.current_status();
+                    let _ = reply.send(Ok(status));
+                } else {
+                    // Parent tree changed — full refresh using already-loaded repo
+                    tracing::debug!(
+                        repo = %repo_path.display(),
+                        "parent tree changed — full refresh"
+                    );
+                    let result = compute_jj_full_status(&repo_path, loaded).await;
+                    match result {
+                        Ok((status, jj_state)) => {
+                            states.insert(repo_path, jj_state);
+                            let _ = reply.send(Ok(status));
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                        }
                     }
                 }
             }
@@ -1908,6 +2030,231 @@ mod tests {
         assert_eq!(
             abs_to_repo_relative(root, Path::new("/home/other/file.txt")),
             None
+        );
+    }
+
+    /// ValidateAndRefresh after `jj describe`: parent tree unchanged, so overlay
+    /// should be preserved and only metadata (description) should update.
+    #[tokio::test]
+    async fn test_validate_refresh_jj_describe_preserves_overlay() {
+        let dir = create_jj_repo().await;
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+
+        // Create a file and snapshot it
+        std::fs::write(dir.path().join("file.txt"), "line1\nline2\n").unwrap();
+        jj_cmd(dir.path(), &["status"]).await;
+
+        // Full refresh — establishes baseline with 1 file, 2 lines added
+        let jj_worker = spawn_jj_worker();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(status.file_mad_count_working_tree, 1);
+        assert_eq!(status.lines_added_working_tree, 2);
+        let original_description = status.description.clone();
+
+        // `jj describe` — changes metadata but not parent tree
+        jj_cmd(dir.path(), &["describe", "-m", "new description"]).await;
+
+        // ValidateAndRefresh — should detect unchanged parent tree, do metadata-only
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::ValidateAndRefresh {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![],
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+
+        // Metadata should be updated
+        assert_eq!(status.description, "new description");
+        assert_ne!(status.description, original_description);
+
+        // Overlay/diffs should be preserved — same file stats as before
+        assert_eq!(
+            status.file_mad_count_working_tree, 1,
+            "overlay should be preserved after describe"
+        );
+        assert_eq!(
+            status.lines_added_working_tree, 2,
+            "line stats should be preserved after describe"
+        );
+    }
+
+    /// ValidateAndRefresh after `jj bookmark create`: parent tree unchanged,
+    /// so overlay should be preserved and bookmark metadata should update.
+    #[tokio::test]
+    async fn test_validate_refresh_jj_bookmark_preserves_overlay() {
+        let dir = create_jj_repo().await;
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+
+        // Create a file and snapshot it
+        std::fs::write(dir.path().join("file.txt"), "content\n").unwrap();
+        jj_cmd(dir.path(), &["status"]).await;
+
+        // Full refresh
+        let jj_worker = spawn_jj_worker();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(status.file_mad_count_working_tree, 1);
+        assert!(status.bookmarks.is_empty());
+
+        // Create a bookmark
+        jj_cmd(dir.path(), &["bookmark", "create", "my-branch"]).await;
+
+        // ValidateAndRefresh
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::ValidateAndRefresh {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![],
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+
+        // Bookmark metadata updated
+        assert!(
+            !status.bookmarks.is_empty(),
+            "bookmark should appear after create"
+        );
+
+        // Diffs preserved
+        assert_eq!(
+            status.file_mad_count_working_tree, 1,
+            "overlay should be preserved after bookmark create"
+        );
+    }
+
+    /// ValidateAndRefresh after `jj new`: parent tree changes (new empty commit),
+    /// so a full refresh should be triggered.
+    #[tokio::test]
+    async fn test_validate_refresh_jj_new_triggers_full_refresh() {
+        let dir = create_jj_repo().await;
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+
+        // Create a file and snapshot it
+        std::fs::write(dir.path().join("file.txt"), "line1\nline2\n").unwrap();
+        jj_cmd(dir.path(), &["status"]).await;
+
+        // Full refresh — 1 file, 2 lines added
+        let jj_worker = spawn_jj_worker();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(status.file_mad_count_working_tree, 1);
+        assert_eq!(status.lines_added_working_tree, 2);
+        let old_change_id = status.change_id.clone();
+
+        // `jj new` — creates a new empty change on top, parent tree now includes file.txt
+        jj_cmd(dir.path(), &["new"]).await;
+
+        // ValidateAndRefresh — parent tree changed, should trigger full refresh
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::ValidateAndRefresh {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![],
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+
+        // After `jj new`, file.txt is in the parent tree so working tree diff is 0
+        assert_eq!(
+            status.file_mad_count_working_tree, 0,
+            "file.txt is now in parent, so diff should be empty"
+        );
+        assert_ne!(
+            status.change_id, old_change_id,
+            "should have a new change ID after jj new"
+        );
+        assert!(status.empty, "new empty change should be empty");
+    }
+
+    /// ValidateAndRefresh with incremental WC diffs: after `jj describe`,
+    /// also apply incremental diffs for changed_paths.
+    #[tokio::test]
+    async fn test_validate_refresh_jj_describe_with_wc_diffs() {
+        let dir = create_jj_repo().await;
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+
+        // Create and snapshot a file
+        std::fs::write(dir.path().join("a.txt"), "original\n").unwrap();
+        jj_cmd(dir.path(), &["status"]).await;
+
+        // Full refresh
+        let jj_worker = spawn_jj_worker();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(status.lines_added_working_tree, 1);
+
+        // Modify a file on disk AND run `jj describe` (simulates mixed event)
+        std::fs::write(dir.path().join("a.txt"), "original\nnew line\n").unwrap();
+        jj_cmd(dir.path(), &["describe", "-m", "updated"]).await;
+
+        // ValidateAndRefresh with changed_paths
+        let abs_path = dir.path().canonicalize().unwrap().join("a.txt");
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::ValidateAndRefresh {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![abs_path],
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+
+        // Description updated
+        assert_eq!(status.description, "updated");
+
+        // Incremental diff applied — now 2 lines added
+        assert_eq!(
+            status.lines_added_working_tree, 2,
+            "should see updated line count from incremental diff"
         );
     }
 }

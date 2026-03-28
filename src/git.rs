@@ -11,6 +11,7 @@ use crate::jj::{
     aggregate_overlay_stats_by_dir,
 };
 use crate::template::RepoStatus;
+use crate::watcher::VcsChangeHint;
 
 const GIT2_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -130,6 +131,7 @@ impl GitRepoState {
             files_added_total: tot.files_added,
             files_deleted_total: tot.files_deleted,
             untracked: tot.files_untracked,
+            empty: tot.file_mad_count == 0,
             // Staged stats are unchanged by working copy edits
             ..self.base_status.clone()
         }
@@ -209,6 +211,114 @@ fn query_git_status_blocking(repo_path: &Path) -> Result<RepoStatus> {
     Ok(status)
 }
 
+/// Refresh git metadata fields (branch, stash, ahead/behind, conflict, rebase state)
+/// without recomputing diffs. Mutates `base_status` in-place.
+fn refresh_git_metadata(status: &mut RepoStatus, repo: &mut git2::Repository) {
+    // Branch name
+    if let Ok(head) = repo.head() {
+        status.branch = if head.is_branch() {
+            head.shorthand().unwrap_or("").to_string()
+        } else {
+            String::new()
+        };
+    }
+
+    // Conflict detection
+    status.conflict = repo.index().map(|idx| idx.has_conflicts()).unwrap_or(false);
+
+    // Rebase detection
+    status.rebasing = matches!(
+        repo.state(),
+        git2::RepositoryState::Rebase
+            | git2::RepositoryState::RebaseInteractive
+            | git2::RepositoryState::RebaseMerge
+            | git2::RepositoryState::ApplyMailbox
+            | git2::RepositoryState::ApplyMailboxOrRebase
+    );
+
+    // Ahead/behind
+    status.ahead = 0;
+    status.behind = 0;
+    if !status.branch.is_empty()
+        && let Ok(local) = repo.find_branch(&status.branch, git2::BranchType::Local)
+        && let Ok(upstream) = local.upstream()
+        && let Some(local_oid) = local.get().target()
+        && let Some(upstream_oid) = upstream.get().target()
+        && let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, upstream_oid)
+    {
+        status.ahead = ahead as u32;
+        status.behind = behind as u32;
+    }
+
+    // Stash count
+    let mut count: u32 = 0;
+    let _ = repo.stash_foreach(|_index, _message, _oid| {
+        count += 1;
+        true
+    });
+    status.stashes = count;
+}
+
+/// Recompute all three diff baselines (unstaged, staged, total) after an index change.
+/// Clears overlays since the baselines changed.
+fn refresh_git_diffs(state: &mut GitRepoState, repo: &git2::Repository) {
+    let head_tree = state.head_tree_oid.and_then(|oid| repo.find_tree(oid).ok());
+
+    // Unstaged: index → workdir
+    {
+        let mut diff_opts = git2::DiffOptions::new();
+        diff_opts.include_untracked(true);
+        if let Ok(diff) = repo.diff_index_to_workdir(None, Some(&mut diff_opts)) {
+            state.base_unstaged = per_file_stats_from_diff(&diff).unwrap_or_default();
+            let c = aggregate_file_stats(&state.base_unstaged);
+            state.base_status.file_mad_count_working_tree = c.file_mad_count;
+            state.base_status.lines_added_working_tree = c.lines_added;
+            state.base_status.lines_removed_working_tree = c.lines_removed;
+            state.base_status.files_modified_working_tree = c.files_modified;
+            state.base_status.files_added_working_tree = c.files_added;
+            state.base_status.files_deleted_working_tree = c.files_deleted;
+        }
+    }
+
+    // Staged: tree → index
+    {
+        if let Ok(diff) = repo.diff_tree_to_index(head_tree.as_ref(), None, None)
+            && let Ok(c) = diff_stats(&diff)
+        {
+            state.base_status.file_mad_count_staged = c.file_mad_count;
+            state.base_status.lines_added_staged = c.lines_added;
+            state.base_status.lines_removed_staged = c.lines_removed;
+            state.base_status.files_modified_staged = c.files_modified;
+            state.base_status.files_added_staged = c.files_added;
+            state.base_status.files_deleted_staged = c.files_deleted;
+        }
+    }
+
+    // Total: tree → workdir+index
+    {
+        let mut total_opts = git2::DiffOptions::new();
+        total_opts.include_untracked(true);
+        if let Ok(diff) =
+            repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut total_opts))
+        {
+            state.base_total = per_file_stats_from_diff(&diff).unwrap_or_default();
+            let c = aggregate_file_stats(&state.base_total);
+            state.base_status.file_mad_count = c.file_mad_count;
+            state.base_status.lines_added_total = c.lines_added;
+            state.base_status.lines_removed_total = c.lines_removed;
+            state.base_status.files_modified_total = c.files_modified;
+            state.base_status.files_added_total = c.files_added;
+            state.base_status.files_deleted_total = c.files_deleted;
+            state.base_status.untracked = c.files_untracked;
+            state.base_status.empty = c.file_mad_count == 0;
+        }
+    }
+
+    // Clear overlays since baselines changed
+    state.unstaged_overlay.clear();
+    state.total_overlay.clear();
+}
+
 /// Full git status query that also returns retained state for incremental updates.
 #[tracing::instrument(fields(repo = %repo_path.display()))]
 fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus, GitRepoState)> {
@@ -260,16 +370,7 @@ fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus,
                 .unwrap_or_else(|_| format!("{:.7}", oid));
             status.description = commit.summary().unwrap_or("").to_string();
 
-            // Empty detection: compare HEAD tree to parent tree
             let head_tree = commit.tree().ok();
-            let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-            if let Some(head_tree) = &head_tree {
-                let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(head_tree), None);
-                status.empty = match diff {
-                    Ok(d) => d.stats().map(|s| s.files_changed() == 0).unwrap_or(false),
-                    Err(_) => false,
-                };
-            }
             head_tree.map(|t| t.id())
         } else {
             None
@@ -333,6 +434,7 @@ fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus,
                 status.files_added_total = c.files_added;
                 status.files_deleted_total = c.files_deleted;
                 status.untracked = c.files_untracked;
+                status.empty = c.file_mad_count == 0;
                 per_file
             } else {
                 HashMap::new()
@@ -422,6 +524,14 @@ pub enum GitWorkerRequest {
         repo_path: PathBuf,
         reply: tokio::sync::oneshot::Sender<Result<RepoStatus>>,
     },
+    /// Validate baseline and refresh: check HEAD tree OID, then dispatch to
+    /// metadata-only, index refresh, or full refresh based on hint.
+    ValidateAndRefresh {
+        repo_path: PathBuf,
+        changed_paths: Vec<PathBuf>,
+        hint: VcsChangeHint,
+        reply: tokio::sync::oneshot::Sender<Result<RepoStatus>>,
+    },
     /// Incremental update: diff specific working copy files using retained state.
     IncrementalUpdate {
         repo_path: PathBuf,
@@ -459,6 +569,92 @@ pub fn spawn_git_worker() -> mpsc::UnboundedSender<GitWorkerRequest> {
                         Err(e) => {
                             let _ = reply.send(Err(e));
                         }
+                    }
+                }
+                GitWorkerRequest::ValidateAndRefresh {
+                    repo_path,
+                    changed_paths,
+                    hint,
+                    reply,
+                } => {
+                    let Some(state) = states.get_mut(&repo_path) else {
+                        // No retained state — fall through to full refresh
+                        let result = query_git_status_blocking_with_state(&repo_path);
+                        match result {
+                            Ok((status, git_state)) => {
+                                states.insert(repo_path, git_state);
+                                let _ = reply.send(Ok(status));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                        }
+                        continue;
+                    };
+
+                    // Open repo and check HEAD tree OID
+                    let mut repo = match git2::Repository::open(&state.repo_root) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ =
+                                reply.send(Err(anyhow::anyhow!("failed to open git repo: {e}")));
+                            continue;
+                        }
+                    };
+
+                    let current_head_tree_oid = repo
+                        .head()
+                        .ok()
+                        .and_then(|h| h.peel_to_commit().ok())
+                        .and_then(|c| c.tree().ok())
+                        .map(|t| t.id());
+
+                    if current_head_tree_oid != state.head_tree_oid {
+                        // HEAD tree changed — full refresh
+                        tracing::debug!(
+                            repo = %repo_path.display(),
+                            "HEAD tree OID changed — full refresh"
+                        );
+                        let result = query_git_status_blocking_with_state(&repo_path);
+                        match result {
+                            Ok((status, git_state)) => {
+                                states.insert(repo_path, git_state);
+                                let _ = reply.send(Ok(status));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                        }
+                    } else {
+                        // HEAD tree unchanged — dispatch based on hint
+                        match hint {
+                            VcsChangeHint::IndexChanged => {
+                                // Re-diff all three baselines, clear overlays
+                                tracing::debug!(
+                                    repo = %repo_path.display(),
+                                    "index changed — refreshing staged/unstaged/total diffs"
+                                );
+                                refresh_git_diffs(state, &repo);
+                            }
+                            VcsChangeHint::MetadataOnly | VcsChangeHint::HeadMayHaveChanged => {
+                                // HEAD didn't actually change — just update metadata
+                                tracing::debug!(
+                                    repo = %repo_path.display(),
+                                    ?hint,
+                                    "metadata-only refresh"
+                                );
+                            }
+                        }
+                        // Always refresh metadata (branch, stash, ahead/behind, conflict, rebase)
+                        refresh_git_metadata(&mut state.base_status, &mut repo);
+
+                        // Apply incremental WC diffs if any paths changed
+                        if !changed_paths.is_empty() {
+                            state.update_files(&changed_paths);
+                        }
+
+                        let status = state.current_status();
+                        let _ = reply.send(Ok(status));
                     }
                 }
                 GitWorkerRequest::IncrementalUpdate {
@@ -1386,5 +1582,203 @@ mod tests {
             .unwrap();
         let result = reply_rx.await.unwrap();
         assert!(result.is_err(), "expected error without prior full refresh");
+    }
+
+    /// ValidateAndRefresh after `git commit`: HEAD tree OID changes, so
+    /// a full refresh should be triggered.
+    #[tokio::test]
+    async fn test_validate_refresh_git_commit_triggers_full_refresh() {
+        let dir = create_git_repo().await;
+        let worker = spawn_git_worker();
+
+        // Create a file and stage it
+        std::fs::write(dir.path().join("new.txt"), "hello\nworld\n").unwrap();
+        git_cmd(dir.path(), &["add", "new.txt"]).await;
+
+        // Full refresh — sees staged + unstaged
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        worker
+            .send(GitWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert!(status.file_mad_count > 0, "should see staged file");
+
+        // Commit the file — HEAD tree OID changes
+        git_cmd(dir.path(), &["commit", "-m", "add new.txt"]).await;
+
+        // ValidateAndRefresh with HeadMayHaveChanged — should detect OID change, full refresh
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        worker
+            .send(GitWorkerRequest::ValidateAndRefresh {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![],
+                hint: VcsChangeHint::HeadMayHaveChanged,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+
+        // After commit, working tree should be clean
+        assert_eq!(
+            status.file_mad_count, 0,
+            "should be clean after commit + full refresh"
+        );
+    }
+
+    /// ValidateAndRefresh after `git add`: IndexChanged hint triggers
+    /// re-diffing staged/unstaged/total while preserving HEAD tree OID.
+    #[tokio::test]
+    async fn test_validate_refresh_git_add_index_changed() {
+        let dir = create_git_repo().await;
+        let worker = spawn_git_worker();
+
+        // Modify a tracked file (the initial commit has README)
+        std::fs::write(dir.path().join("README"), "modified content\n").unwrap();
+
+        // Full refresh — sees unstaged modification
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        worker
+            .send(GitWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(status.file_mad_count_staged, 0, "nothing staged yet");
+        assert!(
+            status.file_mad_count > 0,
+            "should see modified file in total"
+        );
+
+        // Stage the file
+        git_cmd(dir.path(), &["add", "README"]).await;
+
+        // ValidateAndRefresh with IndexChanged — HEAD tree OID unchanged
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        worker
+            .send(GitWorkerRequest::ValidateAndRefresh {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![],
+                hint: VcsChangeHint::IndexChanged,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+
+        // Staged stats should now show the file
+        assert!(
+            status.file_mad_count_staged > 0,
+            "should see staged file after git add + index refresh"
+        );
+    }
+
+    /// ValidateAndRefresh with MetadataOnly hint (e.g. stash count change):
+    /// HEAD tree OID unchanged, diffs preserved, metadata updated.
+    #[tokio::test]
+    async fn test_validate_refresh_git_metadata_only() {
+        let dir = create_git_repo().await;
+        let worker = spawn_git_worker();
+
+        // Create and stage a file (but don't commit)
+        std::fs::write(dir.path().join("new.txt"), "content\n").unwrap();
+        git_cmd(dir.path(), &["add", "new.txt"]).await;
+
+        // Full refresh
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        worker
+            .send(GitWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        let original_branch = status.branch.clone();
+        assert!(status.file_mad_count > 0);
+
+        // MetadataOnly refresh — nothing actually changed, just testing the path
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        worker
+            .send(GitWorkerRequest::ValidateAndRefresh {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![],
+                hint: VcsChangeHint::MetadataOnly,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+
+        // Diffs preserved
+        assert!(
+            status.file_mad_count > 0,
+            "diffs should be preserved on metadata-only refresh"
+        );
+        // Metadata still correct
+        assert_eq!(status.branch, original_branch);
+    }
+
+    /// ValidateAndRefresh with HeadMayHaveChanged hint but HEAD tree OID
+    /// actually unchanged — should be treated as metadata-only, preserving overlays.
+    #[tokio::test]
+    async fn test_validate_refresh_git_head_unchanged_preserves_overlay() {
+        let dir = create_git_repo().await;
+
+        // Commit a file so we can modify it and track diffs
+        std::fs::write(dir.path().join("work.txt"), "a\nb\nc\n").unwrap();
+        git_cmd(dir.path(), &["add", "work.txt"]).await;
+        git_cmd(dir.path(), &["commit", "-m", "add work.txt"]).await;
+
+        let worker = spawn_git_worker();
+
+        // Modify the committed file
+        std::fs::write(dir.path().join("work.txt"), "a\nb\nc\nd\n").unwrap();
+
+        // Full refresh — sees 1 modified file with 1 line added
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        worker
+            .send(GitWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(status.file_mad_count, 1);
+        assert_eq!(status.lines_added_total, 1, "1 line added vs HEAD");
+
+        // Further modify the file and do incremental update
+        std::fs::write(dir.path().join("work.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        worker
+            .send(GitWorkerRequest::IncrementalUpdate {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![dir.path().join("work.txt")],
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(
+            status.lines_added_total, 2,
+            "2 lines added after second modify"
+        );
+
+        // ValidateAndRefresh with HeadMayHaveChanged but HEAD didn't actually change
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        worker
+            .send(GitWorkerRequest::ValidateAndRefresh {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![],
+                hint: VcsChangeHint::HeadMayHaveChanged,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+
+        // Overlay should be preserved — same line count as after incremental
+        assert_eq!(
+            status.lines_added_total, 2,
+            "overlay should be preserved when HEAD tree OID unchanged"
+        );
     }
 }

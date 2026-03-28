@@ -9,15 +9,76 @@ use tokio::sync::mpsc;
 
 use crate::protocol::VcsKind;
 
+/// Hint from path-based classification of VCS-internal filesystem events.
+/// Ordered by severity: higher variants require more expensive refresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum VcsChangeHint {
+    /// Stash, conflict state files — only metadata changed.
+    MetadataOnly,
+    /// Git index changed — staged stats invalid but HEAD tree likely unchanged.
+    IndexChanged,
+    /// HEAD/branch ref changed or jj op_heads changed — commit tree may differ.
+    HeadMayHaveChanged,
+}
+
 pub enum WatchEvent {
     Change {
         repo_path: PathBuf,
         vcs_kind: VcsKind,
         working_copy_changed: bool,
+        /// Hint classifying what kind of VCS-internal change occurred, if any.
+        /// `None` means no VCS-internal paths were in the event (pure working copy change).
+        vcs_change_hint: Option<VcsChangeHint>,
         /// Absolute paths of changed files (non-ignored working copy files only).
         changed_paths: Vec<PathBuf>,
     },
     Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Classify a VCS-internal path to determine what kind of refresh is needed.
+/// Returns `None` for irrelevant paths that should be skipped entirely.
+fn classify_git_internal_path(vcs_dir: &Path, path: &Path) -> Option<VcsChangeHint> {
+    let rel = path.strip_prefix(vcs_dir).ok()?;
+    let first = rel.components().next()?.as_os_str().to_str()?;
+    match first {
+        "HEAD" => Some(VcsChangeHint::HeadMayHaveChanged),
+        "packed-refs" => Some(VcsChangeHint::HeadMayHaveChanged),
+        "index" => Some(VcsChangeHint::IndexChanged),
+        "index.lock" => None, // transient lock file
+        "MERGE_HEAD" | "REBASE_HEAD" | "CHERRY_PICK_HEAD" => Some(VcsChangeHint::MetadataOnly),
+        "COMMIT_EDITMSG" | "FETCH_HEAD" => None,
+        "refs" => {
+            let second = rel.components().nth(1).and_then(|c| c.as_os_str().to_str());
+            match second {
+                Some("heads") => Some(VcsChangeHint::HeadMayHaveChanged),
+                Some("stash") => Some(VcsChangeHint::MetadataOnly),
+                Some("remotes") | Some("tags") => None,
+                _ => Some(VcsChangeHint::HeadMayHaveChanged), // conservative
+            }
+        }
+        "logs" | "objects" | "info" | "hooks" | "modules" => None,
+        _ => Some(VcsChangeHint::HeadMayHaveChanged), // conservative default
+    }
+}
+
+/// Classify a jj-internal path. All op_heads changes are HeadMayHaveChanged;
+/// we cannot distinguish operation types from filesystem paths alone.
+fn classify_jj_internal_path(_vcs_dir: &Path, _path: &Path) -> Option<VcsChangeHint> {
+    Some(VcsChangeHint::HeadMayHaveChanged)
+}
+
+/// Compute the merged hint from all VCS-internal paths in an event.
+/// Returns `None` if all paths classified as skip (irrelevant).
+fn merge_vcs_hints(vcs_dir: &Path, vcs_kind: VcsKind, paths: &[PathBuf]) -> Option<VcsChangeHint> {
+    let classify = match vcs_kind {
+        VcsKind::Jj => classify_jj_internal_path,
+        VcsKind::Git => classify_git_internal_path,
+    };
+    paths
+        .iter()
+        .filter(|p| p.starts_with(vcs_dir))
+        .filter_map(|p| classify(vcs_dir, p))
+        .max() // PartialOrd: HeadMayHaveChanged > IndexChanged > MetadataOnly
 }
 
 pub struct RepoWatcher {
@@ -295,15 +356,24 @@ pub fn watch_repo(
                 return;
             }
 
-            // Determine if this is a working copy change or a VCS internal change
+            // Classify paths as working copy vs VCS-internal.
             let working_copy_changed = event.paths.iter().any(|p| !p.starts_with(&vcs_dir));
+            let vcs_change_hint = merge_vcs_hints(&vcs_dir, vcs_kind, &event.paths);
 
             // Lazily discover ignore files and filter paths in one step.
             // Ignore files are incorporated before filtering so the matcher
             // is always up-to-date when we check paths.
             let verdict = filter.process_event(&vcs_dir, &event.paths);
-            if working_copy_changed && verdict.all_ignored {
+
+            // Drop events where all working-copy paths are ignored and there's
+            // no relevant VCS-internal change.
+            if working_copy_changed && vcs_change_hint.is_none() && verdict.all_ignored {
                 ignored_events_cb.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+
+            // Drop events that are purely VCS-internal noise (all paths classified as skip).
+            if !working_copy_changed && vcs_change_hint.is_none() {
                 return;
             }
 
@@ -311,6 +381,7 @@ pub fn watch_repo(
                 repo_path: repo_path_owned.clone(),
                 vcs_kind,
                 working_copy_changed,
+                vcs_change_hint,
                 changed_paths: verdict.changed_paths,
             });
         })?;
@@ -667,5 +738,190 @@ mod tests {
             }
         }
         assert!(found, "sub_a/.gitignore should not affect files in sub_b/");
+    }
+
+    // --- Path classification unit tests ---
+
+    #[test]
+    fn test_classify_git_head() {
+        let vcs_dir = Path::new("/repo/.git");
+        assert_eq!(
+            classify_git_internal_path(vcs_dir, Path::new("/repo/.git/HEAD")),
+            Some(VcsChangeHint::HeadMayHaveChanged)
+        );
+    }
+
+    #[test]
+    fn test_classify_git_index() {
+        let vcs_dir = Path::new("/repo/.git");
+        assert_eq!(
+            classify_git_internal_path(vcs_dir, Path::new("/repo/.git/index")),
+            Some(VcsChangeHint::IndexChanged)
+        );
+    }
+
+    #[test]
+    fn test_classify_git_index_lock_skipped() {
+        let vcs_dir = Path::new("/repo/.git");
+        assert_eq!(
+            classify_git_internal_path(vcs_dir, Path::new("/repo/.git/index.lock")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_classify_git_refs_heads() {
+        let vcs_dir = Path::new("/repo/.git");
+        assert_eq!(
+            classify_git_internal_path(vcs_dir, Path::new("/repo/.git/refs/heads/main")),
+            Some(VcsChangeHint::HeadMayHaveChanged)
+        );
+    }
+
+    #[test]
+    fn test_classify_git_refs_stash() {
+        let vcs_dir = Path::new("/repo/.git");
+        assert_eq!(
+            classify_git_internal_path(vcs_dir, Path::new("/repo/.git/refs/stash")),
+            Some(VcsChangeHint::MetadataOnly)
+        );
+    }
+
+    #[test]
+    fn test_classify_git_refs_remotes_skipped() {
+        let vcs_dir = Path::new("/repo/.git");
+        assert_eq!(
+            classify_git_internal_path(vcs_dir, Path::new("/repo/.git/refs/remotes/origin/main")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_classify_git_refs_tags_skipped() {
+        let vcs_dir = Path::new("/repo/.git");
+        assert_eq!(
+            classify_git_internal_path(vcs_dir, Path::new("/repo/.git/refs/tags/v1.0")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_classify_git_packed_refs() {
+        let vcs_dir = Path::new("/repo/.git");
+        assert_eq!(
+            classify_git_internal_path(vcs_dir, Path::new("/repo/.git/packed-refs")),
+            Some(VcsChangeHint::HeadMayHaveChanged)
+        );
+    }
+
+    #[test]
+    fn test_classify_git_merge_head() {
+        let vcs_dir = Path::new("/repo/.git");
+        assert_eq!(
+            classify_git_internal_path(vcs_dir, Path::new("/repo/.git/MERGE_HEAD")),
+            Some(VcsChangeHint::MetadataOnly)
+        );
+    }
+
+    #[test]
+    fn test_classify_git_commit_editmsg_skipped() {
+        let vcs_dir = Path::new("/repo/.git");
+        assert_eq!(
+            classify_git_internal_path(vcs_dir, Path::new("/repo/.git/COMMIT_EDITMSG")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_classify_git_objects_skipped() {
+        let vcs_dir = Path::new("/repo/.git");
+        assert_eq!(
+            classify_git_internal_path(vcs_dir, Path::new("/repo/.git/objects/ab/cd1234")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_classify_git_logs_skipped() {
+        let vcs_dir = Path::new("/repo/.git");
+        assert_eq!(
+            classify_git_internal_path(vcs_dir, Path::new("/repo/.git/logs/HEAD")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_classify_git_unknown_conservative() {
+        let vcs_dir = Path::new("/repo/.git");
+        assert_eq!(
+            classify_git_internal_path(vcs_dir, Path::new("/repo/.git/some_unknown_file")),
+            Some(VcsChangeHint::HeadMayHaveChanged)
+        );
+    }
+
+    #[test]
+    fn test_classify_jj_always_head_may_have_changed() {
+        let vcs_dir = Path::new("/repo/.jj");
+        assert_eq!(
+            classify_jj_internal_path(vcs_dir, Path::new("/repo/.jj/repo/op_heads/heads/abc")),
+            Some(VcsChangeHint::HeadMayHaveChanged)
+        );
+    }
+
+    #[test]
+    fn test_merge_hints_takes_max_severity() {
+        let vcs_dir = Path::new("/repo/.git");
+        let paths = vec![
+            PathBuf::from("/repo/.git/refs/stash"), // MetadataOnly
+            PathBuf::from("/repo/.git/index"),      // IndexChanged
+        ];
+        assert_eq!(
+            merge_vcs_hints(vcs_dir, VcsKind::Git, &paths),
+            Some(VcsChangeHint::IndexChanged)
+        );
+    }
+
+    #[test]
+    fn test_merge_hints_head_wins_over_all() {
+        let vcs_dir = Path::new("/repo/.git");
+        let paths = vec![
+            PathBuf::from("/repo/.git/refs/stash"),      // MetadataOnly
+            PathBuf::from("/repo/.git/index"),           // IndexChanged
+            PathBuf::from("/repo/.git/refs/heads/main"), // HeadMayHaveChanged
+        ];
+        assert_eq!(
+            merge_vcs_hints(vcs_dir, VcsKind::Git, &paths),
+            Some(VcsChangeHint::HeadMayHaveChanged)
+        );
+    }
+
+    #[test]
+    fn test_merge_hints_all_skipped_returns_none() {
+        let vcs_dir = Path::new("/repo/.git");
+        let paths = vec![
+            PathBuf::from("/repo/.git/objects/ab/cd1234"),
+            PathBuf::from("/repo/.git/logs/HEAD"),
+            PathBuf::from("/repo/.git/COMMIT_EDITMSG"),
+        ];
+        assert_eq!(merge_vcs_hints(vcs_dir, VcsKind::Git, &paths), None);
+    }
+
+    #[test]
+    fn test_merge_hints_ignores_non_vcs_paths() {
+        let vcs_dir = Path::new("/repo/.git");
+        let paths = vec![
+            PathBuf::from("/repo/src/main.rs"), // not under .git
+            PathBuf::from("/repo/.git/refs/stash"),
+        ];
+        assert_eq!(
+            merge_vcs_hints(vcs_dir, VcsKind::Git, &paths),
+            Some(VcsChangeHint::MetadataOnly)
+        );
+    }
+
+    #[test]
+    fn test_merge_hints_empty_returns_none() {
+        let vcs_dir = Path::new("/repo/.git");
+        assert_eq!(merge_vcs_hints(vcs_dir, VcsKind::Git, &[]), None);
     }
 }
