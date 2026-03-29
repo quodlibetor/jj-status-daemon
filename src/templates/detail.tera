@@ -2,7 +2,12 @@
 {% if git_head_diverged %}{{ diverged_icon | bright_red }} {% endif -%}
 {% if is_jj -%}
   {{ jj_icon | magenta }} {{ change_id_prefix | magenta | bold }}{{ change_id_rest | bright_black | bold }}
-  {%- for b in bookmarks %} {{ bookmark_prefix ~ b.display | blue }}
+  {%- if max_bookmarks is defined -%}
+    {%- set display_bookmarks = bookmarks | limit_bookmarks(count=max_bookmarks, prioritize=prioritize_branches | default(value="")) -%}
+  {%- else -%}
+    {%- set display_bookmarks = bookmarks -%}
+  {%- endif -%}
+  {%- for b in display_bookmarks %} {{ bookmark_prefix ~ b.display | blue }}
     {%- if b.tracking == "ahead" %}{{ tracking_ahead | cyan }}
     {%- elif b.tracking == "behind" %}{{ tracking_behind | cyan }}
     {%- elif b.tracking == "sideways" %}{{ tracking_sideways | bright_red }}

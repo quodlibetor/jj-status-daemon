@@ -8,15 +8,9 @@ use crate::protocol::VcsKind;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Explicit format template. If set, overrides `template_name`.
+    /// Template configuration (name, format overrides, user variables).
     #[serde(default)]
-    pub format: Option<String>,
-    /// Name of a built-in or user-defined template (default: "ascii").
-    #[serde(default = "default_template_name")]
-    pub template_name: String,
-    /// Explicit not-ready template. If set, overrides the built-in not-ready template.
-    #[serde(default)]
-    pub not_ready_format: Option<String>,
+    pub template: TemplateConfig,
     /// User-defined named templates.
     #[serde(default)]
     pub templates: HashMap<String, String>,
@@ -28,6 +22,23 @@ pub struct Config {
     /// 0 means respond immediately.
     #[serde(default = "default_query_timeout_ms")]
     pub query_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateConfig {
+    /// Name of a built-in or user-defined template (default: "ascii").
+    #[serde(default = "default_template_name")]
+    pub name: String,
+    /// Explicit format template. If set, overrides `name`.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Explicit not-ready template. If set, overrides the built-in not-ready template.
+    #[serde(default)]
+    pub not_ready_format: Option<String>,
+    /// User-defined variables injected into the template context.
+    #[serde(default)]
+    pub vars: HashMap<String, String>,
 }
 
 fn default_template_name() -> String {
@@ -46,39 +57,48 @@ fn default_query_timeout_ms() -> u64 {
 impl Config {
     /// Resolve the effective format template string.
     ///
-    /// Priority: `format` field > user `templates[template_name]` > built-in template > ascii fallback.
+    /// Priority: `template.format` > user `templates[template.name]` > built-in template > ascii fallback.
     pub fn resolved_format(&self) -> String {
-        tracing::debug!(template_name = %self.template_name, has_format = self.format.is_some(), "resolving format template");
-        if let Some(fmt) = &self.format {
+        tracing::debug!(template_name = %self.template.name, has_format = self.template.format.is_some(), "resolving format template");
+        if let Some(fmt) = &self.template.format {
             return fmt.clone();
         }
-        if let Some(user_tmpl) = self.templates.get(&self.template_name) {
+        if let Some(user_tmpl) = self.templates.get(&self.template.name) {
             return user_tmpl.clone();
         }
-        if let Some(builtin) = crate::template::builtin_template(&self.template_name) {
+        if let Some(builtin) = crate::template::builtin_template(&self.template.name) {
             return builtin.to_string();
         }
-        // Unknown template_name — fall back to ascii
+        // Unknown template name — fall back to ascii
         crate::template::ASCII_FORMAT.to_string()
     }
 
     /// Resolve the not-ready template string.
     ///
-    /// Priority: `not_ready_format` field > built-in not-ready template matching `template_name`.
+    /// Priority: `template.not_ready_format` > built-in not-ready template matching `template.name`.
     pub fn resolved_not_ready_format(&self) -> String {
-        if let Some(fmt) = &self.not_ready_format {
+        if let Some(fmt) = &self.template.not_ready_format {
             return fmt.clone();
         }
-        crate::template::builtin_not_ready_template(&self.template_name).to_string()
+        crate::template::builtin_not_ready_template(&self.template.name).to_string()
+    }
+}
+
+impl Default for TemplateConfig {
+    fn default() -> Self {
+        Self {
+            name: default_template_name(),
+            format: None,
+            not_ready_format: None,
+            vars: HashMap::new(),
+        }
     }
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            format: None,
-            not_ready_format: None,
-            template_name: default_template_name(),
+            template: TemplateConfig::default(),
             templates: HashMap::new(),
             bookmark_search_depth: default_bookmark_search_depth(),
             color: default_color(),
@@ -206,15 +226,29 @@ pub const DEFAULT_CONFIG_TOML: &str = r##"# vcs-status-daemon configuration
 #
 # Built-in templates: "ascii" (default), "nerdfont", "unicode", "simple", "minimal",
 #                     "gitstatus", "starship", "ohmyzsh", "pure"
-# Select one with template_name, or define your own below.
+# Select one with template.name, or define your own below.
 
+[template]
 # Which template to use. Built-in options: "ascii", "nerdfont", "unicode", "simple", "minimal",
 #                                           "gitstatus", "starship", "ohmyzsh", "pure"
-# template_name = "ascii"
+# name = "ascii"
 
-# Override template_name with an inline format string.
-# If set, this takes priority over template_name and user-defined templates.
+# Override template name with an inline format string.
+# If set, this takes priority over name and user-defined templates.
 # format = "{{ change_id }} {{ branch }}"
+
+# --------------------------------------------------------------------------
+# Template variables
+# --------------------------------------------------------------------------
+# User-defined variables injected into the template context.
+# These can be referenced in templates like any other variable.
+#
+# max_bookmarks: limit the number of jj bookmarks shown (shows "+N more" for overflow).
+# prioritize_branches: glob pattern to prioritize matching bookmarks (e.g. "bwm/*").
+#
+# [template.vars]
+# max_bookmarks = "3"
+# prioritize_branches = "bwm/*"
 
 # --------------------------------------------------------------------------
 # Available template variables
@@ -250,14 +284,20 @@ pub const DEFAULT_CONFIG_TOML: &str = r##"# vcs-status-daemon configuration
 #   branch                         — current branch name
 #   rebasing                       — true during a rebase
 #
-# Color filters (applied with | syntax, e.g. {{ branch | green }}):
-#   red, green, yellow, blue, magenta, cyan, white
-#   bright_red, bright_green, bright_yellow, bright_blue,
-#   bright_magenta, bright_cyan, bright_white
-#   bold, dim
+# Template filters:
+#   Color (applied with | syntax, e.g. {{ branch | green }}):
+#     red, green, yellow, blue, magenta, cyan, white
+#     bright_red, bright_green, bright_yellow, bright_blue,
+#     bright_magenta, bright_cyan, bright_white
+#     bold, dim
+#
+#   limit_bookmarks(count, prioritize):
+#     Limits a bookmark array to `count` items with "(+N more)" overflow.
+#     Optional `prioritize` glob pattern sorts matching bookmarks first.
+#     Example: {{ bookmarks | limit_bookmarks(count=3, prioritize="bwm/*") }}
 # --------------------------------------------------------------------------
 
-# User-defined templates. Reference by name via template_name.
+# User-defined templates. Reference by name via template.name.
 # [templates]
 # minimal = "{{ change_id }}"
 # my_custom = """\
@@ -284,8 +324,8 @@ pub fn load_config_from(config_file: Option<&Path>) -> Result<Config> {
         Ok(config) => {
             tracing::info!(
                 path = %path.display(),
-                template_name = %config.template_name,
-                has_format = config.format.is_some(),
+                template_name = %config.template.name,
+                has_format = config.template.format.is_some(),
                 "loaded config"
             );
             Ok(config)
@@ -305,26 +345,28 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.bookmark_search_depth, 10);
-        assert_eq!(config.template_name, "ascii");
-        assert!(config.format.is_none());
+        assert_eq!(config.template.name, "ascii");
+        assert!(config.template.format.is_none());
         assert!(config.resolved_format().contains("detail.tera"));
     }
 
     #[test]
     fn test_config_format_overrides_template_name() {
         let toml_str = r#"
-template_name = "nerdfont"
+[template]
+name = "nerdfont"
 format = "{{ change_id }}"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        // Explicit format wins over template_name
+        // Explicit format wins over name
         assert_eq!(config.resolved_format(), "{{ change_id }}");
     }
 
     #[test]
     fn test_config_template_name_nerdfont() {
         let toml_str = r#"
-template_name = "nerdfont"
+[template]
+name = "nerdfont"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.resolved_format().contains("󱗆"));
@@ -333,7 +375,8 @@ template_name = "nerdfont"
     #[test]
     fn test_config_user_template() {
         let toml_str = r#"
-template_name = "minimal"
+[template]
+name = "minimal"
 
 [templates]
 minimal = "{{ commit_id }}"
@@ -345,7 +388,8 @@ minimal = "{{ commit_id }}"
     #[test]
     fn test_config_user_template_overrides_builtin() {
         let toml_str = r#"
-template_name = "ascii"
+[template]
+name = "ascii"
 
 [templates]
 ascii = "custom ascii: {{ commit_id }}"
@@ -357,7 +401,8 @@ ascii = "custom ascii: {{ commit_id }}"
     #[test]
     fn test_config_unknown_template_falls_back() {
         let toml_str = r#"
-template_name = "nonexistent"
+[template]
+name = "nonexistent"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         // Should fall back to ascii
@@ -367,11 +412,23 @@ template_name = "nonexistent"
     #[test]
     fn test_config_from_toml() {
         let toml_str = r#"
+[template]
 format = "{{ change_id }}"
+
+[other]
 bookmark_search_depth = 5
 "#;
+        // This should fail because [other] is unknown
+        assert!(toml::from_str::<Config>(toml_str).is_err());
+
+        let toml_str = r#"
+bookmark_search_depth = 5
+
+[template]
+format = "{{ change_id }}"
+"#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.format, Some("{{ change_id }}".to_string()));
+        assert_eq!(config.template.format, Some("{{ change_id }}".to_string()));
         assert_eq!(config.bookmark_search_depth, 5);
     }
 
@@ -390,7 +447,10 @@ bookmark_search_depth = 5
 
     #[test]
     fn test_not_ready_format_nerdfont() {
-        let toml_str = r#"template_name = "nerdfont""#;
+        let toml_str = r#"
+[template]
+name = "nerdfont"
+"#;
         let config: Config = toml::from_str(toml_str).unwrap();
         let fmt = config.resolved_not_ready_format();
         assert!(fmt.contains("…"), "nerdfont not-ready should contain …");
@@ -398,7 +458,10 @@ bookmark_search_depth = 5
 
     #[test]
     fn test_not_ready_format_custom() {
-        let toml_str = r#"not_ready_format = "{{ \"wait\" | yellow }}""#;
+        let toml_str = r#"
+[template]
+not_ready_format = "{{ \"wait\" | yellow }}"
+"#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(
             config.resolved_not_ready_format(),
@@ -410,11 +473,11 @@ bookmark_search_depth = 5
     fn test_config_set_and_get() {
         let dir = tempfile::TempDir::with_prefix("vcs-cfg-set-").unwrap();
         let cf = dir.path().join("config.toml");
-        std::fs::write(&cf, "template_name = \"ascii\"\n").unwrap();
+        std::fs::write(&cf, "[template]\nname = \"ascii\"\n").unwrap();
 
         crate::run_config(
             crate::ConfigAction::Set {
-                key: "template_name".into(),
+                key: "template.name".into(),
                 value: "nerdfont".into(),
             },
             Some(&cf),
@@ -423,7 +486,7 @@ bookmark_search_depth = 5
 
         // Verify via load_config_from
         let config = load_config_from(Some(&cf)).unwrap();
-        assert_eq!(config.template_name, "nerdfont");
+        assert_eq!(config.template.name, "nerdfont");
 
         // Verify the file is still valid TOML
         let contents = std::fs::read_to_string(&cf).unwrap();
@@ -506,7 +569,7 @@ bookmark_search_depth = 5
 
         crate::run_config(
             crate::ConfigAction::Set {
-                key: "template_name".into(),
+                key: "template.name".into(),
                 value: "simple".into(),
             },
             Some(&cf),
@@ -519,7 +582,7 @@ bookmark_search_depth = 5
             "comments should be preserved"
         );
         assert!(
-            contents.contains("template_name = \"simple\""),
+            contents.contains("name = \"simple\""),
             "new value should be present"
         );
     }
@@ -531,7 +594,7 @@ bookmark_search_depth = 5
 
         // File doesn't exist — should return defaults
         let config = load_config_from(Some(&cf)).unwrap();
-        assert_eq!(config.template_name, "ascii");
+        assert_eq!(config.template.name, "ascii");
     }
 
     #[test]
@@ -599,7 +662,7 @@ bookmark_search_depth = 5
 
         let result = crate::run_config(
             crate::ConfigAction::Set {
-                key: "template_name".into(),
+                key: "template.name".into(),
                 value: "nonexistent".into(),
             },
             Some(&cf),
@@ -627,11 +690,26 @@ bookmark_search_depth = 5
 
         crate::run_config(
             crate::ConfigAction::Set {
-                key: "template_name".into(),
+                key: "template.name".into(),
                 value: "my_custom".into(),
             },
             Some(&cf),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_config_template_vars() {
+        let toml_str = r#"
+[template.vars]
+max_bookmarks = "3"
+prioritize_branches = "bwm/*"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.template.vars.get("max_bookmarks").unwrap(), "3");
+        assert_eq!(
+            config.template.vars.get("prioritize_branches").unwrap(),
+            "bwm/*"
+        );
     }
 }

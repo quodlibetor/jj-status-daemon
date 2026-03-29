@@ -243,6 +243,113 @@ fn make_color_filter(code: &'static str, color: bool) -> impl tera::Filter + 'st
     }
 }
 
+/// Simple glob matching: `*` matches any sequence of characters.
+/// Supports patterns like `bwm/*`, `*/main`, `*feature*`.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        // No wildcards — exact match
+        return pattern == name;
+    }
+    let mut pos = 0;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            // First segment must match the start
+            if !name.starts_with(part) {
+                return false;
+            }
+            pos = part.len();
+        } else if i == parts.len() - 1 {
+            // Last segment must match the end
+            if !name[pos..].ends_with(part) {
+                return false;
+            }
+            pos = name.len();
+        } else {
+            // Middle segments can appear anywhere after pos
+            match name[pos..].find(part) {
+                Some(idx) => pos += idx + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+/// Tera filter that limits a bookmark array, with optional glob-based prioritization.
+///
+/// Usage: `{{ bookmarks | limit_bookmarks(count=3, prioritize="bwm/*") }}`
+///
+/// If the array has more than `count` items, it is truncated and a synthetic
+/// bookmark with `display: "(+N more)"` is appended.
+fn make_limit_bookmarks_filter() -> impl tera::Filter {
+    move |value: &tera::Value,
+          args: &std::collections::HashMap<String, tera::Value>|
+          -> tera::Result<tera::Value> {
+        let arr = value
+            .as_array()
+            .ok_or_else(|| tera::Error::msg("limit_bookmarks: expected an array"))?;
+
+        let count = args
+            .get("count")
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            })
+            .ok_or_else(|| tera::Error::msg("limit_bookmarks: `count` argument is required"))?
+            as usize;
+
+        let prioritize = args
+            .get("prioritize")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // Partition into prioritized and rest, preserving relative order
+        let mut prioritized = Vec::new();
+        let mut rest = Vec::new();
+        for item in arr {
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if !prioritize.is_empty() && glob_match(prioritize, name) {
+                prioritized.push(item.clone());
+            } else {
+                rest.push(item.clone());
+            }
+        }
+
+        let mut sorted: Vec<tera::Value> = prioritized;
+        sorted.extend(rest);
+
+        if sorted.len() <= count {
+            return Ok(tera::Value::Array(sorted));
+        }
+
+        let overflow = sorted.len() - count;
+        sorted.truncate(count);
+
+        // Append synthetic "(+N more)" bookmark
+        let mut overflow_obj = serde_json::Map::new();
+        overflow_obj.insert("name".to_string(), tera::Value::String(String::new()));
+        overflow_obj.insert(
+            "display".to_string(),
+            tera::Value::String(format!("(+{overflow} more)")),
+        );
+        overflow_obj.insert(
+            "distance".to_string(),
+            tera::Value::Number(serde_json::Number::from(0)),
+        );
+        overflow_obj.insert(
+            "tracking".to_string(),
+            tera::Value::String("untracked".to_string()),
+        );
+        sorted.push(tera::Value::Object(overflow_obj));
+
+        Ok(tera::Value::Array(sorted))
+    }
+}
+
 /// Create a Tera instance with color filters registered.
 /// Format a tera error with its full cause chain for actionable diagnostics.
 fn format_tera_error(err: &tera::Error) -> String {
@@ -288,6 +395,8 @@ fn build_tera(template: &str, color: bool) -> Result<Tera, tera::Error> {
     for &(name, code) in colors {
         tera.register_filter(name, make_color_filter(code, color));
     }
+
+    tera.register_filter("limit_bookmarks", make_limit_bookmarks_filter());
 
     Ok(tera)
 }
@@ -382,7 +491,19 @@ fn build_template_context(status: &RepoStatus) -> tera::Context {
 }
 
 pub fn format_status(status: &RepoStatus, template: &str, color: bool) -> String {
-    let ctx = build_template_context(status);
+    format_status_with_vars(status, template, color, &std::collections::HashMap::new())
+}
+
+pub fn format_status_with_vars(
+    status: &RepoStatus,
+    template: &str,
+    color: bool,
+    vars: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut ctx = build_template_context(status);
+    for (key, value) in vars {
+        ctx.insert(key, value);
+    }
 
     match build_tera(template, color) {
         Ok(tera) => match tera.render("tpl", &ctx) {
@@ -857,6 +978,7 @@ pub fn format_not_ready(template: &str, color: bool) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use std::collections::HashMap;
 
     #[test]
     fn test_format_jj_with_metrics() {
@@ -954,6 +1076,7 @@ mod tests {
     #[test]
     fn test_format_toml_multiline_matches_default() {
         let toml_str = r#"
+[template]
 format = '''
 {% set jj_icon = "JJ" -%}
 {% set git_icon = "+-" -%}
@@ -2132,5 +2255,173 @@ format = '''
         let formatted = format_status(&status, ASCII_FORMAT, false);
         // "Tracked" (in sync) should not show any arrow
         assert_eq!(formatted, "JJ xlvlt main");
+    }
+
+    #[test]
+    fn test_glob_match() {
+        assert!(glob_match("bwm/*", "bwm/feature"));
+        assert!(glob_match("bwm/*", "bwm/"));
+        assert!(!glob_match("bwm/*", "other/feature"));
+        assert!(glob_match("*/main", "origin/main"));
+        assert!(!glob_match("*/main", "origin/develop"));
+        assert!(glob_match("*feature*", "my-feature-branch"));
+        assert!(!glob_match("*feature*", "main"));
+        assert!(glob_match("main", "main"));
+        assert!(!glob_match("main", "develop"));
+        assert!(glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn test_limit_bookmarks_no_limit() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![
+                Bookmark {
+                    name: "main".into(),
+                    display: "main".into(),
+                    ..Default::default()
+                },
+                Bookmark {
+                    name: "feat".into(),
+                    display: "feat".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        // Without max_bookmarks, all bookmarks shown
+        let formatted = format_status(&status, ASCII_FORMAT, false);
+        assert!(
+            formatted.contains("main"),
+            "should contain main: {formatted}"
+        );
+        assert!(
+            formatted.contains("feat"),
+            "should contain feat: {formatted}"
+        );
+    }
+
+    #[test]
+    fn test_limit_bookmarks_truncates() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![
+                Bookmark {
+                    name: "a".into(),
+                    display: "a".into(),
+                    ..Default::default()
+                },
+                Bookmark {
+                    name: "b".into(),
+                    display: "b".into(),
+                    ..Default::default()
+                },
+                Bookmark {
+                    name: "c".into(),
+                    display: "c".into(),
+                    ..Default::default()
+                },
+                Bookmark {
+                    name: "d".into(),
+                    display: "d".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut vars = HashMap::new();
+        vars.insert("max_bookmarks".to_string(), "2".to_string());
+        let formatted = format_status_with_vars(&status, ASCII_FORMAT, false, &vars);
+        assert!(
+            formatted.contains("a"),
+            "should contain first bookmark: {formatted}"
+        );
+        assert!(
+            formatted.contains("b"),
+            "should contain second bookmark: {formatted}"
+        );
+        assert!(
+            formatted.contains("(+2 more)"),
+            "should contain overflow indicator: {formatted}"
+        );
+        assert!(
+            !formatted.contains(" c"),
+            "should not contain third bookmark: {formatted}"
+        );
+    }
+
+    #[test]
+    fn test_limit_bookmarks_prioritize() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![
+                Bookmark {
+                    name: "other/a".into(),
+                    display: "other/a".into(),
+                    ..Default::default()
+                },
+                Bookmark {
+                    name: "bwm/my-feat".into(),
+                    display: "bwm/my-feat".into(),
+                    ..Default::default()
+                },
+                Bookmark {
+                    name: "other/b".into(),
+                    display: "other/b".into(),
+                    ..Default::default()
+                },
+                Bookmark {
+                    name: "bwm/fix".into(),
+                    display: "bwm/fix".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut vars = HashMap::new();
+        vars.insert("max_bookmarks".to_string(), "2".to_string());
+        vars.insert("prioritize_branches".to_string(), "bwm/*".to_string());
+        let formatted = format_status_with_vars(&status, ASCII_FORMAT, false, &vars);
+        // Should prioritize bwm/* bookmarks
+        assert!(
+            formatted.contains("bwm/my-feat"),
+            "should contain prioritized bookmark: {formatted}"
+        );
+        assert!(
+            formatted.contains("bwm/fix"),
+            "should contain second prioritized bookmark: {formatted}"
+        );
+        assert!(
+            formatted.contains("(+2 more)"),
+            "should contain overflow: {formatted}"
+        );
+    }
+
+    #[test]
+    fn test_limit_bookmarks_no_truncation_needed() {
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![Bookmark {
+                name: "main".into(),
+                display: "main".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut vars = HashMap::new();
+        vars.insert("max_bookmarks".to_string(), "5".to_string());
+        let formatted = format_status_with_vars(&status, ASCII_FORMAT, false, &vars);
+        assert!(
+            formatted.contains("main"),
+            "should contain bookmark: {formatted}"
+        );
+        assert!(
+            !formatted.contains("more"),
+            "should not contain overflow: {formatted}"
+        );
     }
 }

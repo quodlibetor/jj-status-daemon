@@ -143,7 +143,7 @@ The exact output is configured via [tera](https://keats.github.io/tera/docs/#tem
 Built in templates are defined in [src/templates](./src/templates), you can use them as inspiration
 and define new ones in your config file via `vcs-status-daemon config edit`.
 
-You can set any named template with `vcs-status-daemon config set template_name NAME`.
+You can set any named template with `vcs-status-daemon config set template.name NAME`.
 And you can view the source code defining a template with the
 `vcs-status-daemon template print NAME` command.
 
@@ -230,13 +230,20 @@ bookmark_search_depth = 10
 # Enable ANSI color output (default: true)
 color = true
 
+[template]
 # Built-in template to use: "ascii" (default), "nerdfont", "unicode", "simple", or "minimal"
-template_name = "ascii"
+name = "ascii"
 
-# Explicit format template (Tera syntax, overrides template_name if set)
+# Explicit format template (Tera syntax, overrides name if set)
 # format = "..."
 
-# User-defined named templates (selected via template_name)
+# User-defined variables injected into the template rendering context.
+# Built-in templates use these to control bookmark limiting.
+[template.vars]
+# max_bookmarks = "5"            # show at most 5 bookmarks, then "(+N more)"
+# prioritize_branches = "bwm/*"  # glob: matching bookmarks are shown first
+
+# User-defined named templates (selected via template.name)
 # [templates]
 # my_template = "{{ change_id }} {{ description }}"
 ```
@@ -331,7 +338,41 @@ Each item in the `bookmarks` list has:
 | `name` | string | Bookmark name, e.g. `"main"`. |
 | `distance` | integer | Number of commits between `@` and the bookmarked commit. `0` means the bookmark is on `@`. |
 | `display` | string | Pre-formatted display string: `"main"` when distance is 0, `"main+2"` otherwise. |
+| `tracking` | string | Tracking status: `"tracked"`, `"untracked"`, `"ahead"`, `"behind"`, or `"sideways"`. |
 
+#### Template variables (`[template.vars]`)
+
+User-defined variables from `[template.vars]` are injected into the Tera rendering context alongside VCS variables. Built-in templates use these to control bookmark limiting:
+
+| Variable | Effect |
+|---|---|
+| `max_bookmarks` | Maximum number of bookmarks to display. Excess bookmarks are replaced with a "(+N more)" entry. |
+| `prioritize_branches` | Glob pattern (e.g. `bwm/*`, `*main*`). Matching bookmarks are sorted first before the limit is applied. |
+
+Example config:
+
+```toml
+[template.vars]
+max_bookmarks = "5"
+prioritize_branches = "bwm/*"
+```
+
+You can also define arbitrary variables for use in custom templates — any key in `[template.vars]` becomes available as a Tera variable.
+
+#### `limit_bookmarks` filter
+
+The `limit_bookmarks` filter truncates a bookmark list and appends a "(+N more)" indicator:
+
+```tera
+{{ bookmarks | limit_bookmarks(count=3, prioritize="bwm/*") }}
+```
+
+| Argument | Type | Description |
+|---|---|---|
+| `count` | integer (required) | Maximum number of bookmarks to show. |
+| `prioritize` | string (optional) | Glob pattern — matching bookmarks are sorted first. Supports `*` wildcards. |
+
+When `bookmarks.len() > count`, the filter returns the first `count` items plus a synthetic entry with `display: "(+N more)"`. You can use it in custom templates directly, or let the built-in templates apply it automatically via `max_bookmarks` / `prioritize_branches` template vars.
 
 #### Color filters
 
@@ -362,10 +403,11 @@ You can apply filters to variables (`{{ branch | green }}`), string literals (`{
 
 ### Built-in templates
 
-Five templates are included. Select one with `template_name` in your config:
+Five templates are included. Select one with `template.name` in your config:
 
 ```toml
-template_name = "nerdfont"
+[template]
+name = "nerdfont"
 ```
 
 
@@ -400,10 +442,11 @@ Just the branch or bookmark name, color-coded by state. Green = clean, yellow = 
 
 ### User-defined templates
 
-You can define your own named templates in the config and select them with `template_name`:
+You can define your own named templates in the config and select them with `template.name`:
 
 ```toml
-template_name = "minimal"
+[template]
+name = "minimal"
 
 [templates]
 minimal = "{{ commit_id }} {{ description }}"
@@ -418,7 +461,8 @@ Use `vcs-status-daemon template debug` to see the current template with each var
 The built-in `ascii`, `nerdfont`, and `unicode` templates all share the same body (`detail.tera`) and differ only in their icon constants. You can use the same pattern in your own templates — set icon variables with `{% set %}` and then `{% include "detail.tera" %}`:
 
 ```toml
-template_name = "my_icons"
+[template]
+name = "my_icons"
 
 [templates]
 my_icons = '''
@@ -439,15 +483,17 @@ my_icons = '''
 
 ### Inline format override
 
-The `format` field directly sets the template string, overriding `template_name`:
+The `format` field directly sets the template string, overriding `template.name`:
 
 ```toml
+[template]
 format = "{{ change_id }} {{ branch }}"
 ```
 
 In TOML, use multi-line literal strings (`'''`) for readability. Use Tera's `{%-` whitespace trimming to prevent newlines from appearing in the output:
 
 ```toml
+[template]
 format = '''
 {% if is_jj %}{{ change_id }}
 {%- for b in bookmarks %} {{ b.display | blue }}{% endfor %}
@@ -461,6 +507,8 @@ format = '''
 
 ```toml
 color = false
+
+[template]
 format = '''
 {{ change_id }}
 {%- for b in bookmarks %} {{ b.display }}{% endfor %}'''
@@ -470,12 +518,15 @@ format = '''
 
 ```toml
 color = false
+
+[template]
 format = "{% if has_branch %}{{ branch }}{% else %}{{ commit_id }}{% endif %}"
 ```
 
 **Verbose, both VCS** -- with description/state details:
 
 ```toml
+[template]
 format = '''
 {% if is_jj %}{{ change_id }} {{ commit_id | dim }}
 {%- for b in bookmarks %} {{ b.display | blue }}{% endfor %}
@@ -490,6 +541,7 @@ format = '''
 **Custom bookmark formatting** -- show distance differently (jj only):
 
 ```toml
+[template]
 format = '''
 {{ change_id }}
 {%- for b in bookmarks %} {{ b.name | cyan }}{% if b.distance > 0 %}~{{ b.distance }}{% endif %}{% endfor %}

@@ -20,7 +20,7 @@ use crate::jj::{JjWorkerRequest, query_jj_status, spawn_jj_worker};
 use crate::protocol::{DaemonStats, Request, Response, VcsKind};
 use crate::template::RepoStatus;
 use crate::template::format_not_ready;
-use crate::template::format_status;
+use crate::template::format_status_with_vars;
 use crate::watcher::{RepoWatcher, VcsChangeHint, WatchEvent, watch_repo};
 
 struct DaemonState {
@@ -51,8 +51,12 @@ struct DaemonState {
 impl DaemonState {
     /// Format status, appending any sticky config error.
     fn format(&self, status: &RepoStatus) -> String {
-        let mut formatted =
-            format_status(status, &self.config.resolved_format(), self.config.color);
+        let mut formatted = format_status_with_vars(
+            status,
+            &self.config.resolved_format(),
+            self.config.color,
+            &self.config.template.vars,
+        );
         if let Some(ref err) = self.config_error {
             if !formatted.is_empty() {
                 formatted.push(' ');
@@ -157,8 +161,8 @@ pub async fn run_daemon(
         git_hash = %git_hash,
         pid = std::process::id(),
         runtime_dir = %runtime_dir.display(),
-        template_name = %config.template_name,
-        has_format_override = config.format.is_some(),
+        template_name = %config.template.name,
+        has_format_override = config.template.format.is_some(),
         "starting daemon"
     );
 
@@ -168,10 +172,10 @@ pub async fn run_daemon(
     } else {
         let resolved = config.resolved_format();
         if let Err(e) = crate::template::validate_template(&resolved) {
-            let source = if config.format.is_some() {
+            let source = if config.template.format.is_some() {
                 "format".to_string()
             } else {
-                format!("template \"{}\"", config.template_name)
+                format!("template \"{}\"", config.template.name)
             };
             eprintln!("warning: invalid {source}: {e}");
             tracing::error!(source = %source, "invalid template: {e}");
@@ -1193,8 +1197,8 @@ async fn reload_config(config_path: &Path, state: &Arc<Mutex<DaemonState>>) {
     let mut st = state.lock().await;
     if let Some(new_config) = new_config {
         tracing::info!(
-            template_name = %new_config.template_name,
-            has_format_override = new_config.format.is_some(),
+            template_name = %new_config.template.name,
+            has_format_override = new_config.template.format.is_some(),
             has_config_error = config_err.is_some(),
             "config reloaded"
         );
@@ -1779,6 +1783,7 @@ pub async fn run_daemon_for_test_with_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TemplateConfig;
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
@@ -2405,9 +2410,12 @@ mod tests {
         let socket_path = rt.path().join("sock");
         let config = Config {
             color: false,
-            format: Some(
-                "{{ change_id }} {{ description }}{% if empty %} EMPTY{% endif %}".to_string(),
-            ),
+            template: TemplateConfig {
+                format: Some(
+                    "{{ change_id }} {{ description }}{% if empty %} EMPTY{% endif %}".to_string(),
+                ),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -2450,7 +2458,12 @@ mod tests {
         let socket_path = rt.path().join("sock");
         let config = Config {
             color: false,
-            format: Some("{% if is_git %}GIT {{ branch }} {{ commit_id }}{% endif %}".to_string()),
+            template: TemplateConfig {
+                format: Some(
+                    "{% if is_git %}GIT {{ branch }} {{ commit_id }}{% endif %}".to_string(),
+                ),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -2494,7 +2507,10 @@ mod tests {
         let socket_path = rt.path().join("sock");
         let config = Config {
             color: false,
-            format: Some("{{ change_id }} {{ description }}{% for b in bookmarks %} {{ b.name }}{% endfor %}{% if empty %} EMPTY{% endif %}".to_string()),
+            template: TemplateConfig {
+                format: Some("{{ change_id }} {{ description }}{% for b in bookmarks %} {{ b.name }}{% endfor %}{% if empty %} EMPTY{% endif %}".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -2647,10 +2663,13 @@ mod tests {
         let socket_path = rt.path().join("sock");
         let config = Config {
             color: false,
-            format: Some(
-                "files={{ file_mad_count }} lines_added={{ lines_added_total }} bm={{ has_bookmarks }}"
-                    .to_string(),
-            ),
+            template: TemplateConfig {
+                format: Some(
+                    "files={{ file_mad_count }} lines_added={{ lines_added_total }} bm={{ has_bookmarks }}"
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -2759,7 +2778,10 @@ mod tests {
         let socket_path = rt.path().join("sock");
         let config = Config {
             color: false,
-            format: Some("{{ change_id }}{% if is_stale %} STALE{% endif %}".to_string()),
+            template: TemplateConfig {
+                format: Some("{{ change_id }}{% if is_stale %} STALE{% endif %}".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -2802,7 +2824,10 @@ mod tests {
         let socket_path = rt.path().join("sock");
         let config = Config {
             color: false,
-            format: Some("{{ change_id }}{% if is_stale %} STALE{% endif %}".to_string()),
+            template: TemplateConfig {
+                format: Some("{{ change_id }}{% if is_stale %} STALE{% endif %}".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -2868,7 +2893,10 @@ mod tests {
         let socket_path = rt.path().join("sock");
         let config = Config {
             color: false,
-            format: Some("{{ branch }}{% if is_stale %} STALE{% endif %}".to_string()),
+            template: TemplateConfig {
+                format: Some("{{ branch }}{% if is_stale %} STALE{% endif %}".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -2938,7 +2966,7 @@ mod tests {
         let config_file = rt.path().join("config.toml");
         std::fs::write(
             &config_file,
-            "color = false\nformat = \"before:{{ commit_id }}\"\n",
+            "color = false\n[template]\nformat = \"before:{{ commit_id }}\"\n",
         )
         .unwrap();
 
@@ -2959,7 +2987,7 @@ mod tests {
         // Rewrite config with a different format
         std::fs::write(
             &config_file,
-            "color = false\nformat = \"after:{{ commit_id }}\"\n",
+            "color = false\n[template]\nformat = \"after:{{ commit_id }}\"\n",
         )
         .unwrap();
 
@@ -2987,7 +3015,7 @@ mod tests {
         let config_file = rt.path().join("config.toml");
         std::fs::write(
             &config_file,
-            "color = false\nformat = \"good:{{ commit_id }}\"\n",
+            "color = false\n[template]\nformat = \"good:{{ commit_id }}\"\n",
         )
         .unwrap();
 
@@ -3006,7 +3034,11 @@ mod tests {
         );
 
         // Write an invalid template — should be accepted but with error appended
-        std::fs::write(&config_file, "color = false\nformat = \"{{ broken }\"\n").unwrap();
+        std::fs::write(
+            &config_file,
+            "color = false\n[template]\nformat = \"{{ broken }\"\n",
+        )
+        .unwrap();
 
         // Give the watcher time to process
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -3022,7 +3054,7 @@ mod tests {
         // Fix the template — error should clear
         std::fs::write(
             &config_file,
-            "color = false\nformat = \"fixed:{{ commit_id }}\"\n",
+            "color = false\n[template]\nformat = \"fixed:{{ commit_id }}\"\n",
         )
         .unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -3048,7 +3080,12 @@ mod tests {
         let socket_path = rt.path().join("sock");
         let config = Config {
             color: false,
-            format: Some("diverged={{ git_head_diverged }} files={{ file_mad_count }}".to_string()),
+            template: TemplateConfig {
+                format: Some(
+                    "diverged={{ git_head_diverged }} files={{ file_mad_count }}".to_string(),
+                ),
+                ..Default::default()
+            },
             ..Default::default()
         };
 

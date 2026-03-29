@@ -11,7 +11,12 @@
   {%- else -%}
     {{ change_id_prefix | green }}{{ change_id_rest | bright_black }}
   {%- endif -%}
-  {%- for b in bookmarks %} {{ b.display | green }}
+  {%- if max_bookmarks is defined -%}
+    {%- set display_bookmarks = bookmarks | limit_bookmarks(count=max_bookmarks, prioritize=prioritize_branches | default(value="")) -%}
+  {%- else -%}
+    {%- set display_bookmarks = bookmarks -%}
+  {%- endif -%}
+  {%- for b in display_bookmarks %} {{ b.display | green }}
     {%- if b.tracking == "ahead" %}{{ "⇡" | green }}
     {%- elif b.tracking == "behind" %}{{ "⇣" | green }}
     {%- elif b.tracking == "sideways" %}{{ "⇕" | red }}

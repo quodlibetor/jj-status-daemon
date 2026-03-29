@@ -167,11 +167,11 @@ enum TemplateAction {
     #[command(group(clap::ArgGroup::new("template_set").required(true)))]
     Set {
         /// Template name (e.g. "ascii", "nerdfont", or a user-defined name).
-        /// Equivalent to `config set template_name <NAME>`.
+        /// Equivalent to `config set template.name <NAME>`.
         #[arg(long, group = "template_set")]
         name: Option<String>,
         /// Inline format template (Tera/Jinja2 syntax).
-        /// Equivalent to `config set format <TEMPLATE>`.
+        /// Equivalent to `config set template.format <TEMPLATE>`.
         #[arg(long, group = "template_set")]
         format: Option<String>,
     },
@@ -185,16 +185,16 @@ pub(crate) enum ConfigAction {
     Edit,
     /// Print the config file path
     Path,
-    /// Set a config value (e.g. `config set template_name nerdfont`)
+    /// Set a config value (e.g. `config set template.name nerdfont`)
     Set {
-        /// Config key (e.g. "template_name", "bookmark_search_depth")
+        /// Config key (e.g. "template.name", "bookmark_search_depth")
         key: String,
         /// Value to set (strings, numbers, and booleans are auto-detected)
         value: String,
     },
     /// Get a config value
     Get {
-        /// Config key (e.g. "template_name", "bookmark_search_depth")
+        /// Config key (e.g. "template.name", "bookmark_search_depth")
         key: String,
     },
 }
@@ -357,16 +357,29 @@ pub(crate) fn run_config(action: ConfigAction, config_file: Option<&Path>) -> an
                 toml_edit::value(&value)
             };
 
-            doc[&key] = toml_value;
+            // Support dotted keys like "template.name" → doc["template"]["name"]
+            let parts: Vec<&str> = key.split('.').collect();
+            match parts.as_slice() {
+                [single] => {
+                    doc[*single] = toml_value;
+                }
+                [table, field] => {
+                    doc[*table][*field] = toml_value;
+                }
+                [table, subtable, field] => {
+                    doc[*table][*subtable][*field] = toml_value;
+                }
+                _ => anyhow::bail!("key too deeply nested: {key}"),
+            }
 
             // Validate the result parses as a valid Config
             let validated: config::Config = toml::from_str(doc.to_string().as_str())
                 .map_err(|e| anyhow::anyhow!("invalid config after setting {key}={value}: {e}"))?;
 
-            // Extra validation: template_name must be a builtin or user-defined template
-            if key == "template_name"
-                && template::builtin_template(&validated.template_name).is_none()
-                && !validated.templates.contains_key(&validated.template_name)
+            // Extra validation: template.name must be a builtin or user-defined template
+            if key == "template.name"
+                && template::builtin_template(&validated.template.name).is_none()
+                && !validated.templates.contains_key(&validated.template.name)
             {
                 let mut valid: Vec<&str> = template::BUILTIN_NAMES.to_vec();
                 let mut user_names: Vec<&str> =
@@ -395,12 +408,22 @@ pub(crate) fn run_config(action: ConfigAction, config_file: Option<&Path>) -> an
             let val = match key.as_str() {
                 "idle_timeout_secs" => anyhow::bail!("idle_timeout_secs has been removed"),
                 "debounce_ms" => anyhow::bail!("debounce_ms has been removed"),
-                "format" => cfg.format.unwrap_or_default(),
-                "not_ready_format" => cfg.not_ready_format.unwrap_or_default(),
-                "template_name" => cfg.template_name,
+                "template_name" | "format" | "not_ready_format" => {
+                    anyhow::bail!(
+                        "{key} has moved under [template]. Use \"template.{}\" instead",
+                        key.strip_prefix("template_").unwrap_or(&key)
+                    )
+                }
+                "template.name" => cfg.template.name,
+                "template.format" => cfg.template.format.unwrap_or_default(),
+                "template.not_ready_format" => cfg.template.not_ready_format.unwrap_or_default(),
                 "bookmark_search_depth" => cfg.bookmark_search_depth.to_string(),
                 "color" => cfg.color.to_string(),
                 "query_timeout_ms" => cfg.query_timeout_ms.to_string(),
+                _ if key.starts_with("template.vars.") => {
+                    let var_name = key.strip_prefix("template.vars.").unwrap();
+                    cfg.template.vars.get(var_name).cloned().unwrap_or_default()
+                }
                 _ => anyhow::bail!("unknown config key: {key}"),
             };
             println!("{val}");
@@ -551,7 +574,12 @@ fn run_template(action: TemplateAction, config_file: Option<&Path>) -> anyhow::R
 
             match query_live_status(&repo_path) {
                 Ok(status) => {
-                    let rendered = template::format_status(&status, &tmpl, color);
+                    let rendered = template::format_status_with_vars(
+                        &status,
+                        &tmpl,
+                        color,
+                        &cfg.template.vars,
+                    );
                     eprintln!("\x1b[1mRendered:\x1b[0m  {rendered}");
                     eprintln!();
                     let debug = template::debug_template(&status, &tmpl, color);
@@ -576,8 +604,8 @@ fn run_template(action: TemplateAction, config_file: Option<&Path>) -> anyhow::R
         }
         TemplateAction::Set { name, format } => {
             let (key, value) = match (name, format) {
-                (Some(n), _) => ("template_name", n),
-                (_, Some(f)) => ("format", f),
+                (Some(n), _) => ("template.name", n),
+                (_, Some(f)) => ("template.format", f),
                 (None, None) => anyhow::bail!("either --name or --format is required"),
             };
             run_config(
