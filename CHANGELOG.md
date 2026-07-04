@@ -1,3 +1,38 @@
+# Unreleased
+
+jj incremental diff engine overhaul: exact `jj diff --stat` parity and
+self-healing after watcher event loss.
+
+**Correctness (jj diff stats)**
+- **self-healing on every jj operation**: `ValidateAndRefresh` now compares the
+  working-copy commit's tree (and the operation id) in addition to the parent
+  tree. Same-parent checkouts (`jj abandon`, `jj edit` to a sibling,
+  `jj restore`, `jj undo`) rebuild base stats from the store instead of
+  trusting watcher events, so dropped/coalesced filesystem events can no
+  longer cause permanently drifting +/- counts.
+- **conflicted files**: diffs now materialize conflicted tree values with
+  conflict markers exactly as jj does, instead of treating them as
+  absent. Touching a file that is conflicted in the parent tree no longer
+  counts the entire file as added (previously produced arbitrarily large
+  bogus counts, especially in megamerge workflows).
+- **zero-line changes count as changed files**: added/deleted empty files,
+  binary file changes, and exec-bit-only changes now count toward "N files
+  changed", matching `jj diff --stat`.
+- **trailing-newline line counting**: a final line without a trailing newline
+  now counts as a line, matching `diff --stat`.
+- **FSEvents overflow handling**: rescan-flagged notify events (OS event queue
+  overflow) previously were silently dropped; they now trigger a full resync
+  that rebuilds state from the store and re-diffs all known-dirty files.
+- **deleted directories**: repo-relative path mapping now works for files
+  whose parent directories were deleted along with them.
+
+**Testing**
+- **property-testing engine** (`src/diff_props.rs`): random sequences of file
+  mutations and jj commands replayed against a real repo, with worker state
+  compared to `jj diff --stat` after every action. A lossy mode drops event
+  batches to simulate FSEvents overflow and asserts the engine converges at
+  the next jj operation. Set `DIFF_PROP_CASES=n` to scale the campaign.
+
 # v0.0.13
 
 * Remove colocated git checkout detection. It is not ready for prime time.

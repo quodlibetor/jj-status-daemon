@@ -1,6 +1,8 @@
 mod client;
 mod config;
 mod daemon;
+#[cfg(test)]
+mod diff_props;
 mod git;
 mod init;
 mod jj;
