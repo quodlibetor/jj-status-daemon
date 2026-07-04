@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use jj_lib::backend::CommitId;
-use jj_lib::backend::TreeValue;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::diff::DiffHunkKind;
 use jj_lib::diff_presentation::{LineCompareMode, diff_by_line};
@@ -41,17 +40,51 @@ fn create_user_settings() -> Result<UserSettings> {
     UserSettings::from_config(config).context("create UserSettings")
 }
 
-/// Read file content from the store into a Vec.
-async fn read_file_content(
+/// Materialize a tree value to the byte content `jj diff` would compare:
+/// plain file bytes, symlink targets as text, and conflicts rendered with
+/// conflict markers exactly as jj materializes them in the working copy.
+///
+/// Returns `None` for absent values and non-content values (submodules,
+/// unreadable entries) — matching jj, which diffs those as empty.
+async fn materialized_content(
     store: &Arc<jj_lib::store::Store>,
     path: &jj_lib::repo_path::RepoPath,
-    id: &jj_lib::backend::FileId,
+    value: jj_lib::merge::MergedTreeValue,
+    labels: &jj_lib::conflict_labels::ConflictLabels,
 ) -> Option<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-    let mut reader = store.read_file(path, id).await.ok()?;
-    let mut buf = Vec::new();
-    reader.read_to_end(&mut buf).await.ok()?;
-    Some(buf)
+    use jj_lib::conflicts::{
+        ConflictMarkerStyle, ConflictMaterializeOptions, MaterializedTreeValue,
+        choose_materialized_conflict_marker_len, materialize_merge_result_to_bytes,
+        materialize_tree_value,
+    };
+
+    match materialize_tree_value(store, path, value, labels)
+        .await
+        .ok()?
+    {
+        MaterializedTreeValue::Absent => None,
+        MaterializedTreeValue::AccessDenied(_) => None,
+        MaterializedTreeValue::File(mut file) => file.read_all(path).await.ok(),
+        MaterializedTreeValue::Symlink { target, .. } => Some(target.into_bytes()),
+        MaterializedTreeValue::FileConflict(file) => {
+            // Same recipe as jj's working-copy checkout, so the materialized
+            // bytes match both `jj diff` output and the conflicted file jj
+            // writes to disk.
+            let marker_len = choose_materialized_conflict_marker_len(&file.contents);
+            let options = ConflictMaterializeOptions {
+                // jj's default `ui.conflict-marker-style`
+                marker_style: ConflictMarkerStyle::Diff,
+                marker_len: Some(marker_len),
+                merge: store.merge_options().clone(),
+            };
+            Some(materialize_merge_result_to_bytes(&file.contents, &file.labels, &options).into())
+        }
+        MaterializedTreeValue::OtherConflict { id, labels } => {
+            Some(id.describe(&labels).into_bytes())
+        }
+        MaterializedTreeValue::GitSubmodule(_) => None,
+        MaterializedTreeValue::Tree(_) => None,
+    }
 }
 
 /// Check if content looks binary by scanning for null bytes in the first 8KB.
@@ -60,8 +93,18 @@ fn is_binary(content: &[u8]) -> bool {
     content[..check_len].contains(&0)
 }
 
+/// Count lines the way `diff --stat` does: a trailing fragment without a
+/// final newline still counts as a line.
 fn count_lines(content: &[u8]) -> u32 {
-    bytecount::count(content, b'\n') as u32
+    if content.is_empty() {
+        return 0;
+    }
+    let newlines = bytecount::count(content, b'\n') as u32;
+    if content.ends_with(b"\n") {
+        newlines
+    } else {
+        newlines + 1
+    }
 }
 
 /// Classification of a file change.
@@ -104,6 +147,17 @@ pub struct JjRepoState {
     parent_tree: jj_lib::merged_tree::MergedTree,
     /// Tree IDs of the parent tree, used to detect baseline changes without full diff.
     parent_tree_ids: jj_lib::merge::Merge<jj_lib::backend::TreeId>,
+    /// Tree IDs of the working-copy commit itself. When an op changes these
+    /// without changing the parent (snapshot, abandon, edit-to-sibling,
+    /// restore), the base stats must be rebuilt from the store — watcher
+    /// events alone cannot be relied on to repair them.
+    commit_tree_ids: jj_lib::merge::Merge<jj_lib::backend::TreeId>,
+    /// Operation ID at the time this state was built. Tree ID comparison
+    /// alone misses A→B→A sequences (e.g. `jj abandon` snapshots a dirty
+    /// file into @ and then discards it — both trees end up as they
+    /// started, but the op rewrote the working copy on disk). When the op
+    /// advanced with unchanged trees, overlay entries must be re-diffed.
+    op_id: jj_lib::op_store::OperationId,
     /// Per-file stats from the last full jj-lib diff (parent_tree vs commit.tree()).
     base_file_stats: HashMap<String, FileDiffStats>,
     /// Overlay: per-file stats computed from disk reads for working copy files.
@@ -127,21 +181,24 @@ pub fn aggregate_overlay_stats(
 ) -> DiffCounts {
     let mut counts = DiffCounts::default();
 
+    // Every entry counts as a changed file, even with 0 added/removed lines
+    // (empty files, binary files, exec-bit changes) — matching `diff --stat`,
+    // which reports e.g. "1 file changed, 0 insertions(+), 0 deletions(-)".
+    // Entries are only created when a file actually differs, so no-change
+    // paths must be represented by absence (or `None` in the overlay).
     fn tally(counts: &mut DiffCounts, stats: &FileDiffStats) {
         if stats.kind == FileChangeKind::Untracked {
             counts.files_untracked += 1;
             return;
         }
-        if stats.lines_added > 0 || stats.lines_removed > 0 {
-            counts.file_mad_count += 1;
-            counts.lines_added += stats.lines_added;
-            counts.lines_removed += stats.lines_removed;
-            match stats.kind {
-                FileChangeKind::Modified => counts.files_modified += 1,
-                FileChangeKind::Added => counts.files_added += 1,
-                FileChangeKind::Deleted => counts.files_deleted += 1,
-                FileChangeKind::Untracked => unreachable!(),
-            }
+        counts.file_mad_count += 1;
+        counts.lines_added += stats.lines_added;
+        counts.lines_removed += stats.lines_removed;
+        match stats.kind {
+            FileChangeKind::Modified => counts.files_modified += 1,
+            FileChangeKind::Added => counts.files_added += 1,
+            FileChangeKind::Deleted => counts.files_deleted += 1,
+            FileChangeKind::Untracked => unreachable!(),
         }
     }
 
@@ -200,9 +257,7 @@ pub fn aggregate_overlay_stats_by_dir(
         if is_overlay {
             acc.overlay_entries += 1;
         }
-        if stats.kind != FileChangeKind::Untracked
-            && (stats.lines_added > 0 || stats.lines_removed > 0)
-        {
+        if stats.kind != FileChangeKind::Untracked {
             acc.files_changed += 1;
             acc.lines_added += stats.lines_added;
             acc.lines_removed += stats.lines_removed;
@@ -282,61 +337,57 @@ async fn compute_per_file_diff_stats(
             continue;
         };
 
-        let before_file = values.before.as_normal().and_then(|tv| match tv {
-            TreeValue::File { id, .. } => Some(id),
-            _ => None,
-        });
-        let after_file = values.after.as_normal().and_then(|tv| match tv {
-            TreeValue::File { id, .. } => Some(id),
-            _ => None,
-        });
+        let before =
+            materialized_content(store, &entry.path, values.before, from_tree.labels()).await;
+        let after = materialized_content(store, &entry.path, values.after, to_tree.labels()).await;
 
-        if before_file.is_none() && after_file.is_none() {
+        let Some(stats) = diff_stats_for_contents(before.as_deref(), after.as_deref()) else {
             continue;
-        }
-
-        let mut stats = FileDiffStats::default();
-
-        match (before_file, after_file) {
-            (None, Some(id)) => {
-                stats.kind = FileChangeKind::Added;
-                if let Some(content) = read_file_content(store, &entry.path, id).await
-                    && !is_binary(&content)
-                {
-                    stats.lines_added = count_lines(&content);
-                }
-            }
-            (Some(id), None) => {
-                stats.kind = FileChangeKind::Deleted;
-                if let Some(content) = read_file_content(store, &entry.path, id).await
-                    && !is_binary(&content)
-                {
-                    stats.lines_removed = count_lines(&content);
-                }
-            }
-            (Some(before_id), Some(after_id)) => {
-                let before = read_file_content(store, &entry.path, before_id).await;
-                let after = read_file_content(store, &entry.path, after_id).await;
-                if let (Some(before), Some(after)) = (before, after)
-                    && !is_binary(&before)
-                    && !is_binary(&after)
-                {
-                    let diff = diff_by_line([&before, &after], &LineCompareMode::Exact);
-                    for hunk in diff.hunks() {
-                        if hunk.kind == DiffHunkKind::Different {
-                            stats.lines_removed += count_lines(hunk.contents[0].as_ref());
-                            stats.lines_added += count_lines(hunk.contents[1].as_ref());
-                        }
-                    }
-                }
-            }
-            (None, None) => unreachable!(),
-        }
+        };
 
         result.insert(entry.path.as_internal_file_string().to_string(), stats);
     }
 
     result
+}
+
+/// Compute `diff --stat`-style stats for a pair of materialized contents.
+///
+/// Returns `None` when both sides are absent or byte-identical (no change).
+/// Binary content counts the file with 0 lines, matching `diff --stat`.
+fn diff_stats_for_contents(before: Option<&[u8]>, after: Option<&[u8]>) -> Option<FileDiffStats> {
+    let mut stats = FileDiffStats::default();
+    match (before, after) {
+        (None, None) => return None,
+        (None, Some(content)) => {
+            stats.kind = FileChangeKind::Added;
+            if !is_binary(content) {
+                stats.lines_added = count_lines(content);
+            }
+        }
+        (Some(content), None) => {
+            stats.kind = FileChangeKind::Deleted;
+            if !is_binary(content) {
+                stats.lines_removed = count_lines(content);
+            }
+        }
+        (Some(before), Some(after)) => {
+            if before == after {
+                return None;
+            }
+            stats.kind = FileChangeKind::Modified;
+            if !is_binary(before) && !is_binary(after) {
+                let diff = diff_by_line([before, after], &LineCompareMode::Exact);
+                for hunk in diff.hunks() {
+                    if hunk.kind == DiffHunkKind::Different {
+                        stats.lines_removed += count_lines(hunk.contents[0].as_ref());
+                        stats.lines_added += count_lines(hunk.contents[1].as_ref());
+                    }
+                }
+            }
+        }
+    }
+    Some(stats)
 }
 
 /// Compute aggregate diff stats from a per-file map.
@@ -355,62 +406,41 @@ async fn diff_single_file(
     repo_path: &jj_lib::repo_path::RepoPath,
     disk_content: Option<&[u8]>,
 ) -> Option<FileDiffStats> {
-    // Get parent version
+    // Materialize the parent-side value the same way jj does (conflicted
+    // files become conflict-marker text, matching what jj writes to disk),
+    // so an untouched conflicted file diffs as unchanged.
     let parent_value = parent_tree.path_value(repo_path).ok()?;
-    let parent_file_id = parent_value.as_normal().and_then(|tv| match tv {
-        TreeValue::File { id, .. } => Some(id.clone()),
-        _ => None,
-    });
-    let parent_content = if let Some(ref id) = parent_file_id {
-        read_file_content(store, repo_path, id).await
-    } else {
-        None
-    };
+    let parent_content =
+        materialized_content(store, repo_path, parent_value, parent_tree.labels()).await;
 
-    match (parent_content.as_deref(), disk_content) {
-        (None, None) => None, // Neither exists
-        (None, Some(disk)) => {
-            // New file
-            let mut stats = FileDiffStats {
-                kind: FileChangeKind::Added,
-                ..Default::default()
-            };
-            if !is_binary(disk) {
-                stats.lines_added = count_lines(disk);
-            }
-            Some(stats)
+    diff_stats_for_contents(parent_content.as_deref(), disk_content)
+}
+
+/// Diff each changed path on disk against the parent tree and record the
+/// results in the overlay. Paths are deduplicated — each is re-read from
+/// disk at processing time, so duplicates are pure wasted work.
+async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathBuf]) {
+    let mut seen = HashSet::new();
+    for abs_path in changed_paths {
+        if !seen.insert(abs_path) {
+            continue;
         }
-        (Some(parent), None) => {
-            // Deleted file
-            let mut stats = FileDiffStats {
-                kind: FileChangeKind::Deleted,
-                ..Default::default()
-            };
-            if !is_binary(parent) {
-                stats.lines_removed = count_lines(parent);
-            }
-            Some(stats)
-        }
-        (Some(parent), Some(disk)) => {
-            // Both exist — check if identical
-            if parent == disk {
-                return None; // File matches parent
-            }
-            let mut stats = FileDiffStats {
-                kind: FileChangeKind::Modified,
-                ..Default::default()
-            };
-            if !is_binary(parent) && !is_binary(disk) {
-                let diff = diff_by_line([parent, disk], &LineCompareMode::Exact);
-                for hunk in diff.hunks() {
-                    if hunk.kind == DiffHunkKind::Different {
-                        stats.lines_removed += count_lines(hunk.contents[0].as_ref());
-                        stats.lines_added += count_lines(hunk.contents[1].as_ref());
-                    }
-                }
-            }
-            Some(stats)
-        }
+        let Some(rel_str) = abs_to_repo_relative(&state.repo_root, abs_path) else {
+            continue;
+        };
+        let Ok(repo_path_buf) = jj_lib::repo_path::RepoPathBuf::from_relative_path(&rel_str) else {
+            continue;
+        };
+        // Read file from disk (None if deleted/missing)
+        let disk_content = std::fs::read(abs_path).ok();
+        let diff_result = diff_single_file(
+            &state.store,
+            &state.parent_tree,
+            &repo_path_buf,
+            disk_content.as_deref(),
+        )
+        .await;
+        state.overlay.insert(rel_str, diff_result);
     }
 }
 
@@ -424,14 +454,20 @@ pub fn abs_to_repo_relative(repo_root: &Path, abs_path: &Path) -> Option<String>
     if let Ok(rel) = abs_path.strip_prefix(repo_root) {
         return Some(rel.to_string_lossy().replace('\\', "/"));
     }
-    // Slow path: canonicalize (handles symlinks, /var → /private/var, etc.)
-    let canonical = abs_path.canonicalize().or_else(|e| {
-        // File might be deleted; canonicalize the parent and append filename
-        let parent = abs_path.parent().ok_or(e)?;
-        let name = abs_path
-            .file_name()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no file name"))?;
-        parent.canonicalize().map(|cp| cp.join(name))
+    // Slow path: canonicalize (handles symlinks, /var → /private/var, etc.).
+    // The path may be deleted — and so may its parent directories (e.g. a
+    // checkout removed a file along with its now-empty directory) — so walk
+    // up until an ancestor exists, canonicalize that, and re-append the rest.
+    let canonical = abs_path.canonicalize().or_else(|err| {
+        for ancestor in abs_path.ancestors().skip(1) {
+            if let Ok(canonical_ancestor) = ancestor.canonicalize() {
+                let rest = abs_path
+                    .strip_prefix(ancestor)
+                    .expect("ancestors() yields prefixes of abs_path");
+                return Ok(canonical_ancestor.join(rest));
+            }
+        }
+        Err(err)
     });
     if let Ok(canonical) = canonical {
         let rel = canonical.strip_prefix(repo_root).ok()?;
@@ -830,12 +866,15 @@ async fn compute_jj_full_status(
         .canonicalize()
         .unwrap_or_else(|_| repo_path.to_path_buf());
 
+    let commit_tree_ids = current_tree.tree_ids().clone();
     let retained_parent_tree = parent_tree.unwrap_or(current_tree);
 
     let jj_state = JjRepoState {
         store: loaded.repo.store().clone(),
         parent_tree_ids: retained_parent_tree.tree_ids().clone(),
         parent_tree: retained_parent_tree,
+        commit_tree_ids,
+        op_id: loaded.repo.op_id().clone(),
         base_file_stats,
         overlay: HashMap::new(),
         repo_root,
@@ -919,6 +958,14 @@ pub enum JjWorkerRequest {
         changed_paths: Vec<PathBuf>,
         reply: tokio::sync::oneshot::Sender<Result<RepoStatus>>,
     },
+    /// Full resync after watcher event loss (OS queue overflow): rebuild all
+    /// state from the store, then re-diff previously-known dirty files so
+    /// unsnapshotted disk edits aren't forgotten.
+    Resync {
+        repo_path: PathBuf,
+        depth: u32,
+        reply: tokio::sync::oneshot::Sender<Result<RepoStatus>>,
+    },
     /// Query current overlay stats for all repos.
     QueryOverlayStats {
         reply: tokio::sync::oneshot::Sender<Vec<(String, crate::protocol::IncrementalDiffStats)>>,
@@ -992,47 +1039,50 @@ async fn jj_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                     }
                 };
 
-                if loaded.parent_tree_ids == state.parent_tree_ids {
-                    // Parent tree unchanged — metadata-only update.
-                    // Keep parent_tree, base_file_stats, overlay intact.
+                let trees_unchanged = loaded.parent_tree_ids == state.parent_tree_ids
+                    && loaded.commit.tree().tree_ids() == &state.commit_tree_ids;
+
+                if trees_unchanged {
+                    // Neither the parent tree nor the WC commit tree changed —
+                    // metadata-only update. Keep base_file_stats and overlay.
                     tracing::debug!(
                         repo = %repo_path.display(),
-                        "parent tree unchanged — metadata-only refresh"
+                        "parent and commit trees unchanged — metadata-only refresh"
                     );
-                    update_base_status_metadata(&mut state.base_status, &loaded.metadata_status);
-
-                    // Apply incremental WC diffs if any paths changed
-                    for abs_path in &changed_paths {
-                        let Some(rel_str) = abs_to_repo_relative(&state.repo_root, abs_path) else {
-                            continue;
-                        };
-                        let Ok(repo_path_buf) =
-                            jj_lib::repo_path::RepoPathBuf::from_relative_path(&rel_str)
-                        else {
-                            continue;
-                        };
-                        let disk_content = std::fs::read(abs_path).ok();
-                        let diff_result = diff_single_file(
-                            &state.store,
-                            &state.parent_tree,
-                            &repo_path_buf,
-                            disk_content.as_deref(),
-                        )
-                        .await;
-                        state.overlay.insert(rel_str, diff_result);
+                    if loaded.repo.op_id() != &state.op_id {
+                        // The op log advanced but the trees ended up where
+                        // they started (A→B→A, e.g. abandon snapshotting and
+                        // then discarding a dirty file). The op may have
+                        // rewritten working-copy files whose events were
+                        // lost — re-diff everything we believe is dirty.
+                        state.op_id = loaded.repo.op_id().clone();
+                        let dirty: Vec<PathBuf> = state
+                            .overlay
+                            .keys()
+                            .map(|rel| state.repo_root.join(rel))
+                            .collect();
+                        apply_incremental_paths(state, &dirty).await;
                     }
-
+                    update_base_status_metadata(&mut state.base_status, &loaded.metadata_status);
+                    apply_incremental_paths(state, &changed_paths).await;
                     let status = state.current_status();
                     let _ = reply.send(Ok(status));
                 } else {
-                    // Parent tree changed — full refresh using already-loaded repo
+                    // A tree changed: the op moved @ (parent changed) or
+                    // rewrote/snapshotted the WC commit (abandon, restore,
+                    // edit-to-sibling, undo, snapshot). Rebuild the whole
+                    // state from the store — this also self-heals any drift
+                    // from dropped watcher events. Disk writes racing after
+                    // the op's snapshot are re-applied from changed_paths.
                     tracing::debug!(
                         repo = %repo_path.display(),
-                        "parent tree changed — full refresh"
+                        "parent or commit tree changed — full refresh"
                     );
                     let result = compute_jj_full_status(&repo_path, loaded).await;
                     match result {
-                        Ok((status, jj_state)) => {
+                        Ok((_, mut jj_state)) => {
+                            apply_incremental_paths(&mut jj_state, &changed_paths).await;
+                            let status = jj_state.current_status();
                             states.insert(repo_path, jj_state);
                             let _ = reply.send(Ok(status));
                         }
@@ -1058,32 +1108,35 @@ async fn jj_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                 )
                 .entered();
 
-                for abs_path in &changed_paths {
-                    let Some(rel_str) = abs_to_repo_relative(&state.repo_root, abs_path) else {
-                        continue;
-                    };
-                    let Ok(repo_path_buf) =
-                        jj_lib::repo_path::RepoPathBuf::from_relative_path(&rel_str)
-                    else {
-                        continue;
-                    };
-
-                    // Read file from disk (None if deleted/missing)
-                    let disk_content = std::fs::read(abs_path).ok();
-
-                    let diff_result = diff_single_file(
-                        &state.store,
-                        &state.parent_tree,
-                        &repo_path_buf,
-                        disk_content.as_deref(),
-                    )
-                    .await;
-
-                    state.overlay.insert(rel_str, diff_result);
-                }
+                apply_incremental_paths(state, &changed_paths).await;
 
                 let status = state.current_status();
                 let _ = reply.send(Ok(status));
+            }
+            JjWorkerRequest::Resync {
+                repo_path,
+                depth,
+                reply,
+            } => {
+                // Events were lost — every part of the cached state is
+                // suspect. Rebuild from the store, then re-diff the files we
+                // previously knew were dirty (overlay keys); disk changes we
+                // never heard about at all can only be healed by the next op.
+                let prior_dirty: Vec<PathBuf> = states
+                    .get(&repo_path)
+                    .map(|s| s.overlay.keys().map(|rel| s.repo_root.join(rel)).collect())
+                    .unwrap_or_default();
+                match query_jj_lib(&repo_path, depth).await {
+                    Ok((_, mut jj_state)) => {
+                        apply_incremental_paths(&mut jj_state, &prior_dirty).await;
+                        let status = jj_state.current_status();
+                        states.insert(repo_path, jj_state);
+                        let _ = reply.send(Ok(status));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
             }
             JjWorkerRequest::QueryOverlayStats { reply } => {
                 let stats: Vec<_> = states
@@ -1756,12 +1809,13 @@ mod tests {
 
     #[test]
     fn test_aggregate_overlay_zeros_out_file() {
-        // Overlay replaces base with zero stats (file exists but is identical to parent
-        // in terms of content — e.g., only whitespace that doesn't count)
+        // Overlay replaces base with zero line stats (file still differs, e.g.
+        // binary or exec-bit change). The file counts, matching `diff --stat`
+        // ("1 file changed, 0 insertions(+), 0 deletions(-)"). A file that no
+        // longer differs must be represented by `None`, not zero stats.
         let base = HashMap::from([("a.rs".into(), fstats(10, 3))]);
         let overlay = HashMap::from([("a.rs".into(), Some(fstats(0, 0)))]);
-        // File is not counted since stats are zero
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(0, 0, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(1, 0, 0));
     }
 
     #[test]
@@ -1790,11 +1844,13 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregate_base_zero_stats_not_counted() {
-        // A base entry with zero stats shouldn't count as a file
+    fn test_aggregate_base_zero_line_stats_counted_as_file() {
+        // A base entry always represents a real change; zero line stats
+        // (empty/binary file, exec-bit change) still count the file,
+        // matching `diff --stat`.
         let base = HashMap::from([("empty_diff.rs".into(), fstats(0, 0))]);
         let overlay = HashMap::new();
-        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(0, 0, 0));
+        assert_eq!(aggregate_overlay_stats(&base, &overlay), dcounts(1, 0, 0));
     }
 
     #[test]
@@ -2366,6 +2422,303 @@ mod tests {
         assert_eq!(
             status_after.lines_added_working_tree, lines_before,
             "full refresh after bookmark set should show same line count"
+        );
+    }
+
+    // ==== Regression tests for historical drift bugs ====
+
+    /// `jj abandon` keeps the same parent tree but rewrites the WC commit.
+    /// Even with every working-copy event dropped (FSEvents overflow /
+    /// dir-level coalescing), ValidateAndRefresh must detect the commit tree
+    /// change and rebuild base stats from the store.
+    #[tokio::test]
+    async fn repro_stale_base_after_abandon_without_events() {
+        let dir = create_jj_repo().await;
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+        std::fs::write(dir.path().join("file.txt"), "line1\nline2\n").unwrap();
+        jj_cmd(dir.path(), &["status"]).await;
+
+        let jj_worker = spawn_jj_worker();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(status.file_mad_count_working_tree, 1);
+        assert_eq!(status.lines_added_working_tree, 2);
+
+        // abandon @: new empty @ on the SAME parent; file.txt removed from disk
+        jj_cmd(dir.path(), &["abandon"]).await;
+        assert!(
+            !dir.path().join("file.txt").exists(),
+            "abandon should remove the file"
+        );
+
+        // Simulate the op_heads event arriving with the working-copy events dropped
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::ValidateAndRefresh {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![],
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(
+            (
+                status.file_mad_count_working_tree,
+                status.lines_added_working_tree
+            ),
+            (0, 0),
+            "after abandon the WC is empty; base stats must be rebuilt from the store"
+        );
+    }
+
+    /// An added empty file counts as a changed file in `jj diff --stat`
+    /// ("1 file changed, 0 insertions"), and so must we.
+    #[tokio::test]
+    async fn repro_empty_added_file_not_counted() {
+        let dir = create_jj_repo().await;
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+        std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+        let jj_output = jj_cmd(dir.path(), &["diff", "--stat"]).await;
+        let (cli_files, cli_added, cli_removed) = parse_diff_stat_summary(&jj_output);
+        let status = query_jj_status(dir.path(), &config).await.unwrap();
+        assert_eq!(
+            (
+                status.file_mad_count_working_tree,
+                status.lines_added_working_tree,
+                status.lines_removed_working_tree
+            ),
+            (cli_files, cli_added, cli_removed),
+            "jj CLI says: {jj_output}"
+        );
+    }
+
+    /// File conflicted in the parent tree: the incremental single-file diff
+    /// must materialize the conflicted parent value (conflict-marker text,
+    /// as jj does) rather than treating it as absent — otherwise touching
+    /// the file counts its entire contents as added.
+    #[tokio::test]
+    async fn repro_conflicted_parent_counts_whole_file_as_added() {
+        let dir = create_jj_repo().await;
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+        // Build a conflict: two siblings editing the same line, then merge
+        std::fs::write(dir.path().join("f.txt"), "base\n").unwrap();
+        jj_cmd(dir.path(), &["commit", "-m", "base"]).await;
+        jj_cmd(dir.path(), &["bookmark", "create", "base-bm", "-r", "@-"]).await;
+        std::fs::write(dir.path().join("f.txt"), "side-a\n").unwrap();
+        jj_cmd(dir.path(), &["commit", "-m", "a"]).await;
+        jj_cmd(dir.path(), &["bookmark", "create", "side-a-bm", "-r", "@-"]).await;
+        jj_cmd(dir.path(), &["new", "base-bm"]).await;
+        std::fs::write(dir.path().join("f.txt"), "side-b\n").unwrap();
+        jj_cmd(dir.path(), &["commit", "-m", "b"]).await;
+        jj_cmd(dir.path(), &["bookmark", "create", "side-b-bm", "-r", "@-"]).await;
+        // merge the two sides — @ tree has a conflict in f.txt
+        jj_cmd(dir.path(), &["new", "side-a-bm", "side-b-bm"]).await;
+
+        let jj_worker = spawn_jj_worker();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let full = reply_rx.await.unwrap().unwrap();
+        eprintln!(
+            "full refresh: files={} +{} -{}",
+            full.file_mad_count_working_tree,
+            full.lines_added_working_tree,
+            full.lines_removed_working_tree
+        );
+
+        // Simulate a watcher event on the conflicted (marker-materialized) file
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::IncrementalUpdate {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![dir.path().join("f.txt")],
+                reply: reply_tx,
+            })
+            .unwrap();
+        let incr = reply_rx.await.unwrap().unwrap();
+        let disk_lines = count_lines(&std::fs::read(dir.path().join("f.txt")).unwrap());
+        eprintln!(
+            "incremental: files={} +{} -{} (disk file has {} lines)",
+            incr.file_mad_count_working_tree,
+            incr.lines_added_working_tree,
+            incr.lines_removed_working_tree,
+            disk_lines
+        );
+        assert_eq!(
+            (
+                incr.file_mad_count_working_tree,
+                incr.lines_added_working_tree
+            ),
+            (
+                full.file_mad_count_working_tree,
+                full.lines_added_working_tree
+            ),
+            "touching a conflicted file should not change the diff stats"
+        );
+    }
+
+    /// REPRO D (megamerge): @ is a 2-parent merge; a file was modified in only
+    /// ONE leg (no conflict). Touching it on disk should be a no-op for stats.
+    #[tokio::test]
+    async fn repro_megamerge_single_leg_file_touch() {
+        let dir = create_jj_repo().await;
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+        // base: two files
+        std::fs::write(dir.path().join("a.txt"), "a1\na2\na3\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "b1\nb2\nb3\n").unwrap();
+        jj_cmd(dir.path(), &["commit", "-m", "base"]).await;
+        jj_cmd(dir.path(), &["bookmark", "create", "base-bm", "-r", "@-"]).await;
+        // leg A modifies a.txt only
+        std::fs::write(dir.path().join("a.txt"), "a1\nA2-CHANGED\na3\n").unwrap();
+        jj_cmd(dir.path(), &["commit", "-m", "leg-a"]).await;
+        jj_cmd(dir.path(), &["bookmark", "create", "leg-a-bm", "-r", "@-"]).await;
+        // leg B modifies b.txt only
+        jj_cmd(dir.path(), &["new", "base-bm"]).await;
+        std::fs::write(dir.path().join("b.txt"), "b1\nB2-CHANGED\nb3\n").unwrap();
+        jj_cmd(dir.path(), &["commit", "-m", "leg-b"]).await;
+        jj_cmd(dir.path(), &["bookmark", "create", "leg-b-bm", "-r", "@-"]).await;
+        // megamerge: @ = merge(leg-a, leg-b), no conflicts
+        jj_cmd(dir.path(), &["new", "leg-a-bm", "leg-b-bm"]).await;
+
+        let jj_worker = spawn_jj_worker();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let full = reply_rx.await.unwrap().unwrap();
+        eprintln!(
+            "full refresh: files={} +{} -{}",
+            full.file_mad_count_working_tree,
+            full.lines_added_working_tree,
+            full.lines_removed_working_tree
+        );
+
+        // Touch a.txt (unchanged content — e.g. editor re-save / mtime bump)
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::IncrementalUpdate {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![dir.path().join("a.txt")],
+                reply: reply_tx,
+            })
+            .unwrap();
+        let incr = reply_rx.await.unwrap().unwrap();
+        eprintln!(
+            "incremental after touching a.txt: files={} +{} -{}",
+            incr.file_mad_count_working_tree,
+            incr.lines_added_working_tree,
+            incr.lines_removed_working_tree
+        );
+        assert_eq!(
+            (
+                incr.file_mad_count_working_tree,
+                incr.lines_added_working_tree
+            ),
+            (0, 0),
+            "touching an unmodified single-leg file in a megamerge should stay empty"
+        );
+    }
+
+    /// Resync after event loss: stale overlay entries (whose files changed
+    /// while events were dropped) are re-diffed from disk, and known dirty
+    /// files survive the rebuild.
+    #[tokio::test]
+    async fn test_resync_heals_stale_overlay_and_keeps_dirty_files() {
+        let dir = create_jj_repo().await;
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+        let jj_worker = spawn_jj_worker();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+
+        // Two dirty files delivered normally → both in the overlay
+        std::fs::write(dir.path().join("keep.txt"), "a\nb\n").unwrap();
+        std::fs::write(dir.path().join("stale.txt"), "x\ny\nz\n").unwrap();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::IncrementalUpdate {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![dir.path().join("keep.txt"), dir.path().join("stale.txt")],
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(status.file_mad_count_working_tree, 2);
+        assert_eq!(status.lines_added_working_tree, 5);
+
+        // Event loss: stale.txt is deleted but the event never arrives
+        std::fs::remove_file(dir.path().join("stale.txt")).unwrap();
+
+        // Rescan-triggered resync must drop stale.txt and keep keep.txt
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::Resync {
+                repo_path: dir.path().to_path_buf(),
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(
+            (
+                status.file_mad_count_working_tree,
+                status.lines_added_working_tree
+            ),
+            (1, 2),
+            "resync should re-diff known dirty files from disk"
+        );
+    }
+
+    /// A deleted file whose parent directories were also deleted must still
+    /// map to a repo-relative path, even when the incoming path uses a
+    /// non-canonical prefix (e.g. /var vs /private/var on macOS).
+    #[test]
+    fn test_abs_to_repo_relative_deleted_nested_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let canonical_root = dir.path().canonicalize().unwrap();
+        // Never created — the whole gone/sub chain is missing
+        let abs = dir.path().join("gone/sub/f.txt");
+        assert_eq!(
+            abs_to_repo_relative(&canonical_root, &abs).as_deref(),
+            Some("gone/sub/f.txt")
         );
     }
 }

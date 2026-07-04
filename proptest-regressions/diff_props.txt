@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7f7fab21465fab935ff005d196623bb2437faddf4fe274e7048cb54952d84e4c # shrinks to actions = [Write { file: 2, lines: 1, seed: 0 }, JjAbandon, Write { file: 0, lines: 1, seed: 0 }]
+cc c7e32b0c64e37b911b61474a78aa8e3b0f14544cd3420826ff93c37f88020010 # shrinks to actions = [DropPendingEvents, Write { file: 0, lines: 1, seed: 0 }, Write { file: 1, lines: 1, seed: 0 }]

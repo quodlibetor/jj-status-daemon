@@ -31,6 +31,10 @@ pub enum WatchEvent {
         vcs_change_hint: Option<VcsChangeHint>,
         /// Absolute paths of changed files (non-ignored working copy files only).
         changed_paths: Vec<PathBuf>,
+        /// The OS event queue overflowed and events were lost (e.g. FSEvents
+        /// kFSEventStreamEventFlagMustScanSubDirs). Cached diff state can no
+        /// longer be trusted — a full resync is required.
+        rescan: bool,
     },
     Flush(tokio::sync::oneshot::Sender<()>),
 }
@@ -366,6 +370,22 @@ pub fn watch_repo(
         notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
             let Ok(event) = res else { return };
 
+            // OS event queue overflow (FSEvents MustScanSubDirs, inotify queue
+            // overflow): arbitrary events were lost, so incremental state is
+            // untrustworthy. Signal a rescan BEFORE the kind filter — these
+            // events have kind Other and would be dropped by it.
+            if event.need_rescan() {
+                let _ = tx.send(WatchEvent::Change {
+                    repo_path: repo_path_owned.clone(),
+                    vcs_kind,
+                    working_copy_changed: true,
+                    vcs_change_hint: None,
+                    changed_paths: Vec::new(),
+                    rescan: true,
+                });
+                return;
+            }
+
             // Skip non-modification events
             if !event.kind.is_modify() && !event.kind.is_create() && !event.kind.is_remove() {
                 return;
@@ -408,6 +428,7 @@ pub fn watch_repo(
                 working_copy_changed,
                 vcs_change_hint,
                 changed_paths: verdict.changed_paths,
+                rescan: false,
             });
         })?;
 
