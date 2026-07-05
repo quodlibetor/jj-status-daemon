@@ -25,6 +25,13 @@ use crate::watcher::{RepoWatcher, VcsChangeHint, WatchEvent, watch_repo};
 
 struct DaemonState {
     cache: HashMap<PathBuf, (RepoStatus, String)>,
+    /// Pre-compiled main template. `None` if the configured template failed to
+    /// compile — `format` then falls back to compile-per-render, which yields
+    /// the same error text the template would produce.
+    compiled_format: Option<crate::template::CompiledTemplate>,
+    /// The not-ready format has no per-status variables, so it is rendered
+    /// once per config load.
+    not_ready_formatted: String,
     watchers: HashMap<PathBuf, RepoWatcher>,
     /// Maps arbitrary directories to their repo root and VCS kind. Negatives are not cached.
     dir_to_repo: HashMap<PathBuf, (PathBuf, VcsKind)>,
@@ -51,12 +58,15 @@ struct DaemonState {
 impl DaemonState {
     /// Format status, appending any sticky config error.
     fn format(&self, status: &RepoStatus) -> String {
-        let mut formatted = format_status_with_vars(
-            status,
-            &self.config.resolved_format(),
-            self.config.color,
-            &self.config.template.vars,
-        );
+        let mut formatted = match &self.compiled_format {
+            Some(compiled) => compiled.render(status, &self.config.template.vars),
+            None => format_status_with_vars(
+                status,
+                &self.config.resolved_format(),
+                self.config.color,
+                &self.config.template.vars,
+            ),
+        };
         if let Some(ref err) = self.config_error {
             if !formatted.is_empty() {
                 formatted.push(' ');
@@ -166,23 +176,29 @@ pub async fn run_daemon(
         "starting daemon"
     );
 
-    // Use the initial config error if provided, otherwise validate the template
+    // Compile the template once up front; the compile result doubles as
+    // validation. On failure `format` falls back to compile-per-render.
+    let (compiled_format, compile_error) =
+        match crate::template::CompiledTemplate::new(&config.resolved_format(), config.color) {
+            Ok(t) => (Some(t), None),
+            Err(e) => (None, Some(e)),
+        };
+    let not_ready_formatted = format_not_ready(&config.resolved_not_ready_format(), config.color);
+
+    // Use the initial config error if provided, otherwise report any template error
     let startup_config_error = if initial_config_error.is_some() {
         initial_config_error
-    } else {
-        let resolved = config.resolved_format();
-        if let Err(e) = crate::template::validate_template(&resolved) {
-            let source = if config.template.format.is_some() {
-                "format".to_string()
-            } else {
-                format!("template \"{}\"", config.template.name)
-            };
-            eprintln!("warning: invalid {source}: {e}");
-            tracing::error!(source = %source, "invalid template: {e}");
-            Some(e)
+    } else if let Some(e) = compile_error {
+        let source = if config.template.format.is_some() {
+            "format".to_string()
         } else {
-            None
-        }
+            format!("template \"{}\"", config.template.name)
+        };
+        eprintln!("warning: invalid {source}: {e}");
+        tracing::error!(source = %source, "invalid template: {e}");
+        Some(e)
+    } else {
+        None
     };
 
     // Clean up stale socket
@@ -217,6 +233,8 @@ pub async fn run_daemon(
 
     let state = Arc::new(Mutex::new(DaemonState {
         cache: HashMap::new(),
+        compiled_format,
+        not_ready_formatted,
         watchers: HashMap::new(),
         dir_to_repo: HashMap::new(),
         started_at: Instant::now(),
@@ -554,17 +572,16 @@ async fn handle_connection(
                 // Cache miss — populate in the background
                 tracing::debug!(repo = %repo_path.display(), vcs = ?vcs_kind, "cache miss");
                 let query_timeout_ms = config.query_timeout_ms;
-                let rx = {
+                let (rx, not_ready) = {
                     let mut st = state.lock().await;
                     st.stats.cache_misses += 1;
-                    if query_timeout_ms > 0 {
+                    let rx = if query_timeout_ms > 0 {
                         Some(st.subscribe_cache(&repo_path))
                     } else {
                         None
-                    }
+                    };
+                    (rx, st.not_ready_formatted.clone())
                 };
-
-                let not_ready = format_not_ready(&config.resolved_not_ready_format(), config.color);
                 let state_bg = state.clone();
                 let query_path_bg = query_path.clone();
                 let repo_path_bg = repo_path.clone();
@@ -1205,20 +1222,24 @@ async fn git_full_refresh(
 /// Reload config from disk, validate the template, swap the config in DaemonState,
 /// and re-render all cached statuses.
 async fn reload_config(config_path: &Path, state: &Arc<Mutex<DaemonState>>) {
-    let (new_config, config_err) = match crate::config::load_config_from(Some(config_path)) {
-        Ok(c) => {
-            let resolved = c.resolved_format();
-            let err = crate::template::validate_template(&resolved).err();
-            if let Some(ref e) = err {
-                tracing::warn!(error = %e, "new config has invalid template");
+    let (new_config, new_compiled, config_err) =
+        match crate::config::load_config_from(Some(config_path)) {
+            Ok(c) => {
+                let (compiled, err) =
+                    match crate::template::CompiledTemplate::new(&c.resolved_format(), c.color) {
+                        Ok(t) => (Some(t), None),
+                        Err(e) => (None, Some(e)),
+                    };
+                if let Some(ref e) = err {
+                    tracing::warn!(error = %e, "new config has invalid template");
+                }
+                (Some(c), compiled, err)
             }
-            (Some(c), err)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to load updated config, keeping current config");
-            (None, Some(format!("config error: {e}")))
-        }
-    };
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to load updated config, keeping current config");
+                (None, None, Some(format!("config error: {e}")))
+            }
+        };
 
     let mut st = state.lock().await;
     if let Some(new_config) = new_config {
@@ -1228,7 +1249,10 @@ async fn reload_config(config_path: &Path, state: &Arc<Mutex<DaemonState>>) {
             has_config_error = config_err.is_some(),
             "config reloaded"
         );
+        st.not_ready_formatted =
+            format_not_ready(&new_config.resolved_not_ready_format(), new_config.color);
         st.config = new_config;
+        st.compiled_format = new_compiled;
     }
     st.config_error = config_err;
 

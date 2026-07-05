@@ -352,7 +352,11 @@ fn format_tera_error(err: &tera::Error) -> String {
 
 fn build_tera(template: &str, color: bool) -> Result<Tera, tera::Error> {
     let mut tera = Tera::default();
-    tera.add_raw_template("detail.tera", DETAIL_FORMAT)?;
+    // Only parse the shared detail template when it's actually referenced —
+    // parsing it dominates compile cost for templates that don't include it.
+    if template.contains("detail.tera") {
+        tera.add_raw_template("detail.tera", DETAIL_FORMAT)?;
+    }
     tera.add_raw_template("tpl", template)?;
 
     // Register a filter for each color name (lowercase).
@@ -476,6 +480,60 @@ fn build_template_context(status: &RepoStatus) -> tera::Context {
     ctx
 }
 
+/// A pre-compiled template ready for repeated rendering.
+///
+/// Building a `Tera` instance (parsing templates, registering filters) costs
+/// roughly 45x as much as a single render, so long-lived callers (the daemon)
+/// should compile once and render many times via this type. One-shot callers
+/// can keep using [`format_status`] / [`format_status_with_vars`], which
+/// compile-and-render in a single call.
+#[derive(Debug)]
+pub struct CompiledTemplate {
+    tera: Tera,
+}
+
+impl CompiledTemplate {
+    /// Compile `template` with the color filters registered.
+    ///
+    /// On failure, returns the same `"template error: ..."` message that
+    /// [`format_status`] would have produced as its output string.
+    pub fn new(template: &str, color: bool) -> Result<Self, String> {
+        match build_tera(template, color) {
+            Ok(tera) => Ok(Self { tera }),
+            Err(e) => Err(format!("template error: {}", format_tera_error(&e))),
+        }
+    }
+
+    /// Render a repo status with user-defined variables injected.
+    ///
+    /// On render failure, returns the error message as the output string
+    /// (same behavior as [`format_status_with_vars`]).
+    pub fn render(
+        &self,
+        status: &RepoStatus,
+        vars: &std::collections::HashMap<String, String>,
+    ) -> String {
+        let mut ctx = build_template_context(status);
+        for (key, value) in vars {
+            ctx.insert(key, value);
+        }
+        self.render_context(&ctx)
+    }
+
+    /// Render with an empty context — only color filters are available, no
+    /// repo status values. Matches the semantics of [`format_not_ready`].
+    pub fn render_not_ready(&self) -> String {
+        self.render_context(&tera::Context::new())
+    }
+
+    fn render_context(&self, ctx: &tera::Context) -> String {
+        match self.tera.render("tpl", ctx) {
+            Ok(rendered) => rendered.trim().to_string(),
+            Err(e) => format!("template error: {}", format_tera_error(&e)),
+        }
+    }
+}
+
 pub fn format_status(status: &RepoStatus, template: &str, color: bool) -> String {
     format_status_with_vars(status, template, color, &std::collections::HashMap::new())
 }
@@ -486,17 +544,9 @@ pub fn format_status_with_vars(
     color: bool,
     vars: &std::collections::HashMap<String, String>,
 ) -> String {
-    let mut ctx = build_template_context(status);
-    for (key, value) in vars {
-        ctx.insert(key, value);
-    }
-
-    match build_tera(template, color) {
-        Ok(tera) => match tera.render("tpl", &ctx) {
-            Ok(rendered) => rendered.trim().to_string(),
-            Err(e) => format!("template error: {}", format_tera_error(&e)),
-        },
-        Err(e) => format!("template error: {}", format_tera_error(&e)),
+    match CompiledTemplate::new(template, color) {
+        Ok(compiled) => compiled.render(status, vars),
+        Err(e) => e,
     }
 }
 
@@ -950,13 +1000,9 @@ pub fn builtin_not_ready_template(name: &str) -> &'static str {
 
 /// Render a "not ready" template with only color variables available.
 pub fn format_not_ready(template: &str, color: bool) -> String {
-    let ctx = tera::Context::new();
-    match build_tera(template, color) {
-        Ok(tera) => match tera.render("tpl", &ctx) {
-            Ok(rendered) => rendered.trim().to_string(),
-            Err(e) => format!("template error: {}", format_tera_error(&e)),
-        },
-        Err(e) => format!("template error: {}", format_tera_error(&e)),
+    match CompiledTemplate::new(template, color) {
+        Ok(compiled) => compiled.render_not_ready(),
+        Err(e) => e,
     }
 }
 
@@ -2408,5 +2454,97 @@ format = '''
             !formatted.contains("more"),
             "should not contain overflow: {formatted}"
         );
+    }
+
+    // ── CompiledTemplate ────────────────────────────────────────────
+
+    #[test]
+    fn test_compiled_template_matches_format_status() {
+        let compiled = CompiledTemplate::new(ASCII_FORMAT, true).unwrap();
+        let no_vars = HashMap::new();
+        for (label, status) in &sample_statuses() {
+            assert_eq!(
+                compiled.render(status, &no_vars),
+                format_status(status, ASCII_FORMAT, true),
+                "compiled render diverged from format_status for {label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compiled_template_reuse_with_vars() {
+        let compiled = CompiledTemplate::new(ASCII_FORMAT, false).unwrap();
+        let status = RepoStatus {
+            is_jj: true,
+            change_id: "xlvlt".to_string(),
+            bookmarks: vec![
+                Bookmark {
+                    name: "a".into(),
+                    display: "a".into(),
+                    ..Default::default()
+                },
+                Bookmark {
+                    name: "b".into(),
+                    display: "b".into(),
+                    ..Default::default()
+                },
+                Bookmark {
+                    name: "c".into(),
+                    display: "c".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut vars = HashMap::new();
+        vars.insert("max_bookmarks".to_string(), "1".to_string());
+        // Repeated renders from the same instance stay consistent
+        let first = compiled.render(&status, &vars);
+        let second = compiled.render(&status, &vars);
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            format_status_with_vars(&status, ASCII_FORMAT, false, &vars)
+        );
+        assert!(first.contains("(+2 more)"), "vars should apply: {first}");
+    }
+
+    #[test]
+    fn test_compiled_template_not_ready() {
+        let compiled = CompiledTemplate::new(NOT_READY_ASCII, false).unwrap();
+        assert_eq!(
+            compiled.render_not_ready(),
+            format_not_ready(NOT_READY_ASCII, false)
+        );
+
+        let colored = CompiledTemplate::new(NOT_READY_ASCII, true).unwrap();
+        assert_eq!(
+            colored.render_not_ready(),
+            format_not_ready(NOT_READY_ASCII, true)
+        );
+    }
+
+    #[test]
+    fn test_compiled_template_invalid() {
+        let err = CompiledTemplate::new("{{ foo", false).unwrap_err();
+        assert!(
+            err.starts_with("template error:"),
+            "expected template error prefix: {err:?}"
+        );
+        assert!(err.contains("caused by:"), "expected cause chain: {err:?}");
+    }
+
+    #[test]
+    fn test_compiled_template_without_detail_include() {
+        // Templates that don't reference detail.tera skip parsing it entirely
+        let compiled =
+            CompiledTemplate::new("{{ branch }}{% if conflict %}!{% endif %}", false).unwrap();
+        let status = RepoStatus {
+            is_git: true,
+            branch: "main".to_string(),
+            conflict: true,
+            ..Default::default()
+        };
+        assert_eq!(compiled.render(&status, &HashMap::new()), "main!");
     }
 }
