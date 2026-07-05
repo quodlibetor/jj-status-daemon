@@ -46,6 +46,18 @@ self-healing after watcher event loss.
   paths outside its root (possible with non-canonical event path prefixes,
   e.g. macOS `/var` vs `/private/var`).
 
+**Bookmark display**
+- **trunk-history bookmarks hidden when feature bookmarks exist**: if the
+  current line of work (`::@ ~ ::trunk()`) has bookmarks, only those are
+  shown — `main`/`master` no longer appear as `main+N` noise on every
+  change. If the current line has *no* bookmarks, the nearest ancestor
+  bookmark is shown instead (typically `main+N`), and only the nearest:
+  stale bookmarks further behind trunk stay hidden. Respects a
+  user-defined `trunk()` revset alias; the filter revset is evaluated once
+  per refresh with a generation-bounded walk (roughly `trunk()..@`, not
+  repo history). Repos with no remotes are unaffected (`trunk()` falls
+  back to `root()`).
+
 **Testing**
 - **property-testing engine** (`src/diff_props.rs`): random sequences of file
   mutations and jj commands replayed against a real repo, with worker state
