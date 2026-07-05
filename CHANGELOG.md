@@ -30,13 +30,33 @@ self-healing after watcher event loss.
   including the modern `config-id`-keyed repo config location) instead of
   assuming jj's default `diff` style, so conflicted files diff as unchanged
   regardless of configuration.
+- **rename/copy detection**: diff stats now match jj's rename handling. Full
+  refreshes use the backend's copy records (`{a => b} | 2 +-` counts as one
+  changed file with real line deltas, including fuzzy move+edit renames);
+  the incremental overlay pairs equal-content Added/Deleted entries as
+  renames and diffs edits to a renamed file against the rename source's
+  parent content. Previously a `mv` counted as a full delete plus a full
+  add.
+- **ignore-aware incremental diffs**: overlay entries for files that are
+  untracked *and* ignored are recorded as "no change", so a file that
+  becomes covered by `.gitignore` after being seen once can no longer leave
+  a permanent phantom Added entry.
+- **watcher panic fix**: ignore matching now maps event paths to
+  repo-relative form before consulting the `ignore` crate, which panics on
+  paths outside its root (possible with non-canonical event path prefixes,
+  e.g. macOS `/var` vs `/private/var`).
 
 **Testing**
 - **property-testing engine** (`src/diff_props.rs`): random sequences of file
   mutations and jj commands replayed against a real repo, with worker state
   compared to `jj diff --stat` after every action. A lossy mode drops event
   batches to simulate FSEvents overflow and asserts the engine converges at
-  the next jj operation. Set `DIFF_PROP_CASES=n` to scale the campaign.
+  the next jj operation. Set `DIFF_PROP_CASES=n` and `DIFF_PROP_SEQ_LEN=n`
+  to scale the campaign. The action set covers file writes/appends/edits/
+  deletes/renames, directory moves, `jj new/commit/describe/abandon/squash/
+  undo/edit/restore/split/rebase`, merge creation, conflicts, marker-style
+  config changes, `.gitignore` mutations, and git-remote interaction
+  (commits to a side repo, `jj git fetch`, `jj new main@origin`).
 
 # v0.0.13
 

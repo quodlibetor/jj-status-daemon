@@ -187,28 +187,28 @@ impl IgnoreFilter {
             };
         }
 
-        let all_ignored = wc_paths.iter().all(|p| {
-            let rel = p.strip_prefix(&canonical_root).unwrap_or(p);
-            let is_dir = p.is_dir();
+        // Map to repo-relative before matching: the `ignore` crate panics on
+        // paths outside its root, and event paths may use a non-canonical
+        // prefix (macOS /var vs /private/var). Unmappable paths are treated
+        // as not ignored (conservative: they trigger a refresh).
+        let is_ignored = |inner: &IgnoreFilterInner, p: &Path| -> bool {
+            let Some(rel) = crate::jj::abs_to_repo_relative(&canonical_root, p) else {
+                return false;
+            };
             inner
                 .matcher
-                .matched_path_or_any_parents(rel, is_dir)
+                .matched_path_or_any_parents(Path::new(&rel), p.is_dir())
                 .is_ignore()
-        });
+        };
+
+        let all_ignored = wc_paths.iter().all(|p| is_ignored(&inner, p));
 
         let changed_paths = if all_ignored {
             Vec::new()
         } else {
             wc_paths
                 .into_iter()
-                .filter(|p| {
-                    let rel = p.strip_prefix(&canonical_root).unwrap_or(p);
-                    let is_dir = p.is_dir();
-                    !inner
-                        .matcher
-                        .matched_path_or_any_parents(rel, is_dir)
-                        .is_ignore()
-                })
+                .filter(|p| !is_ignored(&inner, p))
                 .cloned()
                 .collect()
         };
@@ -319,7 +319,14 @@ impl IgnoreFilterInner {
 }
 
 /// Find the global gitignore path from git config or the default location.
+/// Cached process-wide: it costs a `git config` subprocess and is queried on
+/// every filter construction (per full refresh in the jj diff engine).
 fn global_gitignore_path() -> Option<PathBuf> {
+    static CACHE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(global_gitignore_path_uncached).clone()
+}
+
+fn global_gitignore_path_uncached() -> Option<PathBuf> {
     // Try `core.excludesFile` via git config
     let output = std::process::Command::new("git")
         .args(["config", "--global", "core.excludesFile"])
