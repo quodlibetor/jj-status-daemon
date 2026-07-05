@@ -21,15 +21,21 @@ use jj_lib::workspace::{Workspace, default_working_copy_factories};
 use serde::Deserialize as _;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::template::{Bookmark, RepoStatus, TrackingStatus};
 
-/// Create minimal UserSettings for read-only operations.
+/// Create minimal UserSettings for read-only operations. The settings are
+/// constant, so they are built once and cloned (UserSettings is cheap to
+/// clone) instead of re-parsing the default config on every repo load.
 fn create_user_settings() -> Result<UserSettings> {
+    static SETTINGS: OnceLock<UserSettings> = OnceLock::new();
+    if let Some(settings) = SETTINGS.get() {
+        return Ok(settings.clone());
+    }
     let mut config = StackedConfig::with_defaults();
     let mut user_layer = ConfigLayer::empty(ConfigSource::User);
     user_layer
@@ -39,7 +45,32 @@ fn create_user_settings() -> Result<UserSettings> {
         .set_value("user.email", "vcs-status-daemon@localhost")
         .context("set user.email")?;
     config.add_layer(user_layer);
-    UserSettings::from_config(config).context("create UserSettings")
+    let settings = UserSettings::from_config(config).context("create UserSettings")?;
+    Ok(SETTINGS.get_or_init(|| settings).clone())
+}
+
+/// Read and parse a TOML config file, cached by (mtime, size) so repeated
+/// refreshes don't re-read and re-parse unchanged files. Returns `None` for
+/// missing or unparseable files (parse failures are cached too).
+fn cached_config_table(path: &Path) -> Option<Arc<toml::Table>> {
+    type Key = (std::time::SystemTime, u64);
+    type Cache = HashMap<PathBuf, (Key, Option<Arc<toml::Table>>)>;
+    static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
+
+    let meta = std::fs::metadata(path).ok()?;
+    let key = (meta.modified().ok()?, meta.len());
+    let mut cache = CACHE.lock().unwrap();
+    if let Some((cached_key, table)) = cache.get(path)
+        && *cached_key == key
+    {
+        return table.clone();
+    }
+    let table = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| content.parse::<toml::Table>().ok())
+        .map(Arc::new);
+    cache.insert(path.to_path_buf(), (key, table.clone()));
+    table
 }
 
 /// Materialize a tree value to the byte content `jj diff` would compare:
@@ -112,10 +143,7 @@ fn conflict_marker_style_for_repo(repo_path: &Path) -> ConflictMarkerStyle {
     config_paths.push(repo_config_path(repo_path));
 
     for path in config_paths {
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(table) = content.parse::<toml::Table>() else {
+        let Some(table) = cached_config_table(&path) else {
             continue;
         };
         let Some(value) = table
@@ -509,34 +537,40 @@ async fn compute_per_file_diff_stats(
 ) -> HashMap<String, FileDiffStats> {
     let mut result = HashMap::new();
 
-    let mut diff_stream =
-        from_tree.diff_stream_with_copies(to_tree, &EverythingMatcher, copy_records);
+    // Materialize both sides of each entry with buffered concurrency,
+    // mirroring jj-lib's own materialized_diff_stream — serial awaits here
+    // would bottleneck large diffs on backend read latency.
+    let mut diff_stream = from_tree
+        .diff_stream_with_copies(to_tree, &EverythingMatcher, copy_records)
+        .map(|entry| async move {
+            let values = entry.values.ok()?;
+            let (before, after) = futures::join!(
+                materialized_content(
+                    store,
+                    entry.path.source(),
+                    values.before,
+                    from_tree.labels(),
+                    marker_style,
+                ),
+                materialized_content(
+                    store,
+                    entry.path.target(),
+                    values.after,
+                    to_tree.labels(),
+                    marker_style,
+                ),
+            );
+            Some((entry.path, before, after))
+        })
+        .buffered((store.concurrency() / 2).max(1));
     while let Some(entry) = diff_stream.next().await {
-        let Ok(values) = entry.values else {
+        let Some((path, before, after)) = entry else {
             continue;
         };
 
-        let before = materialized_content(
-            store,
-            entry.path.source(),
-            values.before,
-            from_tree.labels(),
-            marker_style,
-        )
-        .await;
-        let after = materialized_content(
-            store,
-            entry.path.target(),
-            values.after,
-            to_tree.labels(),
-            marker_style,
-        )
-        .await;
-
-        let renamed_from = entry
-            .path
+        let renamed_from = path
             .copy_operation()
-            .map(|_| entry.path.source().as_internal_file_string().to_string());
+            .map(|_| path.source().as_internal_file_string().to_string());
 
         let stats = match diff_stats_for_contents(before.as_deref(), after.as_deref()) {
             Some(mut stats) => {
@@ -557,10 +591,7 @@ async fn compute_per_file_diff_stats(
             None => continue,
         };
 
-        result.insert(
-            entry.path.target().as_internal_file_string().to_string(),
-            stats,
-        );
+        result.insert(path.target().as_internal_file_string().to_string(), stats);
     }
 
     result
@@ -799,10 +830,7 @@ fn load_user_revset_aliases(aliases_map: &mut RevsetAliasesMap) {
     .collect();
 
     for path in config_paths {
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(table) = content.parse::<toml::Table>() else {
+        let Some(table) = cached_config_table(&path) else {
             continue;
         };
         let Some(aliases) = table.get("revset-aliases").and_then(|v| v.as_table()) else {
@@ -913,14 +941,21 @@ fn classify_tracking(
     }
 }
 
-/// Build a map of bookmark name → tracking status by scanning all tracked remote refs.
+/// Build a map of bookmark name → tracking status for the given names by
+/// scanning tracked remote refs. Classification costs up to two ancestry
+/// walks per ref, so callers restrict it to the bookmarks actually shown
+/// rather than every bookmark in the repo.
 fn compute_tracking_statuses(
     repo: &Arc<jj_lib::repo::ReadonlyRepo>,
     view: &jj_lib::view::View,
+    names: &HashSet<&str>,
 ) -> HashMap<String, TrackingStatus> {
     let mut result: HashMap<String, TrackingStatus> = HashMap::new();
 
     for (symbol, remote_ref) in view.all_remote_bookmarks() {
+        if !names.contains(symbol.name.as_str()) {
+            continue;
+        }
         if !remote_ref.is_tracked() || !remote_ref.is_present() {
             continue;
         }
@@ -974,9 +1009,6 @@ fn find_ancestor_bookmarks(
         }
     }
 
-    // Compute tracking statuses for all bookmarks against their remotes
-    let tracking_statuses = compute_tracking_statuses(repo, view);
-
     // Prefer bookmarks on commits in `::@ ~ ::trunk()` — the current line
     // of work. Bookmarks in trunk's history (main, master, ...) are noise
     // when feature bookmarks exist. If the current line has NO bookmarks,
@@ -995,31 +1027,30 @@ fn find_ancestor_bookmarks(
         collect_bookmarks_bfs(
             repo,
             &bookmark_targets,
-            &tracking_statuses,
             wc_id,
             max_depth,
             &|id| containing(id).unwrap_or(true),
             false,
         )
     });
-    match filtered {
-        Some(Ok(found)) if !found.is_empty() => return Ok(found),
+    let mut bookmarks = match filtered {
+        Some(Ok(found)) if !found.is_empty() => found,
         Some(Err(e)) => return Err(e),
-        _ => {}
-    }
+        // Nothing on the current line: nearest ancestor bookmarks only (stop
+        // at the first depth with a match, so `main+N` shows without dragging
+        // in every stale bookmark behind it).
+        _ => collect_bookmarks_bfs(repo, &bookmark_targets, wc_id, max_depth, &|_| true, true)?,
+    };
 
-    // Nothing on the current line: nearest ancestor bookmarks only (stop at
-    // the first depth with a match, so `main+N` shows without dragging in
-    // every stale bookmark behind it).
-    collect_bookmarks_bfs(
-        repo,
-        &bookmark_targets,
-        &tracking_statuses,
-        wc_id,
-        max_depth,
-        &|_| true,
-        true,
-    )
+    // Classify tracking only for the bookmarks that will be displayed.
+    let names: HashSet<&str> = bookmarks.iter().map(|b| b.name.as_str()).collect();
+    let tracking_statuses = compute_tracking_statuses(repo, view, &names);
+    for bookmark in &mut bookmarks {
+        if let Some(status) = tracking_statuses.get(&bookmark.name) {
+            bookmark.tracking = status.clone();
+        }
+    }
+    Ok(bookmarks)
 }
 
 /// BFS over ancestors of `wc_id` up to `max_depth`, collecting bookmarks on
@@ -1033,7 +1064,6 @@ fn find_ancestor_bookmarks(
 fn collect_bookmarks_bfs(
     repo: &Arc<jj_lib::repo::ReadonlyRepo>,
     bookmark_targets: &HashMap<CommitId, Vec<String>>,
-    tracking_statuses: &HashMap<String, TrackingStatus>,
     wc_id: &CommitId,
     max_depth: u32,
     in_branch: &dyn Fn(&CommitId) -> bool,
@@ -1050,12 +1080,11 @@ fn collect_bookmarks_bfs(
     {
         for name_str in names {
             if seen_names.insert(name_str.clone()) {
-                let tracking = tracking_statuses.get(name_str).cloned().unwrap_or_default();
                 bookmarks.push(Bookmark {
                     name: name_str.clone(),
                     distance: 0,
                     display: name_str.clone(),
-                    tracking,
+                    tracking: TrackingStatus::default(),
                 });
             }
         }
@@ -1088,12 +1117,11 @@ fn collect_bookmarks_bfs(
             for name_str in names {
                 if seen_names.insert(name_str.clone()) {
                     let display = format!("{name_str}+{depth}");
-                    let tracking = tracking_statuses.get(name_str).cloned().unwrap_or_default();
                     bookmarks.push(Bookmark {
                         name: name_str.clone(),
                         distance: depth,
                         display,
-                        tracking,
+                        tracking: TrackingStatus::default(),
                     });
                 }
             }
@@ -1118,6 +1146,9 @@ fn collect_bookmarks_bfs(
 struct JjLoadedRepo {
     repo: Arc<jj_lib::repo::ReadonlyRepo>,
     commit: jj_lib::commit::Commit,
+    /// Parent tree (merged for merge commits); `None` if it failed to load.
+    /// Retained so `compute_jj_full_status` doesn't redo the merge.
+    parent_tree: Option<jj_lib::merged_tree::MergedTree>,
     parent_tree_ids: jj_lib::merge::Merge<jj_lib::backend::TreeId>,
     /// Metadata-only status (no diff stats populated).
     metadata_status: RepoStatus,
@@ -1158,7 +1189,7 @@ async fn load_jj_repo(repo_path: &Path, depth: u32) -> Result<JjLoadedRepo> {
     let parent_tree_ids = parent_tree
         .as_ref()
         .map(|t| t.tree_ids().clone())
-        .unwrap_or_else(|| commit.tree().tree_ids().clone());
+        .unwrap_or_else(|| commit.tree_ids().clone());
 
     // Compute metadata-only status (no diff stats)
     let mut status = RepoStatus {
@@ -1203,6 +1234,7 @@ async fn load_jj_repo(repo_path: &Path, depth: u32) -> Result<JjLoadedRepo> {
     Ok(JjLoadedRepo {
         repo,
         commit,
+        parent_tree,
         parent_tree_ids,
         metadata_status: status,
     })
@@ -1216,10 +1248,7 @@ async fn compute_jj_full_status(
     let mut status = loaded.metadata_status;
     let conflict_marker_style = conflict_marker_style_for_repo(repo_path);
 
-    let parent_tree = {
-        let _span = tracing::debug_span!("load_parent_tree").entered();
-        loaded.commit.parent_tree(loaded.repo.as_ref()).await.ok()
-    };
+    let parent_tree = loaded.parent_tree;
     let current_tree = loaded.commit.tree();
     let base_file_stats = if let Some(ref parent_tree) = parent_tree {
         let copy_records = gather_copy_records(loaded.repo.store(), &loaded.commit).await;
@@ -1431,7 +1460,7 @@ async fn jj_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                 };
 
                 let trees_unchanged = loaded.parent_tree_ids == state.parent_tree_ids
-                    && loaded.commit.tree().tree_ids() == &state.commit_tree_ids;
+                    && loaded.commit.tree_ids() == &state.commit_tree_ids;
 
                 if trees_unchanged {
                     // Neither the parent tree nor the WC commit tree changed —
