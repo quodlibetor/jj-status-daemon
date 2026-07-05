@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use jj_lib::backend::CommitId;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::conflicts::ConflictMarkerStyle;
 use jj_lib::diff::DiffHunkKind;
 use jj_lib::diff_presentation::{LineCompareMode, diff_by_line};
 use jj_lib::fileset::FilesetAliasesMap;
@@ -17,6 +18,7 @@ use jj_lib::revset::{
 use jj_lib::settings::UserSettings;
 use jj_lib::time_util::DatePatternContext;
 use jj_lib::workspace::{Workspace, default_working_copy_factories};
+use serde::Deserialize as _;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,11 +53,11 @@ async fn materialized_content(
     path: &jj_lib::repo_path::RepoPath,
     value: jj_lib::merge::MergedTreeValue,
     labels: &jj_lib::conflict_labels::ConflictLabels,
+    marker_style: ConflictMarkerStyle,
 ) -> Option<Vec<u8>> {
     use jj_lib::conflicts::{
-        ConflictMarkerStyle, ConflictMaterializeOptions, MaterializedTreeValue,
-        choose_materialized_conflict_marker_len, materialize_merge_result_to_bytes,
-        materialize_tree_value,
+        ConflictMaterializeOptions, MaterializedTreeValue, choose_materialized_conflict_marker_len,
+        materialize_merge_result_to_bytes, materialize_tree_value,
     };
 
     match materialize_tree_value(store, path, value, labels)
@@ -72,8 +74,7 @@ async fn materialized_content(
             // writes to disk.
             let marker_len = choose_materialized_conflict_marker_len(&file.contents);
             let options = ConflictMaterializeOptions {
-                // jj's default `ui.conflict-marker-style`
-                marker_style: ConflictMarkerStyle::Diff,
+                marker_style,
                 marker_len: Some(marker_len),
                 merge: store.merge_options().clone(),
             };
@@ -85,6 +86,101 @@ async fn materialized_content(
         MaterializedTreeValue::GitSubmodule(_) => None,
         MaterializedTreeValue::Tree(_) => None,
     }
+}
+
+/// Resolve the user's `ui.conflict-marker-style` the way jj would for this
+/// repo: built-in default, then user config files, then repo config
+/// (`.jj/repo/config.toml`), later sources overriding earlier ones.
+///
+/// jj rematerializes on-disk conflicts only when trees change, so a file
+/// written before a config change may briefly carry old-style markers; we
+/// read the current config at refresh time, which matches what jj will
+/// write from now on.
+fn conflict_marker_style_for_repo(repo_path: &Path) -> ConflictMarkerStyle {
+    let mut style = ConflictMarkerStyle::Diff; // jj's built-in default
+
+    // User-level config paths (superset of `load_user_revset_aliases`),
+    // then repo-level config, which has the highest precedence in jj.
+    let mut config_paths: Vec<PathBuf> = [
+        std::env::var("JJ_CONFIG").ok().map(PathBuf::from),
+        dirs::home_dir().map(|d| d.join(".jjconfig.toml")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    config_paths.extend(jj_config_roots().into_iter().map(|d| d.join("config.toml")));
+    config_paths.push(repo_config_path(repo_path));
+
+    for path in config_paths {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(table) = content.parse::<toml::Table>() else {
+            continue;
+        };
+        let Some(value) = table
+            .get("ui")
+            .and_then(|ui| ui.get("conflict-marker-style"))
+        else {
+            continue;
+        };
+        match ConflictMarkerStyle::deserialize(value.clone()) {
+            Ok(parsed) => style = parsed,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "invalid ui.conflict-marker-style in jj config, ignoring"
+                );
+            }
+        }
+    }
+
+    style
+}
+
+/// Path to the repo-level jj config.
+///
+/// Modern jj stores it outside the repo, keyed by `.jj/repo/config-id`:
+/// `<config dir>/jj/repos/<config-id>/config.toml`. Older repos used
+/// `.jj/repo/config.toml` directly. In a secondary workspace `.jj/repo` is
+/// a file containing the path of the primary repo's store directory.
+fn repo_config_path(repo_path: &Path) -> PathBuf {
+    let mut repo_dir = repo_path.join(".jj").join("repo");
+    if repo_dir.is_file()
+        && let Ok(target) = std::fs::read_to_string(&repo_dir)
+    {
+        repo_dir = PathBuf::from(target.trim());
+    }
+    if let Ok(config_id) = std::fs::read_to_string(repo_dir.join("config-id")) {
+        let config_id = config_id.trim();
+        if !config_id.is_empty() && config_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            for root in jj_config_roots() {
+                let candidate = root.join("repos").join(config_id).join("config.toml");
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    repo_dir.join("config.toml")
+}
+
+/// Candidate jj config root directories (containing `config.toml`, `repos/`).
+/// jj checks the platform config dir and, on macOS where they differ,
+/// `~/.config` as well.
+fn jj_config_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(d) = dirs::config_dir() {
+        roots.push(d.join("jj"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        let xdg = home.join(".config").join("jj");
+        if !roots.contains(&xdg) {
+            roots.push(xdg);
+        }
+    }
+    roots
 }
 
 /// Check if content looks binary by scanning for null bytes in the first 8KB.
@@ -158,6 +254,10 @@ pub struct JjRepoState {
     /// started, but the op rewrote the working copy on disk). When the op
     /// advanced with unchanged trees, overlay entries must be re-diffed.
     op_id: jj_lib::op_store::OperationId,
+    /// The user's `ui.conflict-marker-style` at the time of the last full
+    /// refresh; conflicted parent values must materialize with the same
+    /// markers jj wrote to disk or unchanged files diff as modified.
+    conflict_marker_style: ConflictMarkerStyle,
     /// Per-file stats from the last full jj-lib diff (parent_tree vs commit.tree()).
     base_file_stats: HashMap<String, FileDiffStats>,
     /// Overlay: per-file stats computed from disk reads for working copy files.
@@ -328,6 +428,7 @@ async fn compute_per_file_diff_stats(
     store: &Arc<jj_lib::store::Store>,
     from_tree: &jj_lib::merged_tree::MergedTree,
     to_tree: &jj_lib::merged_tree::MergedTree,
+    marker_style: ConflictMarkerStyle,
 ) -> HashMap<String, FileDiffStats> {
     let mut result = HashMap::new();
 
@@ -337,9 +438,22 @@ async fn compute_per_file_diff_stats(
             continue;
         };
 
-        let before =
-            materialized_content(store, &entry.path, values.before, from_tree.labels()).await;
-        let after = materialized_content(store, &entry.path, values.after, to_tree.labels()).await;
+        let before = materialized_content(
+            store,
+            &entry.path,
+            values.before,
+            from_tree.labels(),
+            marker_style,
+        )
+        .await;
+        let after = materialized_content(
+            store,
+            &entry.path,
+            values.after,
+            to_tree.labels(),
+            marker_style,
+        )
+        .await;
 
         let Some(stats) = diff_stats_for_contents(before.as_deref(), after.as_deref()) else {
             continue;
@@ -405,13 +519,20 @@ async fn diff_single_file(
     parent_tree: &jj_lib::merged_tree::MergedTree,
     repo_path: &jj_lib::repo_path::RepoPath,
     disk_content: Option<&[u8]>,
+    marker_style: ConflictMarkerStyle,
 ) -> Option<FileDiffStats> {
     // Materialize the parent-side value the same way jj does (conflicted
     // files become conflict-marker text, matching what jj writes to disk),
     // so an untouched conflicted file diffs as unchanged.
     let parent_value = parent_tree.path_value(repo_path).ok()?;
-    let parent_content =
-        materialized_content(store, repo_path, parent_value, parent_tree.labels()).await;
+    let parent_content = materialized_content(
+        store,
+        repo_path,
+        parent_value,
+        parent_tree.labels(),
+        marker_style,
+    )
+    .await;
 
     diff_stats_for_contents(parent_content.as_deref(), disk_content)
 }
@@ -438,6 +559,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             &state.parent_tree,
             &repo_path_buf,
             disk_content.as_deref(),
+            state.conflict_marker_style,
         )
         .await;
         state.overlay.insert(rel_str, diff_result);
@@ -833,6 +955,7 @@ async fn compute_jj_full_status(
     loaded: JjLoadedRepo,
 ) -> Result<(RepoStatus, JjRepoState)> {
     let mut status = loaded.metadata_status;
+    let conflict_marker_style = conflict_marker_style_for_repo(repo_path);
 
     let parent_tree = {
         let _span = tracing::debug_span!("load_parent_tree").entered();
@@ -840,8 +963,13 @@ async fn compute_jj_full_status(
     };
     let current_tree = loaded.commit.tree();
     let base_file_stats = if let Some(ref parent_tree) = parent_tree {
-        let per_file =
-            compute_per_file_diff_stats(loaded.repo.store(), parent_tree, &current_tree).await;
+        let per_file = compute_per_file_diff_stats(
+            loaded.repo.store(),
+            parent_tree,
+            &current_tree,
+            conflict_marker_style,
+        )
+        .await;
         let c = aggregate_file_stats(&per_file);
         status.file_mad_count_working_tree = c.file_mad_count;
         status.lines_added_working_tree = c.lines_added;
@@ -875,6 +1003,7 @@ async fn compute_jj_full_status(
         parent_tree: retained_parent_tree,
         commit_tree_ids,
         op_id: loaded.repo.op_id().clone(),
+        conflict_marker_style,
         base_file_stats,
         overlay: HashMap::new(),
         repo_root,
@@ -2576,6 +2705,120 @@ mod tests {
                 full.lines_added_working_tree
             ),
             "touching a conflicted file should not change the diff stats"
+        );
+    }
+
+    /// `ui.conflict-marker-style` from the repo config must be used when
+    /// materializing conflicted parent values: with `git` style configured,
+    /// the file jj writes to disk uses git markers, and touching it must
+    /// still diff as unchanged. (With a hardcoded style, the marker text
+    /// mismatch reports phantom modified lines.)
+    #[tokio::test]
+    async fn test_conflict_marker_style_config_respected() {
+        let dir = create_jj_repo().await;
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+        // Configure BEFORE the merge is created so jj materializes the
+        // on-disk conflict with git-style markers. Repo-level config also
+        // keeps this test independent of the host user's jj config.
+        jj_cmd(
+            dir.path(),
+            &["config", "set", "--repo", "ui.conflict-marker-style", "git"],
+        )
+        .await;
+        assert_eq!(
+            conflict_marker_style_for_repo(dir.path()),
+            ConflictMarkerStyle::Git,
+            "resolver should pick up the repo-level config"
+        );
+
+        // Build a conflict: two siblings editing the same line, then merge
+        std::fs::write(dir.path().join("f.txt"), "base\n").unwrap();
+        jj_cmd(dir.path(), &["commit", "-m", "base"]).await;
+        jj_cmd(dir.path(), &["bookmark", "create", "base-bm", "-r", "@-"]).await;
+        std::fs::write(dir.path().join("f.txt"), "side-a\n").unwrap();
+        jj_cmd(dir.path(), &["commit", "-m", "a"]).await;
+        jj_cmd(dir.path(), &["bookmark", "create", "side-a-bm", "-r", "@-"]).await;
+        jj_cmd(dir.path(), &["new", "base-bm"]).await;
+        std::fs::write(dir.path().join("f.txt"), "side-b\n").unwrap();
+        jj_cmd(dir.path(), &["commit", "-m", "b"]).await;
+        jj_cmd(dir.path(), &["bookmark", "create", "side-b-bm", "-r", "@-"]).await;
+        jj_cmd(dir.path(), &["new", "side-a-bm", "side-b-bm"]).await;
+
+        let disk = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
+        assert!(
+            disk.contains("<<<<<<<") && disk.contains("=======") && !disk.contains("%%%%%%%"),
+            "on-disk conflict should use git-style markers, got:\n{disk}"
+        );
+
+        let jj_worker = spawn_jj_worker();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let full = reply_rx.await.unwrap().unwrap();
+
+        // Touch the conflicted file (watcher event, content unchanged)
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::IncrementalUpdate {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![dir.path().join("f.txt")],
+                reply: reply_tx,
+            })
+            .unwrap();
+        let incr = reply_rx.await.unwrap().unwrap();
+        assert_eq!(
+            (
+                incr.file_mad_count_working_tree,
+                incr.lines_added_working_tree,
+                incr.lines_removed_working_tree
+            ),
+            (
+                full.file_mad_count_working_tree,
+                full.lines_added_working_tree,
+                full.lines_removed_working_tree
+            ),
+            "touching a git-marker conflicted file must not change diff stats"
+        );
+    }
+
+    /// The resolver falls back to jj's default (Diff) with no config, and
+    /// ignores invalid values.
+    #[test]
+    fn test_conflict_marker_style_default_and_invalid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".jj/repo")).unwrap();
+        assert_eq!(
+            conflict_marker_style_for_repo(dir.path()),
+            ConflictMarkerStyle::Diff
+        );
+
+        std::fs::write(
+            dir.path().join(".jj/repo/config.toml"),
+            "[ui]\nconflict-marker-style = \"snapshot\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            conflict_marker_style_for_repo(dir.path()),
+            ConflictMarkerStyle::Snapshot
+        );
+
+        std::fs::write(
+            dir.path().join(".jj/repo/config.toml"),
+            "[ui]\nconflict-marker-style = \"bogus\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            conflict_marker_style_for_repo(dir.path()),
+            ConflictMarkerStyle::Diff,
+            "invalid value should fall back to the default"
         );
     }
 

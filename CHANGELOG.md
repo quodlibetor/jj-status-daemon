@@ -25,6 +25,11 @@ self-healing after watcher event loss.
   that rebuilds state from the store and re-diffs all known-dirty files.
 - **deleted directories**: repo-relative path mapping now works for files
   whose parent directories were deleted along with them.
+- **`ui.conflict-marker-style` respected**: conflict materialization reads the
+  user's configured marker style (user config files and repo-level config,
+  including the modern `config-id`-keyed repo config location) instead of
+  assuming jj's default `diff` style, so conflicted files diff as unchanged
+  regardless of configuration.
 
 **Testing**
 - **property-testing engine** (`src/diff_props.rs`): random sequences of file
