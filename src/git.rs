@@ -47,54 +47,73 @@ fn delta_to_kind(status: git2::Delta) -> FileChangeKind {
 }
 
 /// Extract per-file line-level diff stats from a git2 Diff.
+///
+/// Uses `foreach` (not `print`) so the path String is allocated once per
+/// delta rather than once per diff line, and no patch text is formatted.
+/// The file callback fires for every delta, which also covers files with no
+/// line content (binary, pure renames).
 fn per_file_stats_from_diff(diff: &git2::Diff<'_>) -> Result<HashMap<String, FileDiffStats>> {
-    let mut result: HashMap<String, FileDiffStats> = HashMap::new();
+    // foreach takes separate closures, so shared mutable state lives in a
+    // RefCell. Line callbacks for a delta always follow its file callback,
+    // so `current` is the entry receiving counts; it is flushed on the next
+    // file callback (and once more at the end).
+    let state = std::cell::RefCell::new((
+        HashMap::<String, FileDiffStats>::new(),
+        None::<(String, FileDiffStats)>,
+    ));
 
-    diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
-        let path = delta
-            .new_file()
-            .path()
-            .or_else(|| delta.old_file().path())
-            .map(|p| p.to_string_lossy().to_string());
-        if let Some(path) = path {
-            let stats = result.entry(path).or_insert_with(|| FileDiffStats {
-                kind: delta_to_kind(delta.status()),
-                ..Default::default()
-            });
-            match line.origin() {
-                '+' => stats.lines_added += 1,
-                '-' => stats.lines_removed += 1,
-                _ => {}
+    diff.foreach(
+        &mut |delta, _progress| {
+            let (result, current) = &mut *state.borrow_mut();
+            if let Some((path, stats)) = current.take() {
+                result.insert(path, stats);
             }
-        }
-        true
-    })?;
-
-    // Also ensure entries exist for files with no line content (binary, pure renames)
-    for i in 0..diff.deltas().len() {
-        if let Some(delta) = diff.get_delta(i) {
             let path = delta
                 .new_file()
                 .path()
                 .or_else(|| delta.old_file().path())
                 .map(|p| p.to_string_lossy().to_string());
             if let Some(path) = path {
-                result.entry(path).or_insert_with(|| FileDiffStats {
-                    kind: delta_to_kind(delta.status()),
-                    ..Default::default()
-                });
+                *current = Some((
+                    path,
+                    FileDiffStats {
+                        kind: delta_to_kind(delta.status()),
+                        ..Default::default()
+                    },
+                ));
             }
-        }
-    }
+            true
+        },
+        None,
+        None,
+        Some(&mut |_delta, _hunk, line| {
+            let (_, current) = &mut *state.borrow_mut();
+            if let Some((_, stats)) = current.as_mut() {
+                match line.origin() {
+                    '+' => stats.lines_added += 1,
+                    '-' => stats.lines_removed += 1,
+                    _ => {}
+                }
+            }
+            true
+        }),
+    )?;
 
+    let (mut result, current) = state.into_inner();
+    if let Some((path, stats)) = current {
+        result.insert(path, stats);
+    }
     Ok(result)
 }
 
 /// Aggregate per-file stats into DiffCounts.
 fn aggregate_file_stats(per_file: &HashMap<String, FileDiffStats>) -> DiffCounts {
-    let empty = HashMap::new();
-    aggregate_overlay_stats(per_file, &empty)
+    // HashMap::new() does not allocate, so the empty overlay is free.
+    aggregate_overlay_stats(per_file, &HashMap::new())
 }
+
+/// Cached ahead/behind counts keyed by the (local, upstream) OID pair.
+type AheadBehindCache = ((git2::Oid, git2::Oid), (u32, u32));
 
 /// Retained git state for incremental working copy diffs.
 pub struct GitRepoState {
@@ -110,6 +129,8 @@ pub struct GitRepoState {
     unstaged_overlay: HashMap<String, Option<FileDiffStats>>,
     /// Overlay for total diffs (working copy changes only).
     total_overlay: HashMap<String, Option<FileDiffStats>>,
+    /// Memoized graph_ahead_behind result — the walk is pure in the two OIDs.
+    ahead_behind: Option<AheadBehindCache>,
 }
 
 impl GitRepoState {
@@ -165,6 +186,8 @@ impl GitRepoState {
         {
             let mut opts = git2::DiffOptions::new();
             opts.include_untracked(true);
+            // Changed paths are literal file paths, not fnmatch patterns
+            opts.disable_pathspec_match(true);
             for path in &rel_paths {
                 opts.pathspec(path);
             }
@@ -186,6 +209,8 @@ impl GitRepoState {
         {
             let mut opts = git2::DiffOptions::new();
             opts.include_untracked(true);
+            // Changed paths are literal file paths, not fnmatch patterns
+            opts.disable_pathspec_match(true);
             for path in &rel_paths {
                 opts.pathspec(path);
             }
@@ -213,7 +238,11 @@ fn query_git_status_blocking(repo_path: &Path) -> Result<RepoStatus> {
 
 /// Refresh git metadata fields (branch, stash, ahead/behind, conflict, rebase state)
 /// without recomputing diffs. Mutates `base_status` in-place.
-fn refresh_git_metadata(status: &mut RepoStatus, repo: &mut git2::Repository) {
+fn refresh_git_metadata(
+    status: &mut RepoStatus,
+    ahead_behind: &mut Option<AheadBehindCache>,
+    repo: &mut git2::Repository,
+) {
     // Branch name
     if let Ok(head) = repo.head() {
         status.branch = if head.is_branch() {
@@ -236,7 +265,7 @@ fn refresh_git_metadata(status: &mut RepoStatus, repo: &mut git2::Repository) {
             | git2::RepositoryState::ApplyMailboxOrRebase
     );
 
-    // Ahead/behind
+    // Ahead/behind (graph walk memoized on the OID pair)
     status.ahead = 0;
     status.behind = 0;
     if !status.branch.is_empty()
@@ -244,10 +273,22 @@ fn refresh_git_metadata(status: &mut RepoStatus, repo: &mut git2::Repository) {
         && let Ok(upstream) = local.upstream()
         && let Some(local_oid) = local.get().target()
         && let Some(upstream_oid) = upstream.get().target()
-        && let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, upstream_oid)
     {
-        status.ahead = ahead as u32;
-        status.behind = behind as u32;
+        let counts = match *ahead_behind {
+            Some((key, counts)) if key == (local_oid, upstream_oid) => Some(counts),
+            _ => repo
+                .graph_ahead_behind(local_oid, upstream_oid)
+                .ok()
+                .map(|(a, b)| {
+                    let counts = (a as u32, b as u32);
+                    *ahead_behind = Some(((local_oid, upstream_oid), counts));
+                    counts
+                }),
+        };
+        if let Some((ahead, behind)) = counts {
+            status.ahead = ahead;
+            status.behind = behind;
+        }
     }
 
     // Stash count
@@ -281,10 +322,8 @@ fn refresh_git_diffs(state: &mut GitRepoState, repo: &git2::Repository) {
     }
 
     // Staged: tree → index
-    {
-        if let Ok(diff) = repo.diff_tree_to_index(head_tree.as_ref(), None, None)
-            && let Ok(c) = diff_stats(&diff)
-        {
+    let staged_empty = if let Ok(diff) = repo.diff_tree_to_index(head_tree.as_ref(), None, None) {
+        if let Ok(c) = diff_stats(&diff) {
             state.base_status.file_mad_count_staged = c.file_mad_count;
             state.base_status.lines_added_staged = c.lines_added;
             state.base_status.lines_removed_staged = c.lines_removed;
@@ -292,10 +331,26 @@ fn refresh_git_diffs(state: &mut GitRepoState, repo: &git2::Repository) {
             state.base_status.files_added_staged = c.files_added;
             state.base_status.files_deleted_staged = c.files_deleted;
         }
-    }
+        diff.deltas().len() == 0
+    } else {
+        false
+    };
 
-    // Total: tree → workdir+index
-    {
+    // Total: tree → workdir+index. When the index matches HEAD the total
+    // diff is identical to the unstaged diff — reuse it and skip a second
+    // full worktree scan.
+    if staged_empty {
+        state.base_total = state.base_unstaged.clone();
+        let c = aggregate_file_stats(&state.base_total);
+        state.base_status.file_mad_count = c.file_mad_count;
+        state.base_status.lines_added_total = c.lines_added;
+        state.base_status.lines_removed_total = c.lines_removed;
+        state.base_status.files_modified_total = c.files_modified;
+        state.base_status.files_added_total = c.files_added;
+        state.base_status.files_deleted_total = c.files_deleted;
+        state.base_status.untracked = c.files_untracked;
+        state.base_status.empty = c.file_mad_count == 0;
+    } else {
         let mut total_opts = git2::DiffOptions::new();
         total_opts.include_untracked(true);
         if let Ok(diff) =
@@ -332,26 +387,24 @@ fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus,
         ..Default::default()
     };
 
-    // Check for unborn HEAD
-    if repo.head().is_err() {
-        let repo_root = repo_path
-            .canonicalize()
-            .unwrap_or_else(|_| repo_path.to_path_buf());
-        let state = GitRepoState {
-            head_tree_oid: None,
-            repo_root,
-            base_status: status.clone(),
-            base_unstaged: HashMap::new(),
-            base_total: HashMap::new(),
-            unstaged_overlay: HashMap::new(),
-            total_overlay: HashMap::new(),
-        };
-        return Ok((status, state));
-    }
-
     let (head_tree_oid, base_unstaged, base_total) = {
-        // head() is Ok — we checked above
-        let head = repo.head().unwrap();
+        // Unborn HEAD: no commits yet, nothing to diff against
+        let Ok(head) = repo.head() else {
+            let repo_root = repo_path
+                .canonicalize()
+                .unwrap_or_else(|_| repo_path.to_path_buf());
+            let state = GitRepoState {
+                head_tree_oid: None,
+                repo_root,
+                base_status: status.clone(),
+                base_unstaged: HashMap::new(),
+                base_total: HashMap::new(),
+                unstaged_overlay: HashMap::new(),
+                total_overlay: HashMap::new(),
+                ahead_behind: None,
+            };
+            return Ok((status, state));
+        };
 
         // Branch name (empty when HEAD is detached)
         status.branch = if head.is_branch() {
@@ -370,13 +423,12 @@ fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus,
                 .unwrap_or_else(|_| format!("{:.7}", oid));
             status.description = commit.summary().unwrap_or("").to_string();
 
-            let head_tree = commit.tree().ok();
-            head_tree.map(|t| t.id())
+            Some(commit.tree_id())
         } else {
             None
         };
 
-        // Re-lookup the head tree by OID (so `head` and `commit` can be dropped)
+        // Look up the head tree by OID (so `head` and `commit` can be dropped)
         let head_tree = head_tree_oid.and_then(|oid| repo.find_tree(oid).ok());
 
         // Conflict detection
@@ -403,29 +455,38 @@ fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus,
         };
 
         // Staged: tree → index
-        {
+        let staged_empty = {
             let _span = tracing::debug_span!("diff_staged").entered();
-            if let Ok(diff) = repo.diff_tree_to_index(head_tree.as_ref(), None, None)
-                && let Ok(c) = diff_stats(&diff)
-            {
-                status.file_mad_count_staged = c.file_mad_count;
-                status.lines_added_staged = c.lines_added;
-                status.lines_removed_staged = c.lines_removed;
-                status.files_modified_staged = c.files_modified;
-                status.files_added_staged = c.files_added;
-                status.files_deleted_staged = c.files_deleted;
+            if let Ok(diff) = repo.diff_tree_to_index(head_tree.as_ref(), None, None) {
+                if let Ok(c) = diff_stats(&diff) {
+                    status.file_mad_count_staged = c.file_mad_count;
+                    status.lines_added_staged = c.lines_added;
+                    status.lines_removed_staged = c.lines_removed;
+                    status.files_modified_staged = c.files_modified;
+                    status.files_added_staged = c.files_added;
+                    status.files_deleted_staged = c.files_deleted;
+                }
+                diff.deltas().len() == 0
+            } else {
+                false
             }
-        }
+        };
 
-        // Total: tree → workdir (with per-file stats)
+        // Total: tree → workdir+index (with per-file stats). When the index
+        // matches HEAD the total diff is identical to the unstaged diff —
+        // reuse it and skip a second full worktree scan.
         let base_total = {
             let _span = tracing::debug_span!("diff_total").entered();
-            let mut total_opts = git2::DiffOptions::new();
-            total_opts.include_untracked(true);
-            if let Ok(diff) =
+            let maybe_per_file = if staged_empty {
+                Some(base_unstaged.clone())
+            } else {
+                let mut total_opts = git2::DiffOptions::new();
+                total_opts.include_untracked(true);
                 repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut total_opts))
-            {
-                let per_file = per_file_stats_from_diff(&diff).unwrap_or_default();
+                    .ok()
+                    .map(|diff| per_file_stats_from_diff(&diff).unwrap_or_default())
+            };
+            if let Some(per_file) = maybe_per_file {
                 let c = aggregate_file_stats(&per_file);
                 status.file_mad_count = c.file_mad_count;
                 status.lines_added_total = c.lines_added;
@@ -467,6 +528,7 @@ fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus,
     };
 
     // Ahead/behind: compare local branch to its upstream tracking branch
+    let mut ahead_behind = None;
     if !status.branch.is_empty()
         && let Ok(local) = repo.find_branch(&status.branch, git2::BranchType::Local)
         && let Ok(upstream) = local.upstream()
@@ -476,6 +538,7 @@ fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus,
     {
         status.ahead = ahead as u32;
         status.behind = behind as u32;
+        ahead_behind = Some(((local_oid, upstream_oid), (status.ahead, status.behind)));
     }
 
     // Stash count
@@ -500,6 +563,7 @@ fn query_git_status_blocking_with_state(repo_path: &Path) -> Result<(RepoStatus,
         base_total,
         unstaged_overlay: HashMap::new(),
         total_overlay: HashMap::new(),
+        ahead_behind,
     };
 
     Ok((status, state))
@@ -606,8 +670,7 @@ pub fn spawn_git_worker() -> mpsc::UnboundedSender<GitWorkerRequest> {
                         .head()
                         .ok()
                         .and_then(|h| h.peel_to_commit().ok())
-                        .and_then(|c| c.tree().ok())
-                        .map(|t| t.id());
+                        .map(|c| c.tree_id());
 
                     if current_head_tree_oid != state.head_tree_oid {
                         // HEAD tree changed — full refresh
@@ -646,7 +709,11 @@ pub fn spawn_git_worker() -> mpsc::UnboundedSender<GitWorkerRequest> {
                             }
                         }
                         // Always refresh metadata (branch, stash, ahead/behind, conflict, rebase)
-                        refresh_git_metadata(&mut state.base_status, &mut repo);
+                        refresh_git_metadata(
+                            &mut state.base_status,
+                            &mut state.ahead_behind,
+                            &mut repo,
+                        );
 
                         // Apply incremental WC diffs if any paths changed
                         if !changed_paths.is_empty() {
