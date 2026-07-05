@@ -317,7 +317,12 @@ pub async fn run_daemon(
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let _watcher = notify::RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
-                if let Ok(event) = res {
+                // Only removals matter here. The runtime dir also holds
+                // daemon.log, so unfiltered events would wake the daemon on
+                // every log line.
+                if let Ok(event) = res
+                    && matches!(event.kind, EventKind::Remove(_))
+                {
                     let _ = tx.send(event);
                 }
             },
