@@ -439,34 +439,10 @@ pub fn watch_repo(
             });
         })?;
 
-    match vcs_kind {
-        VcsKind::Jj => {
-            // Watch op_heads for jj operations
-            let op_heads_dir = repo_path.join(".jj/repo/op_heads/heads");
-            if op_heads_dir.exists() {
-                watcher
-                    .watch(&op_heads_dir, RecursiveMode::NonRecursive)
-                    .context("failed to watch op_heads")?;
-            }
-        }
-        VcsKind::Git => {
-            // Watch .git/ for ref changes, HEAD, index
-            let git_dir = repo_path.join(".git");
-            if git_dir.is_dir() {
-                watcher
-                    .watch(&git_dir, RecursiveMode::NonRecursive)
-                    .context("failed to watch .git")?;
-                let refs_dir = git_dir.join("refs");
-                if refs_dir.is_dir() {
-                    watcher
-                        .watch(&refs_dir, RecursiveMode::Recursive)
-                        .context("failed to watch .git/refs")?;
-                }
-            }
-        }
-    }
-
-    // Watch working directory for file changes
+    // A single recursive watch on the repo root covers everything, including
+    // `.jj/` and `.git/` internals. Do not add separate watches for VCS dirs:
+    // overlapping watches deliver each event once per covering watch, which
+    // doubles (or triples) refresh work for every VCS operation.
     watcher
         .watch(repo_path, RecursiveMode::Recursive)
         .context("failed to watch repo")?;

@@ -918,73 +918,73 @@ fn record_refresh_timing(stats: &mut DaemonStats, elapsed: Duration, incremental
     buf.push(ms);
 }
 
-/// Per-repo refresh state: tracks whether a re-refresh is needed while one is in flight.
-enum RepoRefreshState {
-    /// A refresh task is running, no new events queued.
-    InFlight,
-    /// A refresh task is running AND new events arrived — re-refresh needed after completion.
-    /// Fields: vcs_kind, working_copy_changed, accumulated changed_paths,
-    /// VCS change hint, rescan (OS event queue overflowed).
-    Pending(VcsKind, bool, Vec<PathBuf>, Option<VcsChangeHint>, bool),
-}
+/// How long to wait after the first watcher event before starting a refresh.
+/// FSEvents/inotify deliver a single VCS operation (commit, checkout, jj op)
+/// as a burst of events spread over tens of milliseconds; refreshing on the
+/// first one means immediately re-refreshing when the rest arrive.
+const REFRESH_DEBOUNCE: Duration = Duration::from_millis(50);
 
-impl RepoRefreshState {
-    /// Coalesce a new event into the current state.
-    ///
-    /// Hints coalesce by taking the maximum severity. Working-copy paths
-    /// accumulate. Rescan is sticky — once events were lost, only a full
-    /// resync restores trust.
-    fn coalesce(
-        &mut self,
-        vcs_kind: VcsKind,
-        working_copy_changed: bool,
-        changed_paths: Vec<PathBuf>,
-        hint: Option<VcsChangeHint>,
-        rescan: bool,
-    ) {
-        match self {
-            RepoRefreshState::InFlight => {
-                *self = RepoRefreshState::Pending(
-                    vcs_kind,
-                    working_copy_changed,
-                    changed_paths,
-                    hint,
-                    rescan,
-                );
-            }
-            RepoRefreshState::Pending(_, wc, paths, existing_hint, existing_rescan) => {
-                *wc = *wc || working_copy_changed;
-                paths.extend(changed_paths);
-                *existing_hint = match (*existing_hint, hint) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    (Some(a), None) => Some(a),
-                    (None, b) => b,
-                };
-                *existing_rescan = *existing_rescan || rescan;
-            }
-        }
-    }
-}
-
-/// Channel message sent when a per-repo refresh task completes.
-struct RefreshDone {
-    repo_path: PathBuf,
-}
-
-#[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip_all, fields(repo = %repo_path.display(), vcs = ?vcs_kind))]
-async fn refresh_repo(
-    repo_path: PathBuf,
+/// Accumulated watcher-event data for a refresh that hasn't started yet.
+struct PendingRefresh {
     vcs_kind: VcsKind,
     working_copy_changed: bool,
     changed_paths: Vec<PathBuf>,
-    vcs_change_hint: Option<VcsChangeHint>,
+    hint: Option<VcsChangeHint>,
+    /// The OS event queue overflowed and events were lost. Sticky — once
+    /// events were lost, only a full resync restores trust.
     rescan: bool,
+}
+
+impl PendingRefresh {
+    /// Merge another event batch into this one: hints take the maximum
+    /// severity, working-copy paths accumulate, rescan is sticky.
+    fn merge(&mut self, other: PendingRefresh) {
+        self.working_copy_changed |= other.working_copy_changed;
+        self.changed_paths.extend(other.changed_paths);
+        self.hint = match (self.hint, other.hint) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, None) => a,
+            (None, b) => b,
+        };
+        self.rescan |= other.rescan;
+    }
+}
+
+/// Per-repo refresh state.
+enum RepoRefreshState {
+    /// Events received; waiting out the debounce window before refreshing.
+    Debouncing(PendingRefresh),
+    /// A refresh task is running, no new events queued.
+    InFlight,
+    /// A refresh task is running AND new events arrived — re-refresh needed
+    /// after completion.
+    Pending(PendingRefresh),
+}
+
+/// Messages sent back into the refresh task's control loop.
+enum RefreshMsg {
+    /// A per-repo refresh task completed.
+    Done { repo_path: PathBuf },
+    /// A repo's debounce window elapsed.
+    DebounceElapsed { repo_path: PathBuf },
+}
+
+#[tracing::instrument(skip_all, fields(repo = %repo_path.display(), vcs = ?pending.vcs_kind))]
+async fn refresh_repo(
+    repo_path: PathBuf,
+    pending: PendingRefresh,
     state: Arc<Mutex<DaemonState>>,
     jj_worker: mpsc::UnboundedSender<JjWorkerRequest>,
     git_worker: mpsc::UnboundedSender<GitWorkerRequest>,
-    done_tx: mpsc::UnboundedSender<RefreshDone>,
+    done_tx: mpsc::UnboundedSender<RefreshMsg>,
 ) {
+    let PendingRefresh {
+        vcs_kind,
+        working_copy_changed,
+        changed_paths,
+        hint: vcs_change_hint,
+        rescan,
+    } = pending;
     let refresh_start = Instant::now();
     tracing::debug!(
         repo = %repo_path.display(),
@@ -1108,7 +1108,7 @@ async fn refresh_repo(
             }
         }
     }
-    let _ = done_tx.send(RefreshDone { repo_path });
+    let _ = done_tx.send(RefreshMsg::Done { repo_path });
 }
 
 /// Full jj resync via the worker thread: rebuilds state from the store and
@@ -1475,6 +1475,14 @@ async fn watch_config_file(config_path: PathBuf, state: Arc<Mutex<DaemonState>>)
     }
 }
 
+/// Start a timer that fires a `DebounceElapsed` message for `repo_path`.
+fn spawn_debounce_timer(repo_path: PathBuf, tx: mpsc::UnboundedSender<RefreshMsg>) {
+    tokio::spawn(async move {
+        tokio::time::sleep(REFRESH_DEBOUNCE).await;
+        let _ = tx.send(RefreshMsg::DebounceElapsed { repo_path });
+    });
+}
+
 #[tracing::instrument(skip_all)]
 async fn refresh_task(
     state: Arc<Mutex<DaemonState>>,
@@ -1483,8 +1491,8 @@ async fn refresh_task(
     git_worker: mpsc::UnboundedSender<GitWorkerRequest>,
 ) {
     // Per-repo concurrency control: at most one refresh per repo at a time.
-    let mut in_flight: HashMap<PathBuf, RepoRefreshState> = HashMap::new();
-    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<RefreshDone>();
+    let mut repo_state: HashMap<PathBuf, RepoRefreshState> = HashMap::new();
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<RefreshMsg>();
 
     loop {
         tokio::select! {
@@ -1493,11 +1501,36 @@ async fn refresh_task(
 
                 match event {
                     WatchEvent::Flush(tx) => {
+                        // Promote any debouncing repos immediately — a flush
+                        // must not wait out debounce windows.
+                        let debouncing: Vec<PathBuf> = repo_state
+                            .iter()
+                            .filter(|(_, s)| matches!(s, RepoRefreshState::Debouncing(_)))
+                            .map(|(p, _)| p.clone())
+                            .collect();
+                        for repo_path in debouncing {
+                            let Some(RepoRefreshState::Debouncing(pending)) =
+                                repo_state.remove(&repo_path)
+                            else {
+                                continue;
+                            };
+                            repo_state.insert(repo_path.clone(), RepoRefreshState::InFlight);
+                            tokio::spawn(refresh_repo(
+                                repo_path,
+                                pending,
+                                state.clone(),
+                                jj_worker.clone(),
+                                git_worker.clone(),
+                                msg_tx.clone(),
+                            ));
+                        }
+
                         // Wait for all in-flight refreshes to complete
-                        while !in_flight.is_empty() {
-                            if let Some(done) = done_rx.recv().await {
-                                handle_refresh_done(
-                                    &done, &mut in_flight, &jj_worker, &git_worker, &state, &done_tx,
+                        while !repo_state.is_empty() {
+                            if let Some(msg) = msg_rx.recv().await {
+                                handle_refresh_msg(
+                                    msg, &mut repo_state, &jj_worker, &git_worker, &state,
+                                    &msg_tx, true,
                                 );
                             }
                         }
@@ -1516,32 +1549,35 @@ async fn refresh_task(
                                 .collect();
                             drop(st);
                             for (repo_path, vcs_kind) in repos {
-                                if !in_flight.contains_key(&repo_path) {
-                                    in_flight.insert(
+                                if !repo_state.contains_key(&repo_path) {
+                                    repo_state.insert(
                                         repo_path.clone(),
                                         RepoRefreshState::InFlight,
                                     );
                                     tokio::spawn(refresh_repo(
                                         repo_path,
-                                        vcs_kind,
-                                        false,
-                                        vec![],
-                                        None,
-                                        false,
+                                        PendingRefresh {
+                                            vcs_kind,
+                                            working_copy_changed: false,
+                                            changed_paths: vec![],
+                                            hint: None,
+                                            rescan: false,
+                                        },
                                         state.clone(),
                                         jj_worker.clone(),
                                         git_worker.clone(),
-                                        done_tx.clone(),
+                                        msg_tx.clone(),
                                     ));
                                 }
                             }
                         }
 
                         // Wait for the forced refreshes to complete
-                        while !in_flight.is_empty() {
-                            if let Some(done) = done_rx.recv().await {
-                                handle_refresh_done(
-                                    &done, &mut in_flight, &jj_worker, &git_worker, &state, &done_tx,
+                        while !repo_state.is_empty() {
+                            if let Some(msg) = msg_rx.recv().await {
+                                handle_refresh_msg(
+                                    msg, &mut repo_state, &jj_worker, &git_worker, &state,
+                                    &msg_tx, true,
                                 );
                             }
                         }
@@ -1551,66 +1587,101 @@ async fn refresh_task(
                     WatchEvent::Change { repo_path, vcs_kind, working_copy_changed, vcs_change_hint, changed_paths, rescan } => {
                         state.lock().await.stats.fs_events += 1;
 
-                        match in_flight.get_mut(&repo_path) {
+                        let incoming = PendingRefresh {
+                            vcs_kind,
+                            working_copy_changed,
+                            changed_paths,
+                            hint: vcs_change_hint,
+                            rescan,
+                        };
+                        match repo_state.get_mut(&repo_path) {
                             None => {
-                                // No refresh running — start one immediately
-                                in_flight.insert(repo_path.clone(), RepoRefreshState::InFlight);
-                                tokio::spawn(refresh_repo(
-                                    repo_path, vcs_kind, working_copy_changed, changed_paths,
-                                    vcs_change_hint, rescan,
-                                    state.clone(), jj_worker.clone(), git_worker.clone(), done_tx.clone(),
-                                ));
+                                // First event for this repo — open a debounce
+                                // window to absorb the rest of the burst.
+                                repo_state.insert(
+                                    repo_path.clone(),
+                                    RepoRefreshState::Debouncing(incoming),
+                                );
+                                spawn_debounce_timer(repo_path, msg_tx.clone());
                             }
-                            Some(entry) => {
-                                entry.coalesce(vcs_kind, working_copy_changed, changed_paths, vcs_change_hint, rescan);
+                            Some(RepoRefreshState::Debouncing(pending)) => {
+                                pending.merge(incoming);
+                            }
+                            Some(entry @ RepoRefreshState::InFlight) => {
+                                *entry = RepoRefreshState::Pending(incoming);
                                 tracing::debug!(
                                     repo = %repo_path.display(),
-                                    ?vcs_change_hint,
-                                    working_copy_changed,
-                                    rescan,
-                                    "event coalesced while refresh in-flight"
+                                    "event queued while refresh in-flight"
                                 );
+                            }
+                            Some(RepoRefreshState::Pending(pending)) => {
+                                pending.merge(incoming);
                             }
                         }
                     }
                 }
             }
-            done = done_rx.recv() => {
-                if let Some(done) = done {
-                    handle_refresh_done(&done, &mut in_flight, &jj_worker, &git_worker, &state, &done_tx);
+            msg = msg_rx.recv() => {
+                if let Some(msg) = msg {
+                    handle_refresh_msg(msg, &mut repo_state, &jj_worker, &git_worker, &state, &msg_tx, false);
                 }
             }
         }
     }
 }
 
-fn handle_refresh_done(
-    done: &RefreshDone,
-    in_flight: &mut HashMap<PathBuf, RepoRefreshState>,
+/// Handle a control message. `skip_debounce` starts follow-up refreshes
+/// immediately instead of opening a new debounce window (used during Flush,
+/// which must converge).
+fn handle_refresh_msg(
+    msg: RefreshMsg,
+    repo_state: &mut HashMap<PathBuf, RepoRefreshState>,
     jj_worker: &mpsc::UnboundedSender<JjWorkerRequest>,
     git_worker: &mpsc::UnboundedSender<GitWorkerRequest>,
     state: &Arc<Mutex<DaemonState>>,
-    done_tx: &mpsc::UnboundedSender<RefreshDone>,
+    msg_tx: &mpsc::UnboundedSender<RefreshMsg>,
+    skip_debounce: bool,
 ) {
-    match in_flight.remove(&done.repo_path) {
-        Some(RepoRefreshState::Pending(vcs_kind, wc, paths, hint, rescan)) => {
-            // Changes arrived while refreshing — re-refresh immediately.
-            in_flight.insert(done.repo_path.clone(), RepoRefreshState::InFlight);
-            tokio::spawn(refresh_repo(
-                done.repo_path.clone(),
-                vcs_kind,
-                wc,
-                paths,
-                hint,
-                rescan,
-                state.clone(),
-                jj_worker.clone(),
-                git_worker.clone(),
-                done_tx.clone(),
-            ));
+    match msg {
+        RefreshMsg::DebounceElapsed { repo_path } => {
+            // Only act if the repo is still waiting out its window; a Flush
+            // may have promoted it already (leaving InFlight, or nothing).
+            if let Some(RepoRefreshState::Debouncing(_)) = repo_state.get(&repo_path) {
+                let Some(RepoRefreshState::Debouncing(pending)) = repo_state.remove(&repo_path)
+                else {
+                    unreachable!();
+                };
+                repo_state.insert(repo_path.clone(), RepoRefreshState::InFlight);
+                tokio::spawn(refresh_repo(
+                    repo_path,
+                    pending,
+                    state.clone(),
+                    jj_worker.clone(),
+                    git_worker.clone(),
+                    msg_tx.clone(),
+                ));
+            }
         }
-        _ => {
-            // Done, no pending work for this repo
+        RefreshMsg::Done { repo_path } => {
+            if let Some(RepoRefreshState::Pending(pending)) = repo_state.remove(&repo_path) {
+                // Changes arrived while refreshing — refresh again, after a
+                // fresh debounce window (the trailing events are usually the
+                // tail of the same burst).
+                if skip_debounce {
+                    repo_state.insert(repo_path.clone(), RepoRefreshState::InFlight);
+                    tokio::spawn(refresh_repo(
+                        repo_path,
+                        pending,
+                        state.clone(),
+                        jj_worker.clone(),
+                        git_worker.clone(),
+                        msg_tx.clone(),
+                    ));
+                } else {
+                    repo_state.insert(repo_path.clone(), RepoRefreshState::Debouncing(pending));
+                    spawn_debounce_timer(repo_path, msg_tx.clone());
+                }
+            }
         }
     }
 }
@@ -1660,174 +1731,88 @@ mod tests {
     use tokio::process::Command;
     use tokio::time::Duration;
 
-    // --- RepoRefreshState::coalesce unit tests ---
+    // --- PendingRefresh::merge unit tests ---
 
-    #[test]
-    fn test_coalesce_inflight_to_wc_event() {
-        let mut state = RepoRefreshState::InFlight;
-        let paths = vec![PathBuf::from("/repo/file.txt")];
-        state.coalesce(VcsKind::Jj, true, paths.clone(), None, false);
-        match &state {
-            RepoRefreshState::Pending(_, wc, p, hint, _) => {
-                assert!(*wc);
-                assert_eq!(p, &paths);
-                assert_eq!(*hint, None);
-            }
-            _ => panic!("expected Pending"),
+    fn wc_event(paths: Vec<PathBuf>) -> PendingRefresh {
+        PendingRefresh {
+            vcs_kind: VcsKind::Jj,
+            working_copy_changed: true,
+            changed_paths: paths,
+            hint: None,
+            rescan: false,
+        }
+    }
+
+    fn vcs_event(hint: VcsChangeHint) -> PendingRefresh {
+        PendingRefresh {
+            vcs_kind: VcsKind::Jj,
+            working_copy_changed: false,
+            changed_paths: vec![],
+            hint: Some(hint),
+            rescan: false,
         }
     }
 
     #[test]
-    fn test_coalesce_inflight_to_vcs_internal_event() {
-        let mut state = RepoRefreshState::InFlight;
-        state.coalesce(
-            VcsKind::Jj,
-            false,
-            vec![],
-            Some(VcsChangeHint::HeadMayHaveChanged),
-            false,
-        );
-        match &state {
-            RepoRefreshState::Pending(_, wc, p, hint, _) => {
-                assert!(!*wc);
-                assert!(p.is_empty());
-                assert_eq!(*hint, Some(VcsChangeHint::HeadMayHaveChanged));
-            }
-            _ => panic!("expected Pending"),
-        }
-    }
-
-    #[test]
-    fn test_coalesce_wc_then_wc_accumulates() {
+    fn test_merge_wc_then_wc_accumulates() {
         // Two working-copy events: paths should accumulate
-        let mut state = RepoRefreshState::Pending(
-            VcsKind::Jj,
-            true,
-            vec![PathBuf::from("/repo/a.txt")],
-            None,
-            false,
-        );
-        state.coalesce(
-            VcsKind::Jj,
-            true,
-            vec![PathBuf::from("/repo/b.txt")],
-            None,
-            false,
-        );
-        match &state {
-            RepoRefreshState::Pending(_, wc, paths, hint, _) => {
-                assert!(*wc);
-                assert_eq!(paths.len(), 2);
-                assert_eq!(*hint, None);
-            }
-            _ => panic!("expected Pending"),
-        }
+        let mut pending = wc_event(vec![PathBuf::from("/repo/a.txt")]);
+        pending.merge(wc_event(vec![PathBuf::from("/repo/b.txt")]));
+        assert!(pending.working_copy_changed);
+        assert_eq!(pending.changed_paths.len(), 2);
+        assert_eq!(pending.hint, None);
     }
 
     #[test]
-    fn test_coalesce_wc_then_vcs_hint_merges() {
+    fn test_merge_wc_then_vcs_hint_merges() {
         // Working-copy event pending, then VCS-internal arrives — hint is added,
         // paths are preserved (worker will decide based on baseline validation)
-        let mut state = RepoRefreshState::Pending(
-            VcsKind::Jj,
-            true,
-            vec![PathBuf::from("/repo/a.txt")],
-            None,
-            false,
+        let mut pending = wc_event(vec![PathBuf::from("/repo/a.txt")]);
+        pending.merge(vcs_event(VcsChangeHint::HeadMayHaveChanged));
+        assert!(
+            pending.working_copy_changed,
+            "wc should stay true (OR of both events)"
         );
-        state.coalesce(
-            VcsKind::Jj,
-            false,
-            vec![],
-            Some(VcsChangeHint::HeadMayHaveChanged),
-            false,
+        assert_eq!(
+            pending.changed_paths.len(),
+            1,
+            "paths preserved for potential incremental use"
         );
-        match &state {
-            RepoRefreshState::Pending(_, wc, paths, hint, _) => {
-                assert!(*wc, "wc should stay true (OR of both events)");
-                assert_eq!(
-                    paths.len(),
-                    1,
-                    "paths preserved for potential incremental use"
-                );
-                assert_eq!(*hint, Some(VcsChangeHint::HeadMayHaveChanged));
-            }
-            _ => panic!("expected Pending"),
-        }
+        assert_eq!(pending.hint, Some(VcsChangeHint::HeadMayHaveChanged));
     }
 
     #[test]
-    fn test_coalesce_vcs_then_wc_merges() {
+    fn test_merge_vcs_then_wc_merges() {
         // VCS-internal event pending, then working-copy event arrives — both preserved
-        let mut state = RepoRefreshState::Pending(
-            VcsKind::Jj,
-            false,
-            vec![],
-            Some(VcsChangeHint::HeadMayHaveChanged),
-            false,
+        let mut pending = vcs_event(VcsChangeHint::HeadMayHaveChanged);
+        pending.merge(wc_event(vec![PathBuf::from("/repo/a.txt")]));
+        assert!(
+            pending.working_copy_changed,
+            "wc should be true (OR of both events)"
         );
-        state.coalesce(
-            VcsKind::Jj,
-            true,
-            vec![PathBuf::from("/repo/a.txt")],
-            None,
-            false,
-        );
-        match &state {
-            RepoRefreshState::Pending(_, wc, paths, hint, _) => {
-                assert!(*wc, "wc should be true (OR of both events)");
-                assert_eq!(paths.len(), 1, "WC paths accumulated");
-                assert_eq!(*hint, Some(VcsChangeHint::HeadMayHaveChanged));
-            }
-            _ => panic!("expected Pending"),
-        }
+        assert_eq!(pending.changed_paths.len(), 1, "WC paths accumulated");
+        assert_eq!(pending.hint, Some(VcsChangeHint::HeadMayHaveChanged));
     }
 
     #[test]
-    fn test_coalesce_hint_takes_max_severity() {
+    fn test_merge_hint_takes_max_severity() {
         // MetadataOnly pending, then HeadMayHaveChanged arrives — takes max
-        let mut state = RepoRefreshState::Pending(
-            VcsKind::Git,
-            false,
-            vec![],
-            Some(VcsChangeHint::MetadataOnly),
-            false,
-        );
-        state.coalesce(
-            VcsKind::Git,
-            false,
-            vec![],
-            Some(VcsChangeHint::HeadMayHaveChanged),
-            false,
-        );
-        match &state {
-            RepoRefreshState::Pending(_, _, _, hint, _) => {
-                assert_eq!(*hint, Some(VcsChangeHint::HeadMayHaveChanged));
-            }
-            _ => panic!("expected Pending"),
-        }
+        let mut pending = vcs_event(VcsChangeHint::MetadataOnly);
+        pending.merge(vcs_event(VcsChangeHint::HeadMayHaveChanged));
+        assert_eq!(pending.hint, Some(VcsChangeHint::HeadMayHaveChanged));
     }
 
     #[test]
-    fn test_coalesce_rescan_is_sticky() {
+    fn test_merge_rescan_is_sticky() {
         // A rescan event followed by ordinary events must keep rescan set —
         // lost events can only be healed by a full resync.
-        let mut state = RepoRefreshState::InFlight;
-        state.coalesce(VcsKind::Jj, true, vec![], None, true);
-        state.coalesce(
-            VcsKind::Jj,
-            true,
-            vec![PathBuf::from("/repo/a.txt")],
-            None,
-            false,
-        );
-        match &state {
-            RepoRefreshState::Pending(_, _, paths, _, rescan) => {
-                assert!(*rescan, "rescan must survive coalescing");
-                assert_eq!(paths.len(), 1);
-            }
-            _ => panic!("expected Pending"),
-        }
+        let mut pending = PendingRefresh {
+            rescan: true,
+            ..wc_event(vec![])
+        };
+        pending.merge(wc_event(vec![PathBuf::from("/repo/a.txt")]));
+        assert!(pending.rescan, "rescan must survive merging");
+        assert_eq!(pending.changed_paths.len(), 1);
     }
 
     // --- Existing tests ---
