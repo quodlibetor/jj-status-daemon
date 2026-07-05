@@ -816,15 +816,16 @@ fn load_user_revset_aliases(aliases_map: &mut RevsetAliasesMap) {
     }
 }
 
-/// Check if a commit is immutable by evaluating the `immutable_heads()::` revset.
+/// Evaluate a revset expression with jj-cli's default aliases plus the
+/// user's overrides, passing the resulting revset to `f`.
 ///
-/// This uses jj's revset engine with the same default aliases as jj-cli,
-/// plus any user overrides from their jj config files.
-fn is_commit_immutable(
+/// Returns `None` if the expression fails to parse, resolve, or evaluate.
+fn with_evaluated_revset<R>(
     repo: &Arc<jj_lib::repo::ReadonlyRepo>,
     workspace_name: &WorkspaceName,
-    commit_id: &CommitId,
-) -> bool {
+    expr: &str,
+    f: impl FnOnce(&dyn jj_lib::revset::Revset) -> R,
+) -> Option<R> {
     // Build aliases map with defaults from jj-cli
     let mut aliases_map = RevsetAliasesMap::new();
     let _ = aliases_map.insert("trunk()", DEFAULT_TRUNK_ALIAS);
@@ -834,7 +835,7 @@ fn is_commit_immutable(
     );
     let _ = aliases_map.insert("immutable_heads()", DEFAULT_IMMUTABLE_HEADS_ALIAS);
 
-    // Load user overrides (e.g. custom immutable_heads())
+    // Load user overrides (e.g. custom trunk() or immutable_heads())
     load_user_revset_aliases(&mut aliases_map);
 
     let extensions = RevsetExtensions::new();
@@ -861,21 +862,31 @@ fn is_commit_immutable(
     };
 
     let mut diagnostics = RevsetDiagnostics::new();
-    let Ok(expression) = revset::parse(&mut diagnostics, "::immutable_heads()", &context) else {
-        return false;
-    };
+    let expression = revset::parse(&mut diagnostics, expr, &context).ok()?;
 
     let symbol_resolver = SymbolResolver::new(repo.as_ref(), extensions.symbol_resolvers());
-    let Ok(resolved) = expression.resolve_user_expression(repo.as_ref(), &symbol_resolver) else {
-        return false;
-    };
+    let resolved = expression
+        .resolve_user_expression(repo.as_ref(), &symbol_resolver)
+        .ok()?;
 
-    let Ok(revset) = resolved.evaluate(repo.as_ref()) else {
-        return false;
-    };
+    let revset = resolved.evaluate(repo.as_ref()).ok()?;
+    Some(f(revset.as_ref()))
+}
 
-    let containing = revset.containing_fn();
-    containing(commit_id).unwrap_or(false)
+/// Check if a commit is immutable by evaluating the `immutable_heads()::` revset.
+///
+/// This uses jj's revset engine with the same default aliases as jj-cli,
+/// plus any user overrides from their jj config files.
+fn is_commit_immutable(
+    repo: &Arc<jj_lib::repo::ReadonlyRepo>,
+    workspace_name: &WorkspaceName,
+    commit_id: &CommitId,
+) -> bool {
+    with_evaluated_revset(repo, workspace_name, "::immutable_heads()", |revset| {
+        let containing = revset.containing_fn();
+        containing(commit_id).unwrap_or(false)
+    })
+    .unwrap_or(false)
 }
 
 /// Walk ancestors via BFS to find bookmarks within `max_depth` commits.
@@ -948,6 +959,7 @@ fn compute_tracking_statuses(
 fn find_ancestor_bookmarks(
     repo: &Arc<jj_lib::repo::ReadonlyRepo>,
     view: &jj_lib::view::View,
+    workspace_name: &WorkspaceName,
     wc_id: &CommitId,
     max_depth: u32,
 ) -> Result<Vec<Bookmark>> {
@@ -965,13 +977,77 @@ fn find_ancestor_bookmarks(
     // Compute tracking statuses for all bookmarks against their remotes
     let tracking_statuses = compute_tracking_statuses(repo, view);
 
+    // Prefer bookmarks on commits in `::@ ~ ::trunk()` — the current line
+    // of work. Bookmarks in trunk's history (main, master, ...) are noise
+    // when feature bookmarks exist. If the current line has NO bookmarks,
+    // fall back to the nearest ancestor bookmarks — typically trunk's own
+    // (`main+N`) — so a fresh stack of changes still shows where it sits.
+    // With no remotes, trunk() falls back to root(), so local-only repos
+    // are unaffected.
+    //
+    // The revset is evaluated once; jj's default engine computes the
+    // ancestor difference with a generation-bounded walk that visits
+    // roughly `trunk()..@`, not the whole repo. If evaluation fails
+    // (unusual store, broken user alias), the fallback walk runs instead.
+    let expr = format!("::{} ~ ::trunk()", wc_id.hex());
+    let filtered = with_evaluated_revset(repo, workspace_name, &expr, |revset| {
+        let containing = revset.containing_fn();
+        collect_bookmarks_bfs(
+            repo,
+            &bookmark_targets,
+            &tracking_statuses,
+            wc_id,
+            max_depth,
+            &|id| containing(id).unwrap_or(true),
+            false,
+        )
+    });
+    match filtered {
+        Some(Ok(found)) if !found.is_empty() => return Ok(found),
+        Some(Err(e)) => return Err(e),
+        _ => {}
+    }
+
+    // Nothing on the current line: nearest ancestor bookmarks only (stop at
+    // the first depth with a match, so `main+N` shows without dragging in
+    // every stale bookmark behind it).
+    collect_bookmarks_bfs(
+        repo,
+        &bookmark_targets,
+        &tracking_statuses,
+        wc_id,
+        max_depth,
+        &|_| true,
+        true,
+    )
+}
+
+/// BFS over ancestors of `wc_id` up to `max_depth`, collecting bookmarks on
+/// commits for which `in_branch` returns true. A commit outside the branch
+/// prunes its whole subtree (its ancestors are outside too), so e.g. the
+/// trunk leg of a megamerge terminates the walk immediately.
+///
+/// With `nearest_only`, the walk stops after the first depth level that
+/// yielded any bookmark (BFS is level-ordered, so all same-distance
+/// bookmarks are still collected).
+fn collect_bookmarks_bfs(
+    repo: &Arc<jj_lib::repo::ReadonlyRepo>,
+    bookmark_targets: &HashMap<CommitId, Vec<String>>,
+    tracking_statuses: &HashMap<String, TrackingStatus>,
+    wc_id: &CommitId,
+    max_depth: u32,
+    in_branch: &dyn Fn(&CommitId) -> bool,
+    nearest_only: bool,
+) -> Result<Vec<Bookmark>> {
     let mut queue: VecDeque<(CommitId, u32)> = VecDeque::new();
     let mut visited = HashSet::new();
     let mut seen_names = HashSet::new();
     let mut bookmarks = Vec::new();
 
     // Check bookmarks directly on the working copy commit (distance 0)
-    if let Some(names) = bookmark_targets.get(wc_id) {
+    if let Some(names) = bookmark_targets.get(wc_id)
+        && in_branch(wc_id)
+    {
         for name_str in names {
             if seen_names.insert(name_str.clone()) {
                 let tracking = tracking_statuses.get(name_str).cloned().unwrap_or_default();
@@ -992,7 +1068,19 @@ fn find_ancestor_bookmarks(
     }
 
     while let Some((commit_id, depth)) = queue.pop_front() {
+        // BFS is level-ordered: once a level has produced bookmarks, any
+        // deeper node means that level is exhausted.
+        if nearest_only
+            && let Some(first) = bookmarks.first()
+            && depth > first.distance
+        {
+            break;
+        }
         if depth > max_depth || !visited.insert(commit_id.clone()) {
+            continue;
+        }
+
+        if !in_branch(&commit_id) {
             continue;
         }
 
@@ -1108,7 +1196,7 @@ async fn load_jj_repo(repo_path: &Path, depth: u32) -> Result<JjLoadedRepo> {
         .is_some_and(|targets| targets.visible_with_offsets().count() > 1);
     status.hidden = commit.is_hidden(repo.as_ref()).unwrap_or(false);
     status.immutable = is_commit_immutable(&repo, &workspace_name, &wc_id);
-    status.bookmarks = find_ancestor_bookmarks(&repo, view, &wc_id, depth)?;
+    status.bookmarks = find_ancestor_bookmarks(&repo, view, &workspace_name, &wc_id, depth)?;
     status.workspace_name = workspace_name.as_str().to_string();
     status.is_default_workspace = status.workspace_name == "default";
 
@@ -1603,6 +1691,158 @@ mod tests {
         let status = query_jj_status(dir.path(), &config).await.unwrap();
         assert_eq!(status.workspace_name, "default");
         assert!(status.is_default_workspace);
+    }
+
+    /// Bookmarks on commits in trunk's history (main, master, ...) are
+    /// excluded: only bookmarks in `::@ ~ ::trunk()` are shown.
+    #[tokio::test]
+    async fn test_bookmarks_exclude_trunk_history() {
+        let dir = create_jj_repo().await;
+
+        // Side git repo with a commit on `main`; fetching it makes
+        // main@origin resolve as trunk().
+        let remote = TempDir::new().unwrap();
+        crate::test_util::create_git_repo_in(remote.path());
+        {
+            let repo = git2::Repository::open(remote.path()).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            if repo.find_branch("main", git2::BranchType::Local).is_err() {
+                repo.branch("main", &head, false).unwrap();
+            }
+            repo.set_head("refs/heads/main").unwrap();
+        }
+        jj_cmd(
+            dir.path(),
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                remote.path().to_str().unwrap(),
+            ],
+        )
+        .await;
+        jj_cmd(dir.path(), &["git", "fetch"]).await;
+
+        // A local bookmark pointing INTO trunk history — must be hidden.
+        jj_cmd(
+            dir.path(),
+            &["bookmark", "create", "local-main", "-r", "main@origin"],
+        )
+        .await;
+
+        // Feature line on top of trunk: trunk <- feat-commit <- @
+        jj_cmd(dir.path(), &["new", "main@origin"]).await;
+        std::fs::write(dir.path().join("feat.txt"), "work\n").unwrap();
+        jj_cmd(dir.path(), &["commit", "-m", "feat work"]).await;
+        jj_cmd(dir.path(), &["bookmark", "create", "feat", "-r", "@-"]).await;
+
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+        let status = query_jj_status(dir.path(), &config).await.unwrap();
+
+        assert!(
+            status
+                .bookmarks
+                .iter()
+                .any(|b| b.name == "feat" && b.distance == 1),
+            "feature bookmark on the current line should be shown: {:?}",
+            status.bookmarks
+        );
+        assert!(
+            !status.bookmarks.iter().any(|b| b.name == "local-main"),
+            "bookmark in trunk history should be hidden: {:?}",
+            status.bookmarks
+        );
+    }
+
+    /// With no bookmarks between @ and trunk, fall back to the nearest
+    /// ancestor bookmark (`main+N`) — but only the nearest level, not
+    /// older bookmarks further behind trunk.
+    #[tokio::test]
+    async fn test_bookmarks_fall_back_to_nearest_trunk_bookmark() {
+        let dir = create_jj_repo().await;
+
+        // Side remote with TWO commits on main, so trunk has a parent to
+        // hang an older bookmark on.
+        let remote = TempDir::new().unwrap();
+        crate::test_util::create_git_repo_in(remote.path());
+        {
+            let repo = git2::Repository::open(remote.path()).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            if repo.find_branch("main", git2::BranchType::Local).is_err() {
+                repo.branch("main", &head, false).unwrap();
+            }
+            repo.set_head("refs/heads/main").unwrap();
+            // second commit on main
+            std::fs::write(remote.path().join("second.txt"), "two\n").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("second.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = repo.signature().unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(
+                Some("refs/heads/main"),
+                &sig,
+                &sig,
+                "second",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        }
+        jj_cmd(
+            dir.path(),
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                remote.path().to_str().unwrap(),
+            ],
+        )
+        .await;
+        jj_cmd(dir.path(), &["git", "fetch"]).await;
+
+        // local-main at trunk, old-bm one behind trunk
+        jj_cmd(
+            dir.path(),
+            &["bookmark", "create", "local-main", "-r", "main@origin"],
+        )
+        .await;
+        jj_cmd(
+            dir.path(),
+            &["bookmark", "create", "old-bm", "-r", "main@origin-"],
+        )
+        .await;
+
+        // Two unbookmarked commits on top of trunk: trunk <- c1 <- @
+        jj_cmd(dir.path(), &["new", "main@origin"]).await;
+        std::fs::write(dir.path().join("work.txt"), "work\n").unwrap();
+        jj_cmd(dir.path(), &["commit", "-m", "work"]).await;
+
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+        let status = query_jj_status(dir.path(), &config).await.unwrap();
+
+        assert!(
+            status
+                .bookmarks
+                .iter()
+                .any(|b| b.name == "local-main" && b.distance == 2),
+            "nearest trunk bookmark should show as main+2: {:?}",
+            status.bookmarks
+        );
+        assert!(
+            !status.bookmarks.iter().any(|b| b.name == "old-bm"),
+            "bookmarks behind the nearest level should stay hidden: {:?}",
+            status.bookmarks
+        );
     }
 
     #[tokio::test]
