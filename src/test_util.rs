@@ -55,6 +55,37 @@ pub fn parse_diff_stat_summary(output: &str) -> (u32, u32, u32) {
     (files, insertions, deletions)
 }
 
+/// Removes the external per-repo jj config dir (`<config root>/jj/repos/<id>`)
+/// that `jj config set --repo` creates, so tests that set repo config don't
+/// litter the user's config directory. Runs on drop, including panics.
+pub struct RepoConfigCleanup {
+    repo_root: std::path::PathBuf,
+}
+
+impl RepoConfigCleanup {
+    pub fn new(repo_root: &Path) -> Self {
+        RepoConfigCleanup {
+            repo_root: repo_root.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for RepoConfigCleanup {
+    fn drop(&mut self) {
+        let Ok(config_id) = std::fs::read_to_string(self.repo_root.join(".jj/repo/config-id"))
+        else {
+            return;
+        };
+        let config_id = config_id.trim();
+        if config_id.is_empty() || !config_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return;
+        }
+        for root in crate::jj::jj_config_roots() {
+            let _ = std::fs::remove_dir_all(root.join("repos").join(config_id));
+        }
+    }
+}
+
 /// Create a jj repo (colocated with git) using jj-lib directly — no CLI subprocess.
 pub fn create_jj_repo() -> TempDir {
     use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};

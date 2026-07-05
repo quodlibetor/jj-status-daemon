@@ -26,7 +26,20 @@ use crate::test_util::{create_jj_repo, parse_diff_stat_summary};
 
 /// Fixed pool of file paths that actions index into. Small enough that
 /// actions frequently collide on the same file (modify-after-add, etc).
-const FILE_POOL: &[&str] = &["a.txt", "b.txt", "dir/c.txt", "dir/sub/d.txt", "e.rs"];
+/// `x.log` exists to interact with the `*.log` gitignore pattern.
+const FILE_POOL: &[&str] = &[
+    "a.txt",
+    "b.txt",
+    "dir/c.txt",
+    "dir/sub/d.txt",
+    "e.rs",
+    "x.log",
+];
+
+/// Root `.gitignore` contents that `WriteGitignore` cycles through. Each
+/// interacts with part of FILE_POOL: untracked matches disappear from
+/// diffs, already-tracked matches must remain.
+const GITIGNORE_VARIANTS: &[&str] = &["*.log\n", "dir/\n", "e.rs\n", "*.log\ndir/\n"];
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -64,6 +77,62 @@ pub enum Action {
     JjEditPrior {
         nth: u8,
     },
+    /// `jj restore` — rewrite the whole working copy from the parent.
+    JjRestoreAll,
+    /// `jj restore <file>` — restore one pool file from the parent.
+    JjRestoreFile {
+        file: usize,
+    },
+    /// `std::fs::rename` between two pool paths (delete+add to jj).
+    RenameFile {
+        from: usize,
+        to: usize,
+    },
+    /// Rename the `dir/` tree to `dir2/` or back — a directory-level move
+    /// whose per-file events some platforms coalesce.
+    MoveDir,
+    /// `jj split -m msg -- <file>` — carve one file into a new parent commit.
+    JjSplit {
+        file: usize,
+    },
+    /// `jj rebase -r @ -d <nth visible commit>` — reparent @, possibly
+    /// creating conflicts.
+    JjRebase {
+        nth: u8,
+    },
+    /// `jj new @ <nth other head>` — create a merge commit (megamerge leg;
+    /// conflicts arise organically when heads touched the same file).
+    JjNewMerge {
+        nth: u8,
+    },
+    /// `jj config set --repo ui.conflict-marker-style <style>`. Skipped when
+    /// @ is conflicted: jj deliberately does not rematerialize existing
+    /// on-disk conflicts on config change, so toggling under a live conflict
+    /// leaves old-style markers that neither jj nor the daemon can trust.
+    SetMarkerStyle {
+        style: u8,
+    },
+    /// Commit seeded content to the `main` branch of the side "remote" git
+    /// repo. Invisible locally until a fetch.
+    RemoteCommit {
+        file: usize,
+        lines: u8,
+        seed: u8,
+    },
+    /// `jj git fetch` — imports remote refs; op event with no WC change.
+    JjGitFetch,
+    /// `jj new main@origin` — start a change on fetched remote work: a
+    /// checkout that rewrites the working copy (the classic drift trigger).
+    JjNewOnRemote,
+    /// Write a root `.gitignore` (lossy suite only: making an existing
+    /// untracked file ignored — or un-ignoring one by deletion — is only
+    /// observable to the daemon at the next operation, since no watcher
+    /// event fires for files whose ignore status flips).
+    WriteGitignore {
+        variant: u8,
+    },
+    /// Delete the root `.gitignore` (lossy suite only, see WriteGitignore).
+    DeleteGitignore,
     /// Lossy mode only: drop all not-yet-delivered file events, simulating
     /// FSEvents queue overflow. In Perfect mode this is skipped.
     DropPendingEvents,
@@ -75,9 +144,8 @@ pub enum Delivery {
     Lossy,
 }
 
-/// Strategy for the safe action set: text files, trailing newlines, no
-/// conflicts-by-construction is NOT guaranteed (jj merges can conflict via
-/// undo/edit interleavings are excluded), and no event drops.
+/// Strategy for the CI-strict action set: every action's effect must be
+/// reflected in the daemon's stats immediately (per-action oracle parity).
 fn safe_action() -> impl Strategy<Value = Action> {
     prop_oneof![
         6 => (0..FILE_POOL.len(), 1..12u8, any::<u8>())
@@ -94,14 +162,32 @@ fn safe_action() -> impl Strategy<Value = Action> {
         1 => Just(Action::JjSquash),
         1 => Just(Action::JjUndo),
         1 => (0..6u8).prop_map(|nth| Action::JjEditPrior { nth }),
+        1 => Just(Action::JjRestoreAll),
+        1 => (0..FILE_POOL.len()).prop_map(|file| Action::JjRestoreFile { file }),
+        2 => (0..FILE_POOL.len(), 0..FILE_POOL.len())
+            .prop_map(|(from, to)| Action::RenameFile { from, to }),
+        1 => Just(Action::MoveDir),
+        1 => (0..FILE_POOL.len()).prop_map(|file| Action::JjSplit { file }),
+        1 => (0..8u8).prop_map(|nth| Action::JjRebase { nth }),
+        1 => (0..4u8).prop_map(|nth| Action::JjNewMerge { nth }),
+        1 => (0..3u8).prop_map(|style| Action::SetMarkerStyle { style }),
+        2 => (0..FILE_POOL.len(), 1..8u8, any::<u8>())
+            .prop_map(|(file, lines, seed)| Action::RemoteCommit { file, lines, seed }),
+        2 => Just(Action::JjGitFetch),
+        1 => Just(Action::JjNewOnRemote),
     ]
 }
 
-/// Superset of `safe_action` that also drops event batches (lossy watcher).
+/// Superset of `safe_action`: drops event batches (lossy watcher) and
+/// mutates `.gitignore` (whose semantic flips are only observable at the
+/// next operation, i.e. under the convergence contract).
 fn lossy_action() -> impl Strategy<Value = Action> {
     prop_oneof![
-        9 => safe_action(),
-        1 => Just(Action::DropPendingEvents),
+        12 => safe_action(),
+        1 => (0..GITIGNORE_VARIANTS.len() as u8)
+            .prop_map(|variant| Action::WriteGitignore { variant }),
+        1 => Just(Action::DeleteGitignore),
+        2 => Just(Action::DropPendingEvents),
     ]
 }
 
@@ -170,6 +256,9 @@ struct Harness {
     /// simulating FSEvents queue overflow during e.g. a checkout.
     drop_next_sync: bool,
     delivery: Delivery,
+    /// Side git repo registered as the `origin` remote; RemoteCommit writes
+    /// to its `main` branch, JjGitFetch imports it.
+    remote: tempfile::TempDir,
     /// Log of executed steps, printed on failure for diagnosis.
     log: Vec<String>,
 }
@@ -187,6 +276,21 @@ impl Harness {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let worker = spawn_jj_worker();
         let mirror = read_mirror(&root);
+
+        // Side "remote": a plain git repo with an initial commit on `main`.
+        let remote = tempfile::TempDir::new().unwrap();
+        crate::test_util::create_git_repo_in(remote.path());
+        {
+            // Normalize the branch name to `main` regardless of the host's
+            // init.defaultBranch setting.
+            let repo = git2::Repository::open(remote.path()).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            if repo.find_branch("main", git2::BranchType::Local).is_err() {
+                repo.branch("main", &head, false).unwrap();
+            }
+            repo.set_head("refs/heads/main").unwrap();
+        }
+
         let mut h = Harness {
             root,
             worker,
@@ -195,14 +299,58 @@ impl Harness {
             pending: Vec::new(),
             drop_next_sync: false,
             delivery,
+            remote,
             log: Vec::new(),
         };
+        let remote_path = h.remote.path().to_str().unwrap().to_string();
+        assert!(
+            h.jj(&["git", "remote", "add", "origin", &remote_path]),
+            "failed to add origin remote"
+        );
         h.full_refresh().await;
         h
     }
 
+    /// Commit seeded content to the remote's `main` branch via git2.
+    fn remote_commit(&mut self, file: usize, lines: u8, seed: u8) {
+        let repo = git2::Repository::open(self.remote.path()).unwrap();
+        let parent = repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let rel = Path::new(FILE_POOL[file]);
+        let abs = self.remote.path().join(rel);
+        if let Some(dir) = abs.parent() {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(&abs, seeded_content(file, lines, seed)).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(rel).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = repo.signature().unwrap();
+        repo.commit(
+            Some("refs/heads/main"),
+            &sig,
+            &sig,
+            &format!("remote change f{file} s{seed}"),
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+        self.log.push(format!(
+            "remote-commit {} ({lines} lines, seed {seed})",
+            FILE_POOL[file]
+        ));
+    }
+
     fn jj(&mut self, args: &[&str]) -> bool {
+        // ui.editor=false: any action that unexpectedly needs an editor
+        // fails fast (treated as a no-op) instead of hanging the campaign.
         let output = Command::new("jj")
+            .args(["--config", "ui.editor=false"])
             .args(args)
             .current_dir(&self.root)
             .output()
@@ -223,6 +371,7 @@ impl Harness {
 
     fn jj_stdout(&self, args: &[&str]) -> String {
         let output = Command::new("jj")
+            .args(["--config", "ui.editor=false"])
             .args(args)
             .current_dir(&self.root)
             .output()
@@ -386,7 +535,8 @@ impl Harness {
                 if out.contains("root") {
                     return None;
                 }
-                self.run_jj_op(&["squash"]).await
+                // -m avoids the editor jj opens to combine two descriptions.
+                self.run_jj_op(&["squash", "-m", "squashed"]).await
             }
             Action::JjUndo => {
                 if !self.jj(&["undo"]) {
@@ -418,6 +568,126 @@ impl Harness {
                 }
                 let id = ids[*nth as usize % ids.len()].to_string();
                 self.run_jj_op(&["edit", &id]).await
+            }
+            Action::JjRestoreAll => self.run_jj_op(&["restore"]).await,
+            Action::JjRestoreFile { file } => self.run_jj_op(&["restore", FILE_POOL[*file]]).await,
+            Action::RenameFile { from, to } => {
+                if from == to {
+                    return None;
+                }
+                let src = abs(from);
+                let dst = abs(to);
+                if !src.is_file() {
+                    return None;
+                }
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::rename(&src, &dst).unwrap();
+                self.log
+                    .push(format!("rename {} -> {}", FILE_POOL[*from], FILE_POOL[*to]));
+                self.sync_mirror();
+                self.deliver_file_events().await
+            }
+            Action::MoveDir => {
+                let d1 = self.root.join("dir");
+                let d2 = self.root.join("dir2");
+                let (src, dst, label) = if d1.is_dir() && !d2.exists() {
+                    (d1, d2, "dir -> dir2")
+                } else if d2.is_dir() && !d1.exists() {
+                    (d2, d1, "dir2 -> dir")
+                } else {
+                    return None;
+                };
+                std::fs::rename(&src, &dst).unwrap();
+                self.log.push(format!("move-dir {label}"));
+                self.sync_mirror();
+                self.deliver_file_events().await
+            }
+            Action::JjSplit { file } => {
+                self.run_jj_op(&["split", "-m", "split-out", "--", FILE_POOL[*file]])
+                    .await
+            }
+            Action::JjRebase { nth } => {
+                let out = self.jj_stdout(&[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    "all() ~ @",
+                    "-T",
+                    "change_id ++ \"\\n\"",
+                ]);
+                let ids: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+                if ids.is_empty() {
+                    return None;
+                }
+                let id = ids[*nth as usize % ids.len()].to_string();
+                self.run_jj_op(&["rebase", "-r", "@", "-d", &id]).await
+            }
+            Action::JjNewMerge { nth } => {
+                // Other heads exist after edit-prior + new branched history.
+                let out = self.jj_stdout(&[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    "heads(all()) ~ ::@",
+                    "-T",
+                    "change_id ++ \"\\n\"",
+                ]);
+                let ids: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+                if ids.is_empty() {
+                    return None;
+                }
+                let id = ids[*nth as usize % ids.len()].to_string();
+                self.run_jj_op(&["new", "@", &id]).await
+            }
+            Action::SetMarkerStyle { style } => {
+                // jj does not rematerialize existing on-disk conflicts when
+                // the style changes, so only toggle while @ is conflict-free.
+                let conflicted = !self
+                    .jj_stdout(&["log", "--no-graph", "-r", "@ & conflicts()", "-T", "\"c\""])
+                    .is_empty();
+                if conflicted {
+                    self.log
+                        .push("skip set-marker-style: @ is conflicted".to_string());
+                    return None;
+                }
+                let name = ["diff", "snapshot", "git"][*style as usize % 3];
+                self.log.push(format!("set conflict-marker-style {name}"));
+                self.jj(&["config", "set", "--repo", "ui.conflict-marker-style", name]);
+                // Config changes create no jj operation and no watcher event.
+                None
+            }
+            Action::RemoteCommit { file, lines, seed } => {
+                self.remote_commit(*file, *lines, *seed);
+                // Nothing observable locally until a fetch.
+                None
+            }
+            Action::JjGitFetch => self.run_jj_op(&["git", "fetch"]).await,
+            Action::JjNewOnRemote => {
+                // Requires a prior fetch to have imported main@origin.
+                if !self.jj(&["log", "--no-graph", "-r", "main@origin", "-T", "\"\""]) {
+                    return None;
+                }
+                self.run_jj_op(&["new", "main@origin"]).await
+            }
+            Action::WriteGitignore { variant } => {
+                let content = GITIGNORE_VARIANTS[*variant as usize % GITIGNORE_VARIANTS.len()];
+                std::fs::write(self.root.join(".gitignore"), content).unwrap();
+                self.log
+                    .push(format!("write .gitignore {:?}", content.replace('\n', " ")));
+                self.sync_mirror();
+                self.deliver_file_events().await
+            }
+            Action::DeleteGitignore => {
+                let path = self.root.join(".gitignore");
+                if !path.exists() {
+                    return None;
+                }
+                std::fs::remove_file(&path).unwrap();
+                self.log.push("delete .gitignore".to_string());
+                self.sync_mirror();
+                self.deliver_file_events().await
             }
             Action::DropPendingEvents => {
                 if self.delivery == Delivery::Lossy {
@@ -482,6 +752,9 @@ impl Harness {
 ///   lost changes into the store) must restore exact parity.
 async fn run_sequence(actions: &[Action], delivery: Delivery) -> Result<(), String> {
     let dir = create_jj_repo();
+    // SetMarkerStyle runs `jj config set --repo`, which creates an external
+    // per-repo config dir; remove it when the sequence ends (even on panic).
+    let _config_cleanup = crate::test_util::RepoConfigCleanup::new(dir.path());
     let mut h = Harness::new(dir.path(), delivery).await;
 
     for action in actions {
@@ -516,6 +789,16 @@ fn run_case(actions: Vec<Action>, delivery: Delivery) -> Result<(), TestCaseErro
         .map_err(TestCaseError::fail)
 }
 
+/// Sequence length range; `DIFF_PROP_SEQ_LEN` sets the upper bound
+/// (default 10). Longer sequences catch drift that only compounds.
+fn seq_len() -> std::ops::Range<usize> {
+    let max: usize = std::env::var("DIFF_PROP_SEQ_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    3..max.max(4)
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: std::env::var("DIFF_PROP_CASES")
@@ -530,17 +813,18 @@ proptest! {
     /// `jj diff --stat` after every action.
     #[test]
     fn prop_incremental_matches_cli_perfect_events(
-        actions in proptest::collection::vec(safe_action(), 3..10)
+        actions in proptest::collection::vec(safe_action(), seq_len())
     ) {
         run_case(actions, Delivery::Perfect)?;
     }
 
     /// Lossy property: even when event batches are dropped (FSEvents
-    /// overflow, dir-level coalescing), the next jj operation must restore
-    /// exact `jj diff --stat` parity — drift is bounded, never permanent.
+    /// overflow, dir-level coalescing) and `.gitignore` semantics flip, the
+    /// next jj operation must restore exact `jj diff --stat` parity — drift
+    /// is bounded, never permanent.
     #[test]
     fn prop_incremental_converges_lossy_events(
-        actions in proptest::collection::vec(lossy_action(), 3..10)
+        actions in proptest::collection::vec(lossy_action(), seq_len())
     ) {
         run_case(actions, Delivery::Lossy)?;
     }
@@ -582,6 +866,77 @@ mod regressions {
                 },
                 Action::DropPendingEvents,
                 Action::JjAbandon,
+            ],
+            Delivery::Lossy,
+        );
+    }
+
+    /// Directory move of a tracked file right after `jj new` — found by the
+    /// 40-case campaign (flaky there; deterministic replay pins it).
+    #[test]
+    fn movedir_of_tracked_file_after_new() {
+        replay(
+            &[
+                Action::Write {
+                    file: 2, // dir/c.txt
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjNew,
+                Action::MoveDir,
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Rename then edit the target across snapshots (perfect mode): the
+    /// overlay must diff the target against the rename *source's* parent
+    /// content, matching jj's `{a => b} | 2 +-` fuzzy-rename stat.
+    #[test]
+    fn rename_then_edit_target() {
+        replay(
+            &[
+                Action::Write {
+                    file: 0, // a.txt
+                    lines: 11,
+                    seed: 7,
+                },
+                Action::JjNew,
+                Action::RenameFile { from: 0, to: 1 }, // a.txt -> b.txt
+                Action::Touch {
+                    file: 1,
+                    line: 5,
+                    seed: 9,
+                },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Rename AND edit within one un-snapshotted window (lossy): only jj's
+    /// copy records can pair them (fuzzy rename); the convergence full
+    /// refresh must use them.
+    #[test]
+    fn lossy_rename_and_edit_converges_via_copy_records() {
+        replay(
+            &[
+                Action::Write {
+                    file: 0,
+                    lines: 11,
+                    seed: 7,
+                },
+                Action::JjNew,
+                Action::RenameFile { from: 0, to: 1 },
+                Action::Touch {
+                    file: 1,
+                    line: 5,
+                    seed: 9,
+                },
             ],
             Delivery::Lossy,
         );

@@ -169,7 +169,7 @@ fn repo_config_path(repo_path: &Path) -> PathBuf {
 /// Candidate jj config root directories (containing `config.toml`, `repos/`).
 /// jj checks the platform config dir and, on macOS where they differ,
 /// `~/.config` as well.
-fn jj_config_roots() -> Vec<PathBuf> {
+pub(crate) fn jj_config_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(d) = dirs::config_dir() {
         roots.push(d.join("jj"));
@@ -220,6 +220,30 @@ pub struct FileDiffStats {
     pub lines_added: u32,
     pub lines_removed: u32,
     pub kind: FileChangeKind,
+    /// Fingerprint of the file content (added: new content; deleted: old
+    /// content). Used to pair equal-content Added/Deleted entries as renames,
+    /// mirroring git's exact-rename detection. `None` for empty content
+    /// (git excludes empty files from rename detection) and for kinds where
+    /// pairing does not apply.
+    pub content_hash: Option<u64>,
+    /// For entries produced by jj copy records: the repo-relative source
+    /// path this file was renamed/copied from. The incremental single-file
+    /// diff uses it to compare disk content against the *source's* parent
+    /// content, as jj does.
+    pub renamed_from: Option<String>,
+}
+
+/// FNV-1a over content — a stable fingerprint for exact-rename pairing.
+fn content_fingerprint(content: &[u8]) -> Option<u64> {
+    if content.is_empty() {
+        return None;
+    }
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in content {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some(hash)
 }
 
 /// Aggregated diff statistics including per-category file counts.
@@ -258,6 +282,11 @@ pub struct JjRepoState {
     /// refresh; conflicted parent values must materialize with the same
     /// markers jj wrote to disk or unchanged files diff as modified.
     conflict_marker_style: ConflictMarkerStyle,
+    /// Ignore rules for this repo. Files that are untracked AND ignored
+    /// are invisible to `jj diff` (jj never auto-tracks them), so they
+    /// must not produce overlay entries — otherwise a file written before
+    /// a `.gitignore` started covering it leaves a permanent phantom Add.
+    ignore_filter: crate::watcher::IgnoreFilter,
     /// Per-file stats from the last full jj-lib diff (parent_tree vs commit.tree()).
     base_file_stats: HashMap<String, FileDiffStats>,
     /// Overlay: per-file stats computed from disk reads for working copy files.
@@ -302,14 +331,39 @@ pub fn aggregate_overlay_stats(
         }
     }
 
+    // Track Added/Deleted entries by content fingerprint for rename pairing.
+    let mut adds_by_hash: HashMap<u64, (u32, u32)> = HashMap::new(); // hash -> (count, lines)
+    let mut dels_by_hash: HashMap<u64, (u32, u32)> = HashMap::new();
+    let mut note = |stats: &FileDiffStats| {
+        if let Some(hash) = stats.content_hash {
+            match stats.kind {
+                FileChangeKind::Added => {
+                    let e = adds_by_hash.entry(hash).or_insert((0, stats.lines_added));
+                    e.0 += 1;
+                }
+                FileChangeKind::Deleted => {
+                    let e = dels_by_hash.entry(hash).or_insert((0, stats.lines_removed));
+                    e.0 += 1;
+                }
+                _ => {}
+            }
+        }
+    };
+
     // Process base entries, checking for overlay overrides
     for (path, stats) in base {
         match overlay.get(path) {
-            Some(Some(overlay_stats)) => tally(&mut counts, overlay_stats),
+            Some(Some(overlay_stats)) => {
+                tally(&mut counts, overlay_stats);
+                note(overlay_stats);
+            }
             Some(None) => {
                 // File reverted to parent — excluded from diff
             }
-            None => tally(&mut counts, stats),
+            None => {
+                tally(&mut counts, stats);
+                note(stats);
+            }
         }
     }
 
@@ -320,7 +374,26 @@ pub fn aggregate_overlay_stats(
         }
         if let Some(stats) = entry {
             tally(&mut counts, stats);
+            note(stats);
         }
+    }
+
+    // Exact-rename pairing: an Added and a Deleted entry with identical
+    // content are one renamed file to git/jj (`{a => b} | 0`), not two
+    // changes. Pair them up and reclassify, subtracting the phantom lines.
+    // (Fuzzy renames — moved AND edited within one snapshot window — are
+    // resolved by jj's copy records at the next full refresh instead.)
+    for (hash, (add_count, add_lines)) in &adds_by_hash {
+        let Some((del_count, del_lines)) = dels_by_hash.get(hash) else {
+            continue;
+        };
+        let pairs = (*add_count).min(*del_count);
+        counts.file_mad_count -= pairs;
+        counts.lines_added -= pairs * add_lines;
+        counts.lines_removed -= pairs * del_lines;
+        counts.files_added -= pairs;
+        counts.files_deleted -= pairs;
+        counts.files_modified += pairs;
     }
 
     counts
@@ -422,17 +495,22 @@ impl JjRepoState {
     }
 }
 
-/// Compute per-file diff stats between two trees.
+/// Compute per-file diff stats between two trees, honoring rename/copy
+/// records the way `jj diff --stat` does: a renamed file is one changed
+/// file (its source's delete entry is suppressed by the copies stream),
+/// with line stats from diffing source content against target content.
 #[tracing::instrument(skip_all)]
 async fn compute_per_file_diff_stats(
     store: &Arc<jj_lib::store::Store>,
     from_tree: &jj_lib::merged_tree::MergedTree,
     to_tree: &jj_lib::merged_tree::MergedTree,
     marker_style: ConflictMarkerStyle,
+    copy_records: &jj_lib::copies::CopyRecords,
 ) -> HashMap<String, FileDiffStats> {
     let mut result = HashMap::new();
 
-    let mut diff_stream = from_tree.diff_stream(to_tree, &EverythingMatcher);
+    let mut diff_stream =
+        from_tree.diff_stream_with_copies(to_tree, &EverythingMatcher, copy_records);
     while let Some(entry) = diff_stream.next().await {
         let Ok(values) = entry.values else {
             continue;
@@ -440,7 +518,7 @@ async fn compute_per_file_diff_stats(
 
         let before = materialized_content(
             store,
-            &entry.path,
+            entry.path.source(),
             values.before,
             from_tree.labels(),
             marker_style,
@@ -448,21 +526,63 @@ async fn compute_per_file_diff_stats(
         .await;
         let after = materialized_content(
             store,
-            &entry.path,
+            entry.path.target(),
             values.after,
             to_tree.labels(),
             marker_style,
         )
         .await;
 
-        let Some(stats) = diff_stats_for_contents(before.as_deref(), after.as_deref()) else {
-            continue;
+        let renamed_from = entry
+            .path
+            .copy_operation()
+            .map(|_| entry.path.source().as_internal_file_string().to_string());
+
+        let stats = match diff_stats_for_contents(before.as_deref(), after.as_deref()) {
+            Some(mut stats) => {
+                if renamed_from.is_some() {
+                    // A rename/copy target always counts as one changed file,
+                    // classified as modified, even when content is identical.
+                    stats.kind = FileChangeKind::Modified;
+                    stats.content_hash = None;
+                    stats.renamed_from = renamed_from;
+                }
+                stats
+            }
+            None if renamed_from.is_some() => FileDiffStats {
+                kind: FileChangeKind::Modified,
+                renamed_from,
+                ..Default::default()
+            },
+            None => continue,
         };
 
-        result.insert(entry.path.as_internal_file_string().to_string(), stats);
+        result.insert(
+            entry.path.target().as_internal_file_string().to_string(),
+            stats,
+        );
     }
 
     result
+}
+
+/// Gather rename/copy records between each parent and the given commit,
+/// as jj's diff machinery does. Failures degrade to "no records".
+async fn gather_copy_records(
+    store: &Arc<jj_lib::store::Store>,
+    commit: &jj_lib::commit::Commit,
+) -> jj_lib::copies::CopyRecords {
+    let mut records = jj_lib::copies::CopyRecords::default();
+    for parent_id in commit.parent_ids() {
+        let Ok(stream) = store.get_copy_records(None, parent_id, commit.id()) else {
+            continue;
+        };
+        let collected: Vec<_> = stream.collect().await;
+        if let Err(e) = records.add_records(collected) {
+            tracing::debug!(error = %e, "failed to add copy records");
+        }
+    }
+    records
 }
 
 /// Compute `diff --stat`-style stats for a pair of materialized contents.
@@ -475,12 +595,14 @@ fn diff_stats_for_contents(before: Option<&[u8]>, after: Option<&[u8]>) -> Optio
         (None, None) => return None,
         (None, Some(content)) => {
             stats.kind = FileChangeKind::Added;
+            stats.content_hash = content_fingerprint(content);
             if !is_binary(content) {
                 stats.lines_added = count_lines(content);
             }
         }
         (Some(content), None) => {
             stats.kind = FileChangeKind::Deleted;
+            stats.content_hash = content_fingerprint(content);
             if !is_binary(content) {
                 stats.lines_removed = count_lines(content);
             }
@@ -541,6 +663,19 @@ async fn diff_single_file(
 /// results in the overlay. Paths are deduplicated — each is re-read from
 /// disk at processing time, so duplicates are pure wasted work.
 async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathBuf]) {
+    // Classify paths through the ignore rules (this also lazily ingests any
+    // .gitignore/.jjignore files present in the batch).
+    let vcs_dir = state.repo_root.join(".jj");
+    let colocated_git_dir = {
+        let git_dir = state.repo_root.join(".git");
+        git_dir.exists().then_some(git_dir)
+    };
+    let verdict =
+        state
+            .ignore_filter
+            .process_event(&vcs_dir, colocated_git_dir.as_deref(), changed_paths);
+    let not_ignored: HashSet<&Path> = verdict.changed_paths.iter().map(|p| p.as_path()).collect();
+
     let mut seen = HashSet::new();
     for abs_path in changed_paths {
         if !seen.insert(abs_path) {
@@ -549,12 +684,21 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
         let Some(rel_str) = abs_to_repo_relative(&state.repo_root, abs_path) else {
             continue;
         };
-        let Ok(repo_path_buf) = jj_lib::repo_path::RepoPathBuf::from_relative_path(&rel_str) else {
+        // If the base recorded this path as a rename target, diff the disk
+        // content against the *source's* parent content, as jj's copy-aware
+        // diff does — otherwise the target looks like a fresh Add.
+        let renamed_from = state
+            .base_file_stats
+            .get(&rel_str)
+            .and_then(|s| s.renamed_from.clone());
+        let parent_lookup = renamed_from.as_deref().unwrap_or(&rel_str);
+        let Ok(repo_path_buf) = jj_lib::repo_path::RepoPathBuf::from_relative_path(parent_lookup)
+        else {
             continue;
         };
         // Read file from disk (None if deleted/missing)
         let disk_content = std::fs::read(abs_path).ok();
-        let diff_result = diff_single_file(
+        let mut diff_result = diff_single_file(
             &state.store,
             &state.parent_tree,
             &repo_path_buf,
@@ -562,6 +706,33 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             state.conflict_marker_style,
         )
         .await;
+        match &mut diff_result {
+            // A rename target that now matches the source content is still
+            // one changed file (the rename itself), not "no change".
+            None if renamed_from.is_some() => {
+                diff_result = Some(FileDiffStats {
+                    kind: FileChangeKind::Modified,
+                    renamed_from,
+                    ..Default::default()
+                });
+            }
+            Some(stats) if renamed_from.is_some() && stats.kind == FileChangeKind::Modified => {
+                stats.renamed_from = renamed_from;
+                stats.content_hash = None;
+            }
+            // An Added result means the file is untracked (absent from the
+            // parent tree). If it is also ignored, jj will never track it —
+            // record "no change" so stale entries heal. Tracked files
+            // (Modified/Deleted) stay in the diff regardless of ignore
+            // rules, matching jj.
+            Some(stats)
+                if stats.kind == FileChangeKind::Added
+                    && !not_ignored.contains(abs_path.as_path()) =>
+            {
+                diff_result = None;
+            }
+            _ => {}
+        }
         state.overlay.insert(rel_str, diff_result);
     }
 }
@@ -963,11 +1134,13 @@ async fn compute_jj_full_status(
     };
     let current_tree = loaded.commit.tree();
     let base_file_stats = if let Some(ref parent_tree) = parent_tree {
+        let copy_records = gather_copy_records(loaded.repo.store(), &loaded.commit).await;
         let per_file = compute_per_file_diff_stats(
             loaded.repo.store(),
             parent_tree,
             &current_tree,
             conflict_marker_style,
+            &copy_records,
         )
         .await;
         let c = aggregate_file_stats(&per_file);
@@ -1004,6 +1177,7 @@ async fn compute_jj_full_status(
         commit_tree_ids,
         op_id: loaded.repo.op_id().clone(),
         conflict_marker_style,
+        ignore_filter: crate::watcher::IgnoreFilter::new(&repo_root, crate::protocol::VcsKind::Jj),
         base_file_stats,
         overlay: HashMap::new(),
         repo_root,
@@ -1873,6 +2047,7 @@ mod tests {
             lines_added: added,
             lines_removed: removed,
             kind: FileChangeKind::Modified,
+            ..Default::default()
         }
     }
 
@@ -2716,6 +2891,7 @@ mod tests {
     #[tokio::test]
     async fn test_conflict_marker_style_config_respected() {
         let dir = create_jj_repo().await;
+        let _config_cleanup = crate::test_util::RepoConfigCleanup::new(dir.path());
         let config = Config {
             color: false,
             ..Default::default()
