@@ -389,15 +389,18 @@ impl Harness {
                 self.run_jj_op(&["squash"]).await
             }
             Action::JjUndo => {
-                // Undoing the repo-init op leaves the workspace with no
-                // working-copy commit — a degenerate state we don't model.
-                // Only undo when at least one op exists beyond init.
-                let ops =
-                    self.jj_stdout(&["op", "log", "--no-graph", "--limit", "3", "-T", "\"op\\n\""]);
-                if ops.lines().count() < 3 {
+                if !self.jj(&["undo"]) {
                     return None;
                 }
-                self.run_jj_op(&["undo"]).await
+                // Undoing the workspace-creating op restores to root() and
+                // leaves the workspace with no working-copy commit — a
+                // degenerate state the daemon (correctly) errors on and that
+                // we don't model. Detect it and redo.
+                if !self.jj(&["log", "--no-graph", "-r", "@", "-T", "\"\""]) {
+                    assert!(self.jj(&["redo"]), "jj redo failed after bad undo");
+                }
+                self.sync_mirror();
+                Some(self.deliver_op_event().await)
             }
             Action::JjEditPrior { nth } => {
                 // Pick the nth visible mutable change (excluding @).
@@ -490,11 +493,14 @@ async fn run_sequence(actions: &[Action], delivery: Delivery) -> Result<(), Stri
         }
     }
 
-    // Convergence check. Run a jj op (snapshot) and deliver its op event —
-    // in lossy mode this is the moment the engine is required to re-anchor
-    // to the store; in perfect mode it must simply stay correct.
+    // Convergence check. Run a jj operation and deliver its op event — in
+    // lossy mode this is the moment the engine is required to re-anchor to
+    // the store; in perfect mode it must simply stay correct. `describe` is
+    // used (not `status`) because it always writes a new operation: a
+    // no-op snapshot advances nothing, and the healing contract is "the
+    // next *operation*", which is also what produces a watcher event.
     h.drop_next_sync = false;
-    h.jj(&["status"]);
+    h.jj(&["describe", "-m", "convergence-check"]);
     h.sync_mirror();
     let status = h.deliver_op_event().await;
     h.check_oracle(&status).await?;
