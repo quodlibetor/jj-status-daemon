@@ -234,6 +234,10 @@ pub async fn run_daemon(
     // Write version file so clients can detect version mismatches without a socket round-trip
     std::fs::write(runtime_dir.join("version"), format!("{version} {git_hash}")).ok();
 
+    // Publish the effective query timeout so the client can size its socket
+    // read timeout without loading the config file on every prompt.
+    write_query_timeout_file(&runtime_dir, config.query_timeout_ms);
+
     let (watch_tx, watch_rx) = mpsc::unbounded_channel();
     let shutdown = Arc::new(Notify::new());
 
@@ -461,6 +465,7 @@ pub async fn run_daemon(
                 }
                 let _ = std::fs::remove_file(&pid_path);
                 let _ = std::fs::remove_file(runtime_dir.join("version"));
+                let _ = std::fs::remove_file(runtime_dir.join("query-timeout-ms"));
                 return Ok(());
             }
         }
@@ -824,6 +829,15 @@ async fn send_response(
 
 /// Name of the persisted watched-repo list inside the runtime directory.
 const REPOS_FILE: &str = "repos";
+
+/// Publish the effective query timeout for the client's socket read timeout.
+fn write_query_timeout_file(runtime_dir: &Path, query_timeout_ms: u64) {
+    std::fs::write(
+        runtime_dir.join("query-timeout-ms"),
+        query_timeout_ms.to_string(),
+    )
+    .ok();
+}
 
 /// Persist the current watcher set (one absolute repo path per line) so a
 /// restarted daemon can resume watching without depending on cache-file names.
@@ -1287,6 +1301,9 @@ async fn reload_config(config_path: &Path, state: &Arc<Mutex<DaemonState>>) {
         );
         st.not_ready_formatted =
             format_not_ready(&new_config.resolved_not_ready_format(), new_config.color);
+        if let Some(runtime_dir) = st.cache_dir.parent() {
+            write_query_timeout_file(runtime_dir, new_config.query_timeout_ms);
+        }
         st.config = Arc::new(new_config);
         st.compiled_format = new_compiled;
     }
