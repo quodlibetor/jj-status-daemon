@@ -86,6 +86,13 @@ daemon, both VCS backends, and the client.
   as a plain add and dropping the source's deletion from the stat; the
   incremental engine now mirrors that outcome instead of pairing the
   rename. Found by the same soak.
+- **moving a conflicted file is not a rename**: rename pairing now scores
+  similarity per merge parent against each parent's own side content,
+  exactly as gix produces copy records — a moved file whose content is
+  conflict-marker text pairs with no parent side and reports as plain
+  delete + add, matching jj. Previously it compared against the merged
+  parent's materialization (the marker text itself) and paired at 100%.
+  Found by the same soak.
 - **self-healing on every jj operation**: `ValidateAndRefresh` now compares the
   working-copy commit's tree (and the operation id) in addition to the parent
   tree. Same-parent checkouts (`jj abandon`, `jj edit` to a sibling,
