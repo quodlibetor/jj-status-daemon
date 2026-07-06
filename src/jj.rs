@@ -1154,10 +1154,23 @@ struct JjLoadedRepo {
     metadata_status: RepoStatus,
 }
 
-/// Load a jj workspace/repo and compute metadata. This is the shared first step
-/// for both full refresh and validate-and-refresh — call once, then branch on
-/// whether the parent tree IDs changed.
-async fn load_jj_repo(repo_path: &Path, depth: u32) -> Result<JjLoadedRepo> {
+/// Retained workspace loader, reused across refreshes so the Store's
+/// commit/tree caches stay warm instead of loading cold each time.
+///
+/// Reuse is sound because `RepoLoader::load_at_head` re-reads op heads from
+/// disk on every call (new operations are always observed) and the Store
+/// caches are keyed by immutable content-addressed ids. Commits written by
+/// external processes are healed by the git backend's own reload-on-miss
+/// path. Anything else that goes stale (repo deleted/recreated, `.jj`
+/// replaced) surfaces as a load error, which callers handle by dropping the
+/// loader and retrying cold.
+struct JjWorkspaceLoader {
+    workspace_name: jj_lib::ref_name::WorkspaceNameBuf,
+    repo_loader: jj_lib::repo::RepoLoader,
+}
+
+/// Load a workspace from disk and keep the pieces needed for repeat loads.
+fn load_workspace_loader(repo_path: &Path) -> Result<JjWorkspaceLoader> {
     let settings = create_user_settings()?;
     let workspace = Workspace::load(
         &settings,
@@ -1166,10 +1179,28 @@ async fn load_jj_repo(repo_path: &Path, depth: u32) -> Result<JjLoadedRepo> {
         &default_working_copy_factories(),
     )
     .context("load jj workspace")?;
+    Ok(JjWorkspaceLoader {
+        workspace_name: workspace.workspace_name().to_owned(),
+        repo_loader: workspace.repo_loader().clone(),
+    })
+}
 
-    let workspace_name = workspace.workspace_name().to_owned();
-    let repo: Arc<jj_lib::repo::ReadonlyRepo> = workspace
-        .repo_loader()
+/// Load a jj workspace/repo and compute metadata. This is the shared first step
+/// for both full refresh and validate-and-refresh — call once, then branch on
+/// whether the parent tree IDs changed.
+///
+/// One-shot cold load; workers with retained state use `load_jj_repo_with`.
+async fn load_jj_repo(repo_path: &Path, depth: u32) -> Result<JjLoadedRepo> {
+    let loader = load_workspace_loader(repo_path)?;
+    load_jj_repo_with(&loader, depth).await
+}
+
+/// Load the repo at the current op head through a (possibly retained)
+/// loader and compute metadata.
+async fn load_jj_repo_with(loader: &JjWorkspaceLoader, depth: u32) -> Result<JjLoadedRepo> {
+    let workspace_name = loader.workspace_name.clone();
+    let repo: Arc<jj_lib::repo::ReadonlyRepo> = loader
+        .repo_loader
         .load_at_head()
         .await
         .context("load jj repo at head")?;
@@ -1332,6 +1363,58 @@ fn update_base_status_metadata(base: &mut RepoStatus, fresh: &RepoStatus) {
 async fn query_jj_lib(repo_path: &Path, depth: u32) -> Result<(RepoStatus, JjRepoState)> {
     let loaded = load_jj_repo(repo_path, depth).await?;
     compute_jj_full_status(repo_path, loaded).await
+}
+
+/// Load via the retained loader when present; on failure drop it and retry
+/// once with a cold load. (Re)fills `cached` on success. The returned flag
+/// is true when the load went through the retained loader.
+async fn load_jj_repo_cached(
+    cached: &mut Option<JjWorkspaceLoader>,
+    repo_path: &Path,
+    depth: u32,
+) -> Result<(JjLoadedRepo, bool)> {
+    if let Some(loader) = cached.as_ref() {
+        match load_jj_repo_with(loader, depth).await {
+            Ok(loaded) => return Ok((loaded, true)),
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo_path.display(),
+                    error = %e,
+                    "retained jj loader failed, retrying with cold load"
+                );
+                *cached = None;
+            }
+        }
+    }
+    let loader = load_workspace_loader(repo_path)?;
+    let loaded = load_jj_repo_with(&loader, depth).await?;
+    *cached = Some(loader);
+    Ok((loaded, false))
+}
+
+/// Full refresh through the retained loader. An error in the diff stage
+/// after a retained load may also be staleness (the store handles are
+/// shared), so it gets the same drop-and-retry-cold treatment as load
+/// errors before being reported.
+async fn query_jj_cached(
+    cached: &mut Option<JjWorkspaceLoader>,
+    repo_path: &Path,
+    depth: u32,
+) -> Result<(RepoStatus, JjRepoState)> {
+    let (loaded, used_retained) = load_jj_repo_cached(cached, repo_path, depth).await?;
+    match compute_jj_full_status(repo_path, loaded).await {
+        Err(e) if used_retained => {
+            tracing::warn!(
+                repo = %repo_path.display(),
+                error = %e,
+                "full status failed via retained loader, retrying with cold load"
+            );
+            *cached = None;
+            let (loaded, _) = load_jj_repo_cached(cached, repo_path, depth).await?;
+            compute_jj_full_status(repo_path, loaded).await
+        }
+        result => result,
+    }
 }
 
 #[tracing::instrument(skip(config), fields(repo = %repo_path.display()))]
@@ -1519,6 +1602,8 @@ async fn repo_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
     // overlay stats; `JjRepoState.repo_root` is canonicalized and may differ.
     let mut worker_repo_path: Option<PathBuf> = None;
     let mut repo_state: Option<JjRepoState> = None;
+    // Workspace loader retained across refreshes to keep store caches warm.
+    let mut cached_loader: Option<JjWorkspaceLoader> = None;
 
     while let Some(req) = rx.recv().await {
         match req {
@@ -1528,7 +1613,7 @@ async fn repo_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                 reply,
             } => {
                 worker_repo_path = Some(repo_path.clone());
-                let result = query_jj_lib(&repo_path, depth).await;
+                let result = query_jj_cached(&mut cached_loader, &repo_path, depth).await;
                 match result {
                     Ok((status, jj_state)) => {
                         repo_state = Some(jj_state);
@@ -1548,7 +1633,7 @@ async fn repo_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                 worker_repo_path = Some(repo_path.clone());
                 let Some(state) = repo_state.as_mut() else {
                     // No retained state — fall through to full refresh
-                    let result = query_jj_lib(&repo_path, depth).await;
+                    let result = query_jj_cached(&mut cached_loader, &repo_path, depth).await;
                     match result {
                         Ok((status, jj_state)) => {
                             repo_state = Some(jj_state);
@@ -1562,13 +1647,14 @@ async fn repo_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                 };
 
                 // Load workspace/repo once — then branch on parent tree IDs
-                let loaded = match load_jj_repo(&repo_path, depth).await {
-                    Ok(l) => l,
-                    Err(e) => {
-                        let _ = reply.send(Err(e));
-                        continue;
-                    }
-                };
+                let (loaded, used_retained) =
+                    match load_jj_repo_cached(&mut cached_loader, &repo_path, depth).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                            continue;
+                        }
+                    };
 
                 let trees_unchanged = loaded.parent_tree_ids == state.parent_tree_ids
                     && loaded.commit.tree_ids() == &state.commit_tree_ids;
@@ -1609,7 +1695,20 @@ async fn repo_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                         repo = %repo_path.display(),
                         "parent or commit tree changed — full refresh"
                     );
-                    let result = compute_jj_full_status(&repo_path, loaded).await;
+                    let result = match compute_jj_full_status(&repo_path, loaded).await {
+                        Err(e) if used_retained => {
+                            // Same staleness handling as query_jj_cached:
+                            // drop the loader and redo the refresh cold.
+                            tracing::warn!(
+                                repo = %repo_path.display(),
+                                error = %e,
+                                "full status failed via retained loader, retrying with cold load"
+                            );
+                            cached_loader = None;
+                            query_jj_cached(&mut cached_loader, &repo_path, depth).await
+                        }
+                        result => result,
+                    };
                     match result {
                         Ok((_, mut jj_state)) => {
                             apply_incremental_paths(&mut jj_state, &changed_paths).await;
@@ -1655,11 +1754,15 @@ async fn repo_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                 // previously knew were dirty (overlay keys); disk changes we
                 // never heard about at all can only be healed by the next op.
                 worker_repo_path = Some(repo_path.clone());
+                // Drop the retained loader too: resync means our picture of
+                // the repo is untrustworthy, and the cold load doubles as a
+                // pressure valve for accumulated store caches.
+                cached_loader = None;
                 let prior_dirty: Vec<PathBuf> = repo_state
                     .as_ref()
                     .map(|s| s.overlay.keys().map(|rel| s.repo_root.join(rel)).collect())
                     .unwrap_or_default();
-                match query_jj_lib(&repo_path, depth).await {
+                match query_jj_cached(&mut cached_loader, &repo_path, depth).await {
                     Ok((_, mut jj_state)) => {
                         apply_incremental_paths(&mut jj_state, &prior_dirty).await;
                         let status = jj_state.current_status();
@@ -3509,6 +3612,51 @@ mod tests {
             (1, 2),
             "resync should re-diff known dirty files from disk"
         );
+    }
+
+    /// Consecutive full refreshes through the same worker: the second and
+    /// third reuse the retained workspace loader and must still observe new
+    /// operations (`RepoLoader::load_at_head` re-reads op heads from disk on
+    /// every call).
+    #[tokio::test]
+    async fn test_retained_loader_sees_new_operations() {
+        let dir = create_jj_repo().await;
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+        let jj_worker = spawn_jj_worker();
+
+        let full_refresh = |reply| JjWorkerRequest::FullRefresh {
+            repo_path: dir.path().to_path_buf(),
+            depth: config.bookmark_search_depth,
+            reply,
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker.send(full_refresh(reply_tx)).unwrap();
+        let first = reply_rx.await.unwrap().unwrap();
+
+        // describe: new operation, same change
+        jj_cmd(dir.path(), &["describe", "-m", "second op"]).await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker.send(full_refresh(reply_tx)).unwrap();
+        let second = reply_rx.await.unwrap().unwrap();
+        assert_eq!(
+            second.description, "second op",
+            "refresh via retained loader must see the new operation"
+        );
+
+        // new: new operation AND new working-copy change
+        jj_cmd(dir.path(), &["new"]).await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker.send(full_refresh(reply_tx)).unwrap();
+        let third = reply_rx.await.unwrap().unwrap();
+        assert_ne!(
+            third.change_id, first.change_id,
+            "new working-copy change must be visible through the retained loader"
+        );
+        assert!(third.description.is_empty());
     }
 
     /// Router behavior: stats fan out across per-repo workers, Forget drops
