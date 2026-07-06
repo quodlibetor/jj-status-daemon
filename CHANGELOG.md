@@ -86,6 +86,18 @@ daemon, both VCS backends, and the client.
   as a plain add and dropping the source's deletion from the stat; the
   incremental engine now mirrors that outcome instead of pairing the
   rename. Found by the same soak.
+- **incremental diffs are computed from synthesized snapshot state**: the
+  incremental engine now models what jj's snapshot would record for each
+  touched path (a read-only mirror of update_from_content built on jj-lib's
+  own merge/conflict primitives) and derives diff entries from value
+  comparison — replacing three hand-written special cases and fixing a
+  latent conflict parse-arity bug (markers are now parsed with the
+  working-copy value's arity, not the parent's). No performance change:
+  the path stays O(touched files).
+- **copy targets match on current content**: gix matches a copy target
+  against a modified source's post-image, not its parent content — a
+  rename source re-created with different content no longer re-pairs.
+  Found by the refactor's baseline soak run.
 - **copy detection matches jj**: a modified file's parent-side content can
   claim an added file as a copy target (gix `CopySource::FromSetOfModified
   Files`), so `jj restore` + re-edit sequences that jj reports as
