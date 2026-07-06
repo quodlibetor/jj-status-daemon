@@ -86,6 +86,20 @@ daemon, both VCS backends, and the client.
   as a plain add and dropping the source's deletion from the stat; the
   incremental engine now mirrors that outcome instead of pairing the
   rename. Found by the same soak.
+- **copy detection matches jj**: a modified file's parent-side content can
+  claim an added file as a copy target (gix `CopySource::FromSetOfModified
+  Files`), so `jj restore` + re-edit sequences that jj reports as
+  `{a => b} | 0` plus the source's own diff now match. Rename/copy pairing
+  also now runs on the composite diff state through one per-parent gix
+  mirror — the old aggregate-time exact-hash pairing, which could
+  contradict gix in both directions, is gone.
+- **conflicted parents project like gix sees them**: per-parent rename
+  records read each parent's first conflict term (what jj stores as the
+  git tree, per GitBackend::read_tree_for_commit), fixing pairing across
+  rebase-conflicted parents.
+- **an ignored re-created rename source keeps the rename**: rename-premise
+  invalidation now checks visibility (tracked or not ignored), matching
+  what jj's snapshot can see, instead of mere on-disk existence.
 - **moving a conflicted file is not a rename**: rename pairing now scores
   similarity per merge parent against each parent's own side content,
   exactly as gix produces copy records — a moved file whose content is
