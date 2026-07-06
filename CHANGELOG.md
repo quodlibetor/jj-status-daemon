@@ -45,6 +45,16 @@ daemon, both VCS backends, and the client.
   cache after this release.
 
 **Correctness (jj diff stats)**
+- **tracked-but-ignored files no longer vanish from stats**: a file that was
+  snapshotted before an ignore rule started covering it (e.g. `dir/` added to
+  `.gitignore` after `dir/sub/d.txt` was tracked) stays in the diff, matching
+  jj. Previously the ignore-aware overlay masked it as "no change", hiding
+  its real diff. Found by a property-test soak.
+- **renames pair correctly after a snapshotted edit**: renaming a file whose
+  edits had already been snapshotted into the working-copy commit now
+  produces jj's `{a => b} | N` stat. Previously the rename fingerprint used
+  the parent-tree content instead of the last-snapshotted content, so the
+  rename split into a bogus full delete + add. Found by the same soak.
 - **self-healing on every jj operation**: `ValidateAndRefresh` now compares the
   working-copy commit's tree (and the operation id) in addition to the parent
   tree. Same-parent checkouts (`jj abandon`, `jj edit` to a sibling,

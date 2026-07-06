@@ -295,11 +295,13 @@ pub struct JjRepoState {
     parent_tree: jj_lib::merged_tree::MergedTree,
     /// Tree IDs of the parent tree, used to detect baseline changes without full diff.
     parent_tree_ids: jj_lib::merge::Merge<jj_lib::backend::TreeId>,
-    /// Tree IDs of the working-copy commit itself. When an op changes these
-    /// without changing the parent (snapshot, abandon, edit-to-sibling,
-    /// restore), the base stats must be rebuilt from the store — watcher
-    /// events alone cannot be relied on to repair them.
-    commit_tree_ids: jj_lib::merge::Merge<jj_lib::backend::TreeId>,
+    /// The working-copy commit's own tree — the last snapshot, i.e. the
+    /// authority on which paths are *tracked* and what content they last
+    /// had. Its IDs detect ops that rewrite the WC commit without changing
+    /// the parent (snapshot, abandon, edit-to-sibling, restore): the base
+    /// stats must then be rebuilt from the store — watcher events alone
+    /// cannot be relied on to repair them.
+    commit_tree: jj_lib::merged_tree::MergedTree,
     /// Operation ID at the time this state was built. Tree ID comparison
     /// alone misses A→B→A sequences (e.g. `jj abandon` snapshots a dirty
     /// file into @ and then discards it — both trees end up as they
@@ -707,6 +709,9 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             .process_event(&vcs_dir, colocated_git_dir.as_deref(), changed_paths);
     let not_ignored: HashSet<&Path> = verdict.changed_paths.iter().map(|p| p.as_path()).collect();
 
+    // Per-path results are staged, then a rename post-pass pairs same-batch
+    // delete+add before committing anything to the overlay.
+    let mut staged: Vec<(String, Option<FileDiffStats>)> = Vec::new();
     let mut seen = HashSet::new();
     for abs_path in changed_paths {
         if !seen.insert(abs_path) {
@@ -751,19 +756,103 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                 stats.renamed_from = renamed_from;
                 stats.content_hash = None;
             }
-            // An Added result means the file is untracked (absent from the
-            // parent tree). If it is also ignored, jj will never track it —
-            // record "no change" so stale entries heal. Tracked files
-            // (Modified/Deleted) stay in the diff regardless of ignore
-            // rules, matching jj.
+            // An Added result means the file is absent from the *parent*
+            // tree — but trackedness is membership in the *WC commit* tree
+            // (the last snapshot): a file snapshotted before a .gitignore
+            // started covering it stays tracked, and jj keeps diffing it.
+            // Only a file that is untracked (absent from the commit tree
+            // too) AND ignored is invisible to jj — record "no change" so
+            // stale entries heal. Tracked files stay in the diff regardless
+            // of ignore rules, matching jj.
             Some(stats)
                 if stats.kind == FileChangeKind::Added
-                    && !not_ignored.contains(abs_path.as_path()) =>
+                    && !not_ignored.contains(abs_path.as_path())
+                    && state
+                        .commit_tree
+                        .path_value(&repo_path_buf)
+                        .map_or(true, |v| v.is_absent()) =>
             {
                 diff_result = None;
             }
             _ => {}
         }
+        staged.push((rel_str, diff_result));
+    }
+
+    // Same-batch exact-rename pairing: an OS rename delivers a Deleted for
+    // the source and an Added for the target in one batch. The content that
+    // identifies the pair is the source's *last-snapshotted* content (the WC
+    // commit tree) — not its parent-tree content: snapshotted-but-uncommitted
+    // edits travel with the file. A pair becomes one rename target diffed
+    // against the source's parent content (jj's `{a => b} | N` fuzzy stat),
+    // and the source's delete entry is suppressed, mirroring what jj's copy
+    // records produce at the next full refresh.
+    let mut added_by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, (_, result)) in staged.iter().enumerate() {
+        if let Some(stats) = result
+            && stats.kind == FileChangeKind::Added
+            && stats.renamed_from.is_none()
+            && let Some(hash) = stats.content_hash
+        {
+            added_by_hash.entry(hash).or_default().push(i);
+        }
+    }
+    if !added_by_hash.is_empty() {
+        for source_idx in 0..staged.len() {
+            let source_deleted =
+                matches!(&staged[source_idx].1, Some(s) if s.kind == FileChangeKind::Deleted);
+            if !source_deleted {
+                continue;
+            }
+            let source_rel = staged[source_idx].0.clone();
+            let Ok(source_path) = jj_lib::repo_path::RepoPathBuf::from_relative_path(&source_rel)
+            else {
+                continue;
+            };
+            let Ok(value) = state.commit_tree.path_value(&source_path) else {
+                continue;
+            };
+            if value.is_absent() {
+                continue;
+            }
+            let Some(content) = materialized_content(
+                &state.store,
+                &source_path,
+                value,
+                state.commit_tree.labels(),
+                state.conflict_marker_style,
+            )
+            .await
+            else {
+                continue;
+            };
+            let Some(hash) = content_fingerprint(&content) else {
+                continue;
+            };
+            let Some(target_idx) = added_by_hash.get_mut(&hash).and_then(|v| v.pop()) else {
+                continue;
+            };
+            let target_disk = std::fs::read(state.repo_root.join(&staged[target_idx].0)).ok();
+            let mut stats = diff_single_file(
+                &state.store,
+                &state.parent_tree,
+                &source_path,
+                target_disk.as_deref(),
+                state.conflict_marker_style,
+            )
+            .await
+            // None (target matches the source's parent content) is still one
+            // changed file: the rename itself.
+            .unwrap_or_default();
+            stats.kind = FileChangeKind::Modified;
+            stats.content_hash = None;
+            stats.renamed_from = Some(source_rel);
+            staged[target_idx].1 = Some(stats);
+            staged[source_idx].1 = None;
+        }
+    }
+
+    for (rel_str, diff_result) in staged {
         state.overlay.insert(rel_str, diff_result);
     }
 }
@@ -1315,14 +1404,14 @@ async fn compute_jj_full_status(
         .canonicalize()
         .unwrap_or_else(|_| repo_path.to_path_buf());
 
-    let commit_tree_ids = current_tree.tree_ids().clone();
+    let commit_tree = current_tree.clone();
     let retained_parent_tree = parent_tree.unwrap_or(current_tree);
 
     let jj_state = JjRepoState {
         store: loaded.repo.store().clone(),
         parent_tree_ids: retained_parent_tree.tree_ids().clone(),
         parent_tree: retained_parent_tree,
-        commit_tree_ids,
+        commit_tree,
         op_id: loaded.repo.op_id().clone(),
         conflict_marker_style,
         ignore_filter: crate::watcher::IgnoreFilter::new(&repo_root, crate::protocol::VcsKind::Jj),
@@ -1657,7 +1746,7 @@ async fn repo_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                     };
 
                 let trees_unchanged = loaded.parent_tree_ids == state.parent_tree_ids
-                    && loaded.commit.tree_ids() == &state.commit_tree_ids;
+                    && loaded.commit.tree_ids() == state.commit_tree.tree_ids();
 
                 if trees_unchanged {
                     // Neither the parent tree nor the WC commit tree changed —
