@@ -88,6 +88,13 @@ impl DaemonState {
         }
     }
 
+    /// Persist the watcher set to the runtime dir's repos file.
+    fn persist_repos(&self) {
+        if let Some(runtime_dir) = self.cache_dir.parent() {
+            write_repos_file(runtime_dir, &self.watchers);
+        }
+    }
+
     /// Get a watch receiver for a repo's cache updates.
     fn subscribe_cache(&mut self, repo_path: &Path) -> watch::Receiver<u64> {
         self.cache_watch
@@ -108,7 +115,7 @@ const MAX_LOG_SIZE: u64 = 5 * 1024 * 1024;
 /// On binary upgrade, if the new binary's directory version is greater than
 /// the running one's, the runtime directory is cleaned (except logs) before
 /// the new daemon starts.
-pub const DIRECTORY_VERSION: u32 = 1;
+pub const DIRECTORY_VERSION: u32 = 2;
 
 /// Number of recent query durations to keep for percentile stats.
 const TIMING_RING_SIZE: usize = 100;
@@ -252,11 +259,11 @@ pub async fn run_daemon(
         git_worker: Some(git_worker.clone()),
     }));
 
-    // Recover watchers from cache files left by a previous daemon instance.
-    // The shell hook reads cache files directly and only contacts the daemon on
-    // cache miss, so after an exec restart we must proactively re-watch all repos
-    // that have cached entries — otherwise working copy changes go undetected.
-    recover_watchers_from_cache(&cache_dir, &state, &watch_tx).await;
+    // Recover watchers persisted by a previous daemon instance. The shell hook
+    // reads cache files directly and only contacts the daemon on cache miss, so
+    // after an exec restart we must proactively re-watch all known repos —
+    // otherwise working copy changes go undetected.
+    recover_watchers(&runtime_dir, &state, &watch_tx).await;
 
     // Spawn refresh task
     tokio::spawn(refresh_task(state.clone(), watch_rx, jj_worker, git_worker));
@@ -294,6 +301,9 @@ pub async fn run_daemon(
                 st.watchers.remove(path);
                 st.cache.remove(path);
                 st.dir_to_repo.retain(|_, (root, _)| root != path);
+            }
+            if !stale.is_empty() {
+                st.persist_repos();
             }
         }
     });
@@ -512,6 +522,7 @@ async fn handle_connection(
                 {
                     tracing::info!(repo = %repo_path.display(), vcs = ?vcs_kind, "watching repo");
                     st.watchers.insert(repo_path.clone(), watcher);
+                    st.persist_repos();
                 }
 
                 let cached = st.cache.get(&repo_path).map(|(_, f)| f.clone());
@@ -570,7 +581,7 @@ async fn handle_connection(
                     st.stats.cache_hits += 1;
                     record_query_timing(&mut st.stats, query_start.elapsed());
                 }
-                // Ensure the queried directory has a hardlink to the repo root's cache file
+                // Ensure the queried directory has a symlink to the repo root's cache file
                 if query_path != repo_path {
                     link_cache_file(&cd, &repo_path, &query_path);
                 }
@@ -811,47 +822,50 @@ async fn send_response(
     Ok(())
 }
 
-/// Scan the cache directory for files left by a previous daemon instance and
-/// set up watchers for the repos they represent.  Cache file names encode the
-/// directory path (`/` → `%`), so we can decode them back.  Hardlinked
-/// subdirectory entries share an inode with their repo root; we deduplicate by
-/// inode so each repo is watched exactly once.
-async fn recover_watchers_from_cache(
-    cache_dir: &Path,
+/// Name of the persisted watched-repo list inside the runtime directory.
+const REPOS_FILE: &str = "repos";
+
+/// Persist the current watcher set (one absolute repo path per line) so a
+/// restarted daemon can resume watching without depending on cache-file names.
+/// Written atomically; callers hold the state lock, so writes are serialized.
+fn write_repos_file(runtime_dir: &Path, watchers: &HashMap<PathBuf, RepoWatcher>) {
+    let mut contents = String::new();
+    for repo in watchers.keys() {
+        contents.push_str(&repo.to_string_lossy());
+        contents.push('\n');
+    }
+    let path = runtime_dir.join(REPOS_FILE);
+    let tmp = runtime_dir.join(".tmp-repos");
+    if let Err(e) =
+        std::fs::write(&tmp, &contents).and_then(|()| std::fs::rename(&tmp, &path))
+    {
+        tracing::warn!(path = %path.display(), error = %e, "failed to write repos file");
+    }
+}
+
+/// Re-watch the repos a previous daemon instance persisted to the repos file.
+async fn recover_watchers(
+    runtime_dir: &Path,
     state: &Arc<Mutex<DaemonState>>,
     watch_tx: &mpsc::UnboundedSender<WatchEvent>,
 ) {
-    let entries = match std::fs::read_dir(cache_dir) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Ok(contents) = std::fs::read_to_string(runtime_dir.join(REPOS_FILE)) else {
+        return;
     };
 
-    // Deduplicate by inode — hardlinked subdirectory cache entries share the
-    // same inode as the repo root entry.
-    use std::collections::HashSet;
-    use std::os::unix::fs::MetadataExt;
-    let mut seen_inodes = HashSet::new();
     let mut recovered = 0u32;
-
-    for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
+    for line in contents.lines() {
+        if line.is_empty() {
             continue;
-        };
-        if !seen_inodes.insert(meta.ino()) {
-            continue; // hardlink to a repo root we already processed
         }
+        let dir_path = PathBuf::from(line);
 
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        // Decode: `%` → `/`
-        let dir_path = PathBuf::from(name.replace('%', "/"));
-
-        // Only set up a watcher if this path is actually a repo root
+        // Re-validate: the repo may have moved or been deleted since.
         let Some((repo_path, vcs_kind)) = find_repo_root(&dir_path) else {
             continue;
         };
         if repo_path != dir_path {
-            continue; // this cache entry is for a subdirectory, not the root
+            continue;
         }
 
         let mut st = state.lock().await;
@@ -860,7 +874,7 @@ async fn recover_watchers_from_cache(
         }
         match watch_repo(&repo_path, vcs_kind, watch_tx.clone()) {
             Ok(watcher) => {
-                tracing::info!(repo = %repo_path.display(), vcs = ?vcs_kind, "recovered watcher from cache");
+                tracing::info!(repo = %repo_path.display(), vcs = ?vcs_kind, "recovered watcher");
                 st.dir_to_repo
                     .insert(repo_path.clone(), (repo_path.clone(), vcs_kind));
                 st.watchers.insert(repo_path, watcher);
@@ -873,8 +887,10 @@ async fn recover_watchers_from_cache(
     }
 
     if recovered > 0 {
-        tracing::info!(count = recovered, "recovered watchers from previous cache");
+        tracing::info!(count = recovered, "recovered watchers from previous daemon");
     }
+    // Rewrite the file so entries for repos that no longer exist are dropped.
+    state.lock().await.persist_repos();
 }
 
 /// Compute the cache file path for a given directory within a specific cache dir.
@@ -884,37 +900,50 @@ fn cache_file_in(cache_dir: &Path, dir: &Path) -> PathBuf {
     cache_dir.join(name)
 }
 
-/// Write the formatted status to the on-disk cache file for fast client reads.
+/// Write the formatted status to the on-disk cache file for fast shell reads.
 ///
-/// Because subdirectory entries are hardlinked to the repo root file,
-/// we write in-place (not rename) so all hardlinks see the update via the shared inode.
+/// Written to a temp file and renamed into place so a shell hook reading
+/// concurrently always sees a complete status, never a truncated one.
+/// Subdirectory entries are symlinks to this file, so the rename updates
+/// what they resolve to as well. The temp name starts with `.` — encoded
+/// cache names always start with `%`, so it can't collide with an entry.
 fn write_cache_file(cache_dir: &Path, repo_path: &Path, formatted: &str) {
     let file_path = cache_file_in(cache_dir, repo_path);
     if let Some(parent) = file_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(&file_path, formatted) {
+    let tmp_path = match file_path.file_name() {
+        Some(name) => {
+            let mut tmp = std::ffi::OsString::from(".tmp-");
+            tmp.push(name);
+            cache_dir.join(tmp)
+        }
+        None => return,
+    };
+    if let Err(e) = std::fs::write(&tmp_path, formatted)
+        .and_then(|()| std::fs::rename(&tmp_path, &file_path))
+    {
         tracing::warn!(path = %file_path.display(), error = %e, "failed to write cache file");
     }
 }
 
-/// Create a hardlink from a queried subdirectory's cache entry to the repo root's cache file.
-/// Since they share the same inode, future writes to the repo root file update both.
+/// Create a symlink from a queried subdirectory's cache entry to the repo
+/// root's cache file, so shell hooks can look up status by `$PWD`.
 fn link_cache_file(cache_dir: &Path, repo_root: &Path, query_dir: &Path) {
     let root_file = cache_file_in(cache_dir, repo_root);
     let dir_file = cache_file_in(cache_dir, query_dir);
-    if dir_file.exists() {
+    if dir_file.symlink_metadata().is_ok() {
         return; // already linked
     }
     if let Some(parent) = dir_file.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::hard_link(&root_file, &dir_file) {
+    if let Err(e) = std::os::unix::fs::symlink(&root_file, &dir_file) {
         tracing::debug!(
             src = %root_file.display(),
             dst = %dir_file.display(),
             error = %e,
-            "failed to hardlink cache file"
+            "failed to symlink cache file"
         );
     }
 }
@@ -2104,18 +2133,26 @@ mod tests {
             sub_cache.display()
         );
 
-        // They should be hardlinked (same inode)
-        use std::os::unix::fs::MetadataExt;
-        let root_ino = std::fs::metadata(&root_cache).unwrap().ino();
-        let sub_ino = std::fs::metadata(&sub_cache).unwrap().ino();
+        // The subdirectory entry should be a symlink resolving to the root file
+        let sub_meta = sub_cache.symlink_metadata().unwrap();
+        assert!(
+            sub_meta.file_type().is_symlink(),
+            "subdirectory cache entry should be a symlink"
+        );
         assert_eq!(
-            root_ino, sub_ino,
-            "cache files should be hardlinked (same inode)"
+            std::fs::read_link(&sub_cache).unwrap(),
+            root_cache,
+            "symlink should point at the repo root's cache file"
         );
 
         // Content should match and be non-empty
         let content = std::fs::read_to_string(&root_cache).unwrap();
         assert!(!content.is_empty(), "cache file should not be empty");
+        assert_eq!(
+            std::fs::read_to_string(&sub_cache).unwrap(),
+            content,
+            "reading through the symlink should yield the same status"
+        );
 
         let _ = send_request(&socket_path, &Request::Shutdown).await;
         daemon.await.unwrap().unwrap();
