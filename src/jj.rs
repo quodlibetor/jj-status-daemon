@@ -340,11 +340,13 @@ pub struct JjRepoState {
     /// stats must then be rebuilt from the store — watcher events alone
     /// cannot be relied on to repair them.
     commit_tree: jj_lib::merged_tree::MergedTree,
-    /// Whether the WC commit has multiple parents. jj's copy detection runs
-    /// per parent, so under a merge a path that exists in the *merged*
-    /// parent tree can still be a rename target (it is an addition relative
-    /// to the parent that owned the rename source).
-    parent_is_merge: bool,
+    /// The individual parent trees (not the merged tree). jj's copy
+    /// detection runs per parent: under a merge a path that exists in the
+    /// *merged* parent tree can still be a rename target (an addition
+    /// relative to the parent that owned the source), and a source present
+    /// in multiple parents produces duplicate copy records that jj-lib
+    /// discards — both outcomes depend on which parents contain a path.
+    parent_trees: Vec<jj_lib::merged_tree::MergedTree>,
     /// Operation ID at the time this state was built. Tree ID comparison
     /// alone misses A→B→A sequences (e.g. `jj abandon` snapshots a dirty
     /// file into @ and then discards it — both trees end up as they
@@ -834,6 +836,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             // disk — a re-created source turns the target back into a plain
             // file (jj drops the copy pairing at the next snapshot).
             .filter(|src| !state.repo_root.join(src).exists());
+        let had_renamed_from = renamed_from.is_some();
         let parent_lookup = renamed_from.as_deref().unwrap_or(&rel_str);
         let Ok(repo_path_buf) = jj_lib::repo_path::RepoPathBuf::from_relative_path(parent_lookup)
         else {
@@ -882,6 +885,29 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                 diff_result = None;
             }
             _ => {}
+        }
+
+        // A None result (disk content equal to the parent materialization)
+        // may still be a standing zero-line change: when the parent and
+        // WC-commit *values* differ with a conflict involved (conflict
+        // shape change, hunk-resolvable conflict vs resolved file), jj
+        // keeps reporting `file | 0` — equal *text* doesn't heal the value
+        // difference. With both values resolved, equal content means equal
+        // values, and None correctly heals the entry.
+        if diff_result.is_none()
+            && !had_renamed_from
+            && disk_content.is_some()
+            && let (Ok(parent_value), Ok(commit_value)) = (
+                state.parent_tree.path_value(&repo_path_buf),
+                state.commit_tree.path_value(&repo_path_buf),
+            )
+            && parent_value != commit_value
+            && (!parent_value.is_resolved() || !commit_value.is_resolved())
+        {
+            diff_result = Some(FileDiffStats {
+                kind: FileChangeKind::Modified,
+                ..Default::default()
+            });
         }
 
         // Events on a recorded rename *source* (some target maps back to
@@ -956,7 +982,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             continue;
         }
         let eligible = stats.kind == FileChangeKind::Added
-            || (stats.kind == FileChangeKind::Modified && state.parent_is_merge);
+            || (stats.kind == FileChangeKind::Modified && state.parent_trees.len() > 1);
         if !eligible {
             continue;
         }
@@ -1004,6 +1030,34 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                 continue;
             };
             let (target_idx, target_disk) = candidates.swap_remove(ci);
+
+            // jj-lib discards duplicate copy records: when the source
+            // exists in multiple parents, each per-parent detection emits a
+            // record for the same target and `CopyRecords::add_records`
+            // poisons both maps (copies.rs). The target then loses its
+            // origin (plain add), while the source's delete entry is STILL
+            // skipped by the stream's `has_source` check — so the deletion
+            // silently vanishes from the stat. Mirror that quirk.
+            let record_parents = state
+                .parent_trees
+                .iter()
+                .filter(|tree| {
+                    let source_present = tree
+                        .path_value(&source_path)
+                        .is_ok_and(|value| !value.is_absent());
+                    let target_absent =
+                        jj_lib::repo_path::RepoPathBuf::from_relative_path(&staged[target_idx].0)
+                            .ok()
+                            .and_then(|path| tree.path_value(&path).ok())
+                            .is_none_or(|value| value.is_absent());
+                    source_present && target_absent
+                })
+                .count();
+            if record_parents >= 2 {
+                staged[source_idx].1 = None;
+                continue;
+            }
+
             let mut stats = diff_single_file(
                 &state.store,
                 &state.parent_tree,
@@ -1577,14 +1631,20 @@ async fn compute_jj_full_status(
 
     let commit_tree = current_tree.clone();
     let retained_parent_tree = parent_tree.unwrap_or(current_tree);
-    let parent_is_merge = loaded.commit.parent_ids().len() > 1;
+    // Individual parent trees for per-parent copy-detection decisions
+    // (Commit::tree() is a cheap lazy constructor). Failures degrade to
+    // "no per-parent knowledge" — single-parent behavior.
+    let parent_trees = match loaded.commit.parents().await {
+        Ok(parents) => parents.iter().map(|p| p.tree()).collect(),
+        Err(_) => Vec::new(),
+    };
 
     let jj_state = JjRepoState {
         store: loaded.repo.store().clone(),
         parent_tree_ids: retained_parent_tree.tree_ids().clone(),
         parent_tree: retained_parent_tree,
         commit_tree,
-        parent_is_merge,
+        parent_trees,
         op_id: loaded.repo.op_id().clone(),
         conflict_marker_style,
         ignore_filter: crate::watcher::IgnoreFilter::new(&repo_root, crate::protocol::VcsKind::Jj),
