@@ -1,7 +1,48 @@
 # Unreleased
 
 jj incremental diff engine overhaul: exact `jj diff --stat` parity and
-self-healing after watcher event loss.
+self-healing after watcher event loss. Plus a performance sweep across the
+daemon, both VCS backends, and the client.
+
+**Performance**
+- **one refresh per VCS operation**: duplicate filesystem watches on VCS
+  internals have been removed and refreshes are debounced (50ms), so a single
+  `git commit`/`jj` op triggers one refresh instead of up to six back-to-back
+  full refreshes. Client-triggered first scans skip the debounce.
+- **first scan of a repo is no longer wasted**: cache-miss scans now run
+  through the VCS workers, so their diff state is retained (the next change
+  can refresh incrementally instead of rescanning) and concurrent prompts in
+  a not-yet-cached repo share one scan instead of each launching their own.
+- **slow repos no longer block fast ones**: each repo gets its own worker
+  thread, so a 30s+ full refresh in a huge repo can't delay incremental
+  updates (or `vcs-status-daemon status`) for other repos. Worker state for
+  deleted repos is reclaimed instead of leaking.
+- **faster jj refreshes**: file contents are diffed with buffered concurrency
+  (matching jj's own pipeline) instead of one file at a time; bookmark
+  tracking status is computed only for displayed bookmarks instead of every
+  remote bookmark; the workspace/store caches are reused across refreshes;
+  jj config files are no longer re-parsed twice per refresh.
+- **faster git refreshes**: per-file diff stats no longer format a full
+  textual patch (or allocate per diff line); the second whole-worktree scan
+  is skipped when nothing is staged; ahead/behind counts are memoized.
+- **cheaper renders**: status templates are compiled once (rebuilt on config
+  reload) instead of recompiled on every render (~650µs → ~15µs).
+- **leaner prompt hot path**: the client no longer loads and parses the
+  config file on every invocation (the daemon publishes its query timeout to
+  the runtime dir), and daemon autostart returns as soon as the socket is
+  listening instead of always sleeping 200ms.
+
+**Cache & daemon behavior**
+- **no more torn cache reads**: cache files are written atomically (temp file
+  + rename), so a shell hook reading mid-update can no longer see an empty or
+  truncated prompt segment. Subdirectory cache entries are now symlinks to
+  the repo root's file (previously hardlinks).
+- **watcher recovery**: the daemon persists its watched-repo list to
+  `<runtime_dir>/repos` and recovers from that after a restart, instead of
+  decoding cache file names.
+- **runtime directory layout version bumped**: upgrading from an older daemon
+  cleans the runtime dir once (logs are kept), so expect a one-time cold
+  cache after this release.
 
 **Correctness (jj diff stats)**
 - **self-healing on every jj operation**: `ValidateAndRefresh` now compares the
