@@ -18,6 +18,7 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 use crate::config::Config;
 use crate::jj::{JjWorkerRequest, spawn_jj_worker};
@@ -136,6 +137,48 @@ pub enum Action {
     /// Lossy mode only: drop all not-yet-delivered file events, simulating
     /// FSEvents queue overflow. In Perfect mode this is skipped.
     DropPendingEvents,
+    /// chmod +x / -x on a pool file (no-op if absent). jj counts an
+    /// exec-bit-only change as one changed file with 0 line changes
+    /// (`file | 0`).
+    SetExecBit {
+        file: usize,
+        on: bool,
+    },
+    /// Create the second workspace (`jj workspace add --name second`) in its
+    /// own TempDir. No-op if it already exists.
+    WorkspaceAdd,
+    /// Write a file in the SECOND workspace and snapshot it there — an
+    /// operation foreign to the watched workspace (op_heads change, no
+    /// watched-disk change). If the second workspace is stale, recover it
+    /// first (`jj workspace update-stale`) like a user would.
+    WorkspaceOp {
+        file: usize,
+        lines: u8,
+        seed: u8,
+    },
+    /// From the WATCHED workspace, rewrite the second workspace's @ with a
+    /// tree change (`jj restore --from @ --into second@ -- <file>`). Leaves
+    /// the OTHER workspace stale; ours stays healthy (same-workspace
+    /// commands always update their own checkout). Describe-only rewrites
+    /// would NOT stale it: jj auto-heals when the wc-commit tree is
+    /// unchanged.
+    RewriteOtherWsAncestor {
+        file: usize,
+    },
+    /// From the SECOND workspace, rewrite a mutable commit on the watched
+    /// @'s line (possibly watched @ itself) with a tree change — makes the
+    /// WATCHED workspace stale. Runs with --ignore-working-copy so it works
+    /// even when the second workspace is itself stale.
+    RewriteWatchedWsAncestor {
+        file: usize,
+        nth: u8,
+    },
+    /// `jj workspace update-stale` in the watched workspace: snapshots +
+    /// checks out, rewriting disk files with no user edit. Safe no-op when
+    /// healthy ("Attempted recovery, but the working copy is not stale").
+    WorkspaceUpdateStale,
+    /// Forget the SECOND workspace (never the watched one). No-op if absent.
+    WorkspaceForget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +218,16 @@ fn safe_action() -> impl Strategy<Value = Action> {
             .prop_map(|(file, lines, seed)| Action::RemoteCommit { file, lines, seed }),
         2 => Just(Action::JjGitFetch),
         1 => Just(Action::JjNewOnRemote),
+        2 => (0..FILE_POOL.len(), any::<bool>())
+            .prop_map(|(file, on)| Action::SetExecBit { file, on }),
+        2 => Just(Action::WorkspaceAdd),
+        2 => (0..FILE_POOL.len(), 1..6u8, any::<u8>())
+            .prop_map(|(file, lines, seed)| Action::WorkspaceOp { file, lines, seed }),
+        1 => (0..FILE_POOL.len()).prop_map(|file| Action::RewriteOtherWsAncestor { file }),
+        2 => (0..FILE_POOL.len(), 0..6u8)
+            .prop_map(|(file, nth)| Action::RewriteWatchedWsAncestor { file, nth }),
+        2 => Just(Action::WorkspaceUpdateStale),
+        1 => Just(Action::WorkspaceForget),
     ]
 }
 
@@ -201,8 +254,17 @@ fn seeded_content(file: usize, lines: u8, seed: u8) -> String {
         .collect()
 }
 
-/// Snapshot of working-copy file contents (excluding VCS dirs).
-type DiskMirror = HashMap<PathBuf, Vec<u8>>;
+/// Snapshot of working-copy file state (excluding VCS dirs): exec bit +
+/// content. The exec bit is part of the state so a chmod produces a watcher
+/// event, exactly as FSEvents reports metadata-only changes.
+type DiskMirror = HashMap<PathBuf, (bool, Vec<u8>)>;
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
 
 fn read_mirror(root: &Path) -> DiskMirror {
     let mut mirror = HashMap::new();
@@ -220,18 +282,19 @@ fn read_mirror(root: &Path) -> DiskMirror {
             if path.is_dir() {
                 stack.push(path);
             } else if let Ok(content) = std::fs::read(&path) {
-                mirror.insert(path, content);
+                mirror.insert(path.clone(), (is_executable(&path), content));
             }
         }
     }
     mirror
 }
 
-/// Paths whose content differs between two mirrors (added, removed, changed).
+/// Paths whose state differs between two mirrors (added, removed, changed
+/// content or exec bit).
 fn changed_paths(before: &DiskMirror, after: &DiskMirror) -> Vec<PathBuf> {
     let mut changed = Vec::new();
-    for (path, content) in after {
-        if before.get(path) != Some(content) {
+    for (path, state) in after {
+        if before.get(path) != Some(state) {
             changed.push(path.clone());
         }
     }
@@ -242,6 +305,13 @@ fn changed_paths(before: &DiskMirror, after: &DiskMirror) -> Vec<PathBuf> {
     }
     changed.sort();
     changed
+}
+
+/// The second workspace of the harness repo: dropping the TempDir removes
+/// the directory (after `jj workspace forget`, or at sequence end).
+struct SecondWorkspace {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
 }
 
 struct Harness {
@@ -259,6 +329,14 @@ struct Harness {
     /// Side git repo registered as the `origin` remote; RemoteCommit writes
     /// to its `main` branch, JjGitFetch imports it.
     remote: tempfile::TempDir,
+    /// Second workspace ("second") of the same repo, if created.
+    second_ws: Option<SecondWorkspace>,
+    /// Whether the WATCHED workspace is stale (its wc-commit tree was
+    /// rewritten from the second workspace). While stale, jj refuses to
+    /// snapshot in the watched dir — `jj diff` errors — so oracle checks are
+    /// skipped; parity is required again once `workspace update-stale`
+    /// resolves. Maintained by probing after second-workspace mutations.
+    watched_stale: bool,
     /// Log of executed steps, printed on failure for diagnosis.
     log: Vec<String>,
 }
@@ -300,6 +378,8 @@ impl Harness {
             drop_next_sync: false,
             delivery,
             remote,
+            second_ws: None,
+            watched_stale: false,
             log: Vec::new(),
         };
         let remote_path = h.remote.path().to_str().unwrap().to_string();
@@ -347,17 +427,27 @@ impl Harness {
     }
 
     fn jj(&mut self, args: &[&str]) -> bool {
-        // ui.editor=false: any action that unexpectedly needs an editor
+        let root = self.root.clone();
+        self.jj_in(&root, args)
+    }
+
+    /// Like `jj` but in an explicit workspace directory (`[second]` marks
+    /// second-workspace commands in the log).
+    fn jj_in(&mut self, dir: &Path, args: &[&str]) -> bool {
+        // ui.editor="false": any action that unexpectedly needs an editor
         // fails fast (treated as a no-op) instead of hanging the campaign.
+        // The value must be quoted — a bare `false` parses as a TOML boolean,
+        // which jj >= 0.42 rejects for ui.editor, failing every command.
         let output = Command::new("jj")
-            .args(["--config", "ui.editor=false"])
+            .args(["--config", r#"ui.editor="false""#])
             .args(args)
-            .current_dir(&self.root)
+            .current_dir(dir)
             .output()
             .expect("failed to spawn jj");
         let ok = output.status.success();
         self.log.push(format!(
-            "jj {:?} -> {}{}",
+            "jj{} {:?} -> {}{}",
+            if dir == self.root { "" } else { " [second]" },
             args,
             if ok { "ok" } else { "FAILED" },
             if ok {
@@ -369,20 +459,82 @@ impl Harness {
         ok
     }
 
-    fn jj_stdout(&self, args: &[&str]) -> String {
+    /// Tolerant stdout capture in an explicit directory: `None` on failure
+    /// (e.g. a stale workspace) instead of asserting like `jj_stdout`.
+    fn jj_stdout_in(&mut self, dir: &Path, args: &[&str]) -> Option<String> {
         let output = Command::new("jj")
-            .args(["--config", "ui.editor=false"])
+            .args(["--config", r#"ui.editor="false""#])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to spawn jj");
+        if output.status.success() {
+            Some(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            self.log.push(format!(
+                "jj [second] {:?} -> FAILED: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+            None
+        }
+    }
+
+    /// Re-derive `watched_stale` from jj itself: a snapshotting no-op query
+    /// in the watched dir succeeds iff the workspace is healthy. Called
+    /// after second-workspace mutations (same-workspace commands always
+    /// update their own checkout, so those can't stale us) and before the
+    /// convergence check. Any snapshot op this creates is covered by the
+    /// caller's subsequent op-event delivery.
+    fn probe_watched_stale(&mut self) {
+        let output = Command::new("jj")
+            .args(["--config", r#"ui.editor="false""#])
+            .args(["log", "--no-graph", "-r", "@", "-T", "\"\""])
+            .current_dir(&self.root)
+            .output()
+            .expect("failed to spawn jj");
+        if output.status.success() {
+            self.watched_stale = false;
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("stale"),
+                "watched-workspace probe failed for a non-stale reason: {stderr}\naction log:\n  {}",
+                self.log.join("\n  "),
+            );
+            self.watched_stale = true;
+        }
+        self.log
+            .push(format!("probe watched_stale={}", self.watched_stale));
+    }
+
+    /// Watched-dir stdout capture. Returns `None` — and records the
+    /// staleness — when the command failed because the watched workspace is
+    /// stale: staleness can arrive from second-workspace mutations through
+    /// paths the flag-maintaining probes don't cover (e.g. a snapshot in
+    /// the second workspace rebasing an entangled watched @), so every
+    /// watched-dir query must tolerate it. Any other failure panics.
+    fn jj_stdout(&mut self, args: &[&str]) -> Option<String> {
+        let output = Command::new("jj")
+            .args(["--config", r#"ui.editor="false""#])
             .args(args)
             .current_dir(&self.root)
             .output()
             .expect("failed to spawn jj");
+        if output.status.success() {
+            return Some(String::from_utf8_lossy(&output.stdout).to_string());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            output.status.success(),
-            "jj {:?} failed: {}",
+            stderr.contains("stale"),
+            "jj {:?} failed: {stderr}\naction log:\n  {}",
             args,
-            String::from_utf8_lossy(&output.stderr)
+            self.log.join("\n  "),
         );
-        String::from_utf8_lossy(&output.stdout).to_string()
+        self.watched_stale = true;
+        self.log
+            .push(format!("jj {args:?} -> STALE watched workspace"));
+        None
     }
 
     async fn full_refresh(&mut self) -> RepoStatus {
@@ -453,6 +605,24 @@ impl Harness {
     /// Execute one action. Returns the worker's status if the action
     /// resulted in an event delivery.
     async fn apply(&mut self, action: &Action) -> Option<RepoStatus> {
+        // jj refuses to snapshot in a stale workspace, so watched-dir
+        // actions whose precondition queries use the asserting `jj_stdout`
+        // are skipped up front — the commands themselves would fail as
+        // no-ops anyway (the existing failure-as-noop path).
+        if self.watched_stale
+            && matches!(
+                action,
+                Action::JjSquash
+                    | Action::JjEditPrior { .. }
+                    | Action::JjRebase { .. }
+                    | Action::JjNewMerge { .. }
+                    | Action::SetMarkerStyle { .. }
+            )
+        {
+            self.log
+                .push(format!("skip {action:?}: watched workspace stale"));
+            return None;
+        }
         let abs = |file: &usize| self.root.join(FILE_POOL[*file]);
         match action {
             Action::Write { file, lines, seed } => {
@@ -531,7 +701,7 @@ impl Harness {
                     "@-",
                     "-T",
                     "if(root, \"root\", \"ok\")",
-                ]);
+                ])?;
                 if out.contains("root") {
                     return None;
                 }
@@ -561,7 +731,7 @@ impl Harness {
                     "mutable() ~ @",
                     "-T",
                     "change_id ++ \"\\n\"",
-                ]);
+                ])?;
                 let ids: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
                 if ids.is_empty() {
                     return None;
@@ -616,7 +786,7 @@ impl Harness {
                     "all() ~ @",
                     "-T",
                     "change_id ++ \"\\n\"",
-                ]);
+                ])?;
                 let ids: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
                 if ids.is_empty() {
                     return None;
@@ -633,7 +803,7 @@ impl Harness {
                     "heads(all()) ~ ::@",
                     "-T",
                     "change_id ++ \"\\n\"",
-                ]);
+                ])?;
                 let ids: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
                 if ids.is_empty() {
                     return None;
@@ -645,7 +815,7 @@ impl Harness {
                 // jj does not rematerialize existing on-disk conflicts when
                 // the style changes, so only toggle while @ is conflict-free.
                 let conflicted = !self
-                    .jj_stdout(&["log", "--no-graph", "-r", "@ & conflicts()", "-T", "\"c\""])
+                    .jj_stdout(&["log", "--no-graph", "-r", "@ & conflicts()", "-T", "\"c\""])?
                     .is_empty();
                 if conflicted {
                     self.log
@@ -697,6 +867,156 @@ impl Harness {
                 }
                 None
             }
+            Action::SetExecBit { file, on } => {
+                use std::os::unix::fs::PermissionsExt as _;
+                let path = abs(file);
+                if !path.is_file() {
+                    return None;
+                }
+                let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                let mode = perms.mode();
+                let new_mode = if *on { mode | 0o111 } else { mode & !0o111 };
+                if new_mode == mode {
+                    return None;
+                }
+                perms.set_mode(new_mode);
+                std::fs::set_permissions(&path, perms).unwrap();
+                self.log.push(format!(
+                    "chmod {} {}",
+                    if *on { "+x" } else { "-x" },
+                    FILE_POOL[*file]
+                ));
+                self.sync_mirror();
+                self.deliver_file_events().await
+            }
+            Action::WorkspaceAdd => {
+                if self.second_ws.is_some() {
+                    return None;
+                }
+                let dir = tempfile::TempDir::with_prefix("jj-second-ws-").unwrap();
+                let root = dir.path().join("second");
+                let root_str = root.to_str().unwrap().to_string();
+                if !self.jj(&["workspace", "add", "--name", "second", &root_str]) {
+                    return None;
+                }
+                let root = root.canonicalize().unwrap_or(root);
+                self.second_ws = Some(SecondWorkspace { _dir: dir, root });
+                self.sync_mirror();
+                Some(self.deliver_op_event().await)
+            }
+            Action::WorkspaceOp { file, lines, seed } => {
+                let ws_root = self.second_ws.as_ref().map(|w| w.root.clone())?;
+                let path = ws_root.join(FILE_POOL[*file]);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::write(&path, seeded_content(*file, *lines, *seed)).unwrap();
+                self.log.push(format!(
+                    "workspace-op write {} in second ({lines} lines, seed {seed})",
+                    FILE_POOL[*file]
+                ));
+                // Snapshot in the second workspace — the foreign operation.
+                // If that workspace is stale (a watched-side action rewrote
+                // its @), recover it first like a user would.
+                let ok = self.jj_in(&ws_root, &["status"])
+                    || (self.jj_in(&ws_root, &["workspace", "update-stale"])
+                        && self.jj_in(&ws_root, &["status"]));
+                if !ok {
+                    return None;
+                }
+                // Even a snapshot in the second workspace can stale the
+                // watched one: when the watched @ is a descendant of second@
+                // (via JjRebase/JjNewMerge onto it), amending second@
+                // auto-rebases the watched wc commit with a tree change.
+                self.probe_watched_stale();
+                self.sync_mirror();
+                Some(self.deliver_op_event().await)
+            }
+            Action::RewriteOtherWsAncestor { file } => {
+                self.second_ws.as_ref()?;
+                // Tree-changing rewrite of the second workspace's @ from the
+                // watched workspace. The watched side stays healthy —
+                // same-workspace commands always update their own checkout —
+                // while the second workspace goes stale (unless the restore
+                // was "Nothing changed").
+                self.run_jj_op(&[
+                    "restore",
+                    "--from",
+                    "@",
+                    "--into",
+                    "second@",
+                    "--",
+                    FILE_POOL[*file],
+                ])
+                .await
+            }
+            Action::RewriteWatchedWsAncestor { file, nth } => {
+                let ws_root = self.second_ws.as_ref().map(|w| w.root.clone())?;
+                // Candidates: mutable commits on the watched line, excluding
+                // the second workspace's own ancestry (usually `default@`
+                // plus watched-side stack). --ignore-working-copy keeps both
+                // the query and the rewrite working when second is stale.
+                let out = self.jj_stdout_in(
+                    &ws_root,
+                    &[
+                        "--ignore-working-copy",
+                        "log",
+                        "--no-graph",
+                        "-r",
+                        "(mutable() & ::default@) ~ ::@",
+                        "-T",
+                        "change_id ++ \"\\n\"",
+                    ],
+                )?;
+                let ids: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+                if ids.is_empty() {
+                    return None;
+                }
+                let id = ids[*nth as usize % ids.len()].to_string();
+                if !self.jj_in(
+                    &ws_root,
+                    &[
+                        "--ignore-working-copy",
+                        "restore",
+                        "--from",
+                        "@",
+                        "--into",
+                        &id,
+                        "--",
+                        FILE_POOL[*file],
+                    ],
+                ) {
+                    return None;
+                }
+                // Staleness only arises when the watched wc-commit *tree*
+                // actually changed (identical-content restores are "Nothing
+                // changed"; jj auto-heals tree-preserving rewrites) — let jj
+                // itself be the authority.
+                self.probe_watched_stale();
+                self.sync_mirror();
+                Some(self.deliver_op_event().await)
+            }
+            Action::WorkspaceUpdateStale => {
+                // Runs unconditionally: recovery in a healthy workspace is a
+                // no-op with exit 0 ("Attempted recovery, but the working
+                // copy is not stale").
+                if !self.jj(&["workspace", "update-stale"]) {
+                    return None;
+                }
+                self.watched_stale = false;
+                // update-stale rewrites disk files (checkout, no user edit).
+                self.sync_mirror();
+                Some(self.deliver_op_event().await)
+            }
+            Action::WorkspaceForget => {
+                self.second_ws.as_ref()?;
+                let status = self.run_jj_op(&["workspace", "forget", "second"]).await;
+                if status.is_some() {
+                    // TempDir drop removes the on-disk workspace.
+                    self.second_ws = None;
+                }
+                status
+            }
         }
     }
 
@@ -718,7 +1038,12 @@ impl Harness {
     /// deliver that op event afterwards so the worker stays in sync, exactly
     /// as the real watcher would observe it.
     async fn check_oracle(&mut self, worker_status: &RepoStatus) -> Result<(), String> {
-        let stat = self.jj_stdout(&["diff", "--stat"]);
+        let Some(stat) = self.jj_stdout(&["diff", "--stat"]) else {
+            // The oracle itself hit the stale error: the watched workspace
+            // went stale under us (jj_stdout has recorded it). Parity is
+            // deferred to the forced update-stale + convergence check.
+            return Ok(());
+        };
         let (files, added, removed) = parse_diff_stat_summary(&stat);
         let got = (
             worker_status.file_mad_count_working_tree,
@@ -759,11 +1084,32 @@ async fn run_sequence(actions: &[Action], delivery: Delivery) -> Result<(), Stri
 
     for action in actions {
         let status = h.apply(action).await;
+        // While the watched workspace is stale, `jj diff` itself errors
+        // ("The working copy is stale") — there is no oracle to compare
+        // against, so parity is deferred to the update-stale recovery.
         if delivery == Delivery::Perfect
+            && !h.watched_stale
             && let Some(status) = status
         {
             h.check_oracle(&status).await?;
         }
+    }
+
+    // A sequence may end inside a stale window (a second-workspace
+    // mutation rewrote the watched @). Probe definitively — the flag can
+    // lag when the very last staleness-inducing op had no watched-dir
+    // follow-up — then force the recovery the staleness contract is
+    // defined around: parity MUST hold once `workspace update-stale`
+    // resolves, which the convergence check below then verifies.
+    h.drop_next_sync = false;
+    h.probe_watched_stale();
+    if h.watched_stale {
+        let status = h.apply(&Action::WorkspaceUpdateStale).await;
+        assert!(
+            status.is_some() && !h.watched_stale,
+            "workspace update-stale failed to recover the watched workspace:\n  {}",
+            h.log.join("\n  ")
+        );
     }
 
     // Convergence check. Run a jj operation and deliver its op event — in
@@ -772,21 +1118,53 @@ async fn run_sequence(actions: &[Action], delivery: Delivery) -> Result<(), Stri
     // used (not `status`) because it always writes a new operation: a
     // no-op snapshot advances nothing, and the healing contract is "the
     // next *operation*", which is also what produces a watcher event.
-    h.drop_next_sync = false;
-    h.jj(&["describe", "-m", "convergence-check"]);
+    // The healing contract depends on this operation actually happening — a
+    // silent failure here (e.g. a config error) makes the whole lossy
+    // property vacuous, so fail loudly instead of no-opping.
+    assert!(
+        h.jj(&["describe", "-m", "convergence-check"]),
+        "convergence-check describe failed: {}",
+        h.log.last().map(String::as_str).unwrap_or("")
+    );
     h.sync_mirror();
     let status = h.deliver_op_event().await;
     h.check_oracle(&status).await?;
     Ok(())
 }
 
+/// The case currently executing, for the `DIFF_PROP_FAILURE_FILE` hook.
+static CURRENT_CASE: Mutex<String> = Mutex::new(String::new());
+
 fn run_case(actions: Vec<Action>, delivery: Delivery) -> Result<(), TestCaseError> {
+    // Soak-campaign diagnostic: when `DIFF_PROP_FAILURE_FILE` is set, write
+    // the failing case (oracle mismatch or panic, wherever it fires) to that
+    // file. Long background runs routinely lose captured test output, and a
+    // panic mid-shrink otherwise leaves nothing to replay.
+    if let Ok(path) = std::env::var("DIFF_PROP_FAILURE_FILE") {
+        *CURRENT_CASE.lock().unwrap() = format!("delivery={delivery:?}\nactions={actions:#?}");
+        static HOOK: std::sync::Once = std::sync::Once::new();
+        HOOK.call_once(move || {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let case = CURRENT_CASE.lock().unwrap();
+                let _ = std::fs::write(&path, format!("PANIC: {info}\n\n{case}"));
+                prev(info);
+            }));
+        });
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    rt.block_on(run_sequence(&actions, delivery))
-        .map_err(TestCaseError::fail)
+    rt.block_on(run_sequence(&actions, delivery)).map_err(|e| {
+        if let Ok(path) = std::env::var("DIFF_PROP_FAILURE_FILE") {
+            let _ = std::fs::write(
+                &path,
+                format!("delivery={delivery:?}\nactions={actions:#?}\n\n{e}"),
+            );
+        }
+        TestCaseError::fail(e)
+    })
 }
 
 /// Sequence length range; `DIFF_PROP_SEQ_LEN` sets the upper bound
@@ -894,6 +1272,975 @@ mod regressions {
         );
     }
 
+    /// Soak-found (flaky at soak volume; deterministic replay pins it):
+    /// fetch/new-on-remote/undo churn, then append + rename. The failing
+    /// runs reported the rename as an unpaired delete+add with a stale
+    /// pre-append base for the source file.
+    #[test]
+    fn soak_fetch_undo_then_rename_after_append() {
+        replay(
+            &[
+                Action::Write {
+                    file: 5,
+                    lines: 2,
+                    seed: 10,
+                },
+                Action::JjGitFetch,
+                Action::JjNew,
+                Action::JjNewOnRemote,
+                Action::JjUndo,
+                Action::Append {
+                    file: 5,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::RenameFile { from: 5, to: 0 },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-found companion case: squash + gitignore flip + fetch, then an
+    /// in-place edit, then undo.
+    #[test]
+    fn soak_squash_gitignore_fetch_touch_undo() {
+        replay(
+            &[
+                Action::Write {
+                    file: 3,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjSquash,
+                Action::WriteGitignore { variant: 1 },
+                Action::JjGitFetch,
+                Action::Touch {
+                    file: 3,
+                    line: 0,
+                    seed: 0,
+                },
+                Action::JjUndo,
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-found: rename a file, then re-create the source with content
+    /// identical to the snapshotted version. The re-created source
+    /// invalidates the rename premise — the target must revert to a pure
+    /// add (jj shows `a.txt | 1 +`, source unchanged), not stay paired as
+    /// a zero-diff rename.
+    #[test]
+    fn soak2_rename_then_recreate_source() {
+        replay(
+            &[
+                Action::Write {
+                    file: 5,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjNew,
+                Action::RenameFile { from: 5, to: 0 },
+                Action::Write {
+                    file: 5,
+                    lines: 1,
+                    seed: 0,
+                },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-found: zero-diff directory move split into delete+add after
+    /// abandon → undo churn on top of a merge (jj shows
+    /// `{dir => dir2}/c.txt | 0`).
+    #[test]
+    fn soak2_movedir_after_merge_abandon_undo() {
+        replay(
+            &[
+                Action::Write {
+                    file: 2,
+                    lines: 1,
+                    seed: 45,
+                },
+                Action::JjGitFetch,
+                Action::JjNewOnRemote,
+                Action::JjNewMerge { nth: 1 },
+                Action::Write {
+                    file: 5,
+                    lines: 5,
+                    seed: 40,
+                },
+                Action::MoveDir,
+                Action::JjAbandon,
+                Action::JjUndo,
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-found (lossy): edits on both sides of a merge parent — the
+    /// worker must diff against the conflict-materialized merged parent
+    /// content like jj does (jj reported +4/-4, worker +1/-1).
+    #[test]
+    fn soak2_merge_conflicted_parent_touch() {
+        replay(
+            &[
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjGitFetch,
+                Action::JjNewOnRemote,
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 1,
+                },
+                Action::JjNewMerge { nth: 0 },
+                Action::JjNewMerge { nth: 0 },
+                Action::Touch {
+                    file: 0,
+                    line: 6,
+                    seed: 0,
+                },
+            ],
+            Delivery::Lossy,
+        );
+    }
+
+    /// Soak-3 (lossy): a file whose tree value changed but whose contents
+    /// diff to zero lines must still count as one changed file (jj shows
+    /// `dir/sub/d.txt | 0` alongside the conflicted `a.txt | 8 ++++----`).
+    #[test]
+    fn soak3_zero_line_change_still_counts_file() {
+        replay(
+            &[
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjGitFetch,
+                Action::JjNewOnRemote,
+                Action::Write {
+                    file: 3,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 1,
+                },
+                Action::JjRebase { nth: 7 },
+                Action::JjNewMerge { nth: 0 },
+                Action::JjNewOnRemote,
+                Action::Write {
+                    file: 3,
+                    lines: 1,
+                    seed: 1,
+                },
+                Action::JjNewMerge { nth: 0 },
+                Action::Touch {
+                    file: 0,
+                    line: 6,
+                    seed: 0,
+                },
+            ],
+            Delivery::Lossy,
+        );
+    }
+
+    /// Soak-3: rename ONTO a path that already exists in the parent tree
+    /// (arrived via a fetched merge side). jj pairs it as a rename and the
+    /// old target baseline vanishes: `{e.rs => dir/sub/d.txt} | 0`.
+    #[test]
+    fn soak3_rename_onto_existing_path() {
+        replay(
+            &[
+                Action::RemoteCommit {
+                    file: 3,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Write {
+                    file: 4,
+                    lines: 9,
+                    seed: 128,
+                },
+                Action::JjNew,
+                Action::JjGitFetch,
+                Action::JjNewMerge { nth: 1 },
+                Action::RenameFile { from: 4, to: 3 },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-3 (inverted): move of a file whose snapshotted content shares
+    /// nothing with its parent-tree content. jj's copy detection compares
+    /// the *diff endpoints* (source@parent vs target@wc) and does NOT pair
+    /// dissimilar content: `dir/c.txt | 1 -` + `dir2/c.txt | 1 +`.
+    #[test]
+    fn soak3_movedir_dissimilar_content_not_paired() {
+        replay(
+            &[
+                Action::Write {
+                    file: 2,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjNew,
+                Action::Write {
+                    file: 2,
+                    lines: 1,
+                    seed: 1,
+                },
+                Action::MoveDir,
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-14: a paired directory move followed by `jj restore` of the
+    /// source. The restored source is unmodified vs the *merged* parent but
+    /// a Modification vs one individual parent, so gix keeps the pairing as
+    /// a COPY record: jj shows `{dir => dir2}/c.txt | 0`. The worker voided
+    /// the pairing on source visibility and reported a plain add (+4).
+    #[test]
+    fn soak14_restored_source_keeps_pairing_as_copy() {
+        replay(
+            &[
+                Action::RemoteCommit {
+                    file: 2,
+                    lines: 4,
+                    seed: 252,
+                },
+                Action::JjGitFetch,
+                Action::JjNewOnRemote,
+                Action::Write {
+                    file: 2,
+                    lines: 4,
+                    seed: 176,
+                },
+                Action::WorkspaceAdd,
+                Action::JjNewOnRemote,
+                Action::WorkspaceOp {
+                    file: 5,
+                    lines: 3,
+                    seed: 224,
+                },
+                Action::WorkspaceForget,
+                Action::JjNew,
+                Action::JjNew,
+                Action::JjNew,
+                Action::JjNewOnRemote,
+                Action::JjNewMerge { nth: 2 },
+                Action::WorkspaceAdd,
+                Action::JjNewOnRemote,
+                Action::JjNewMerge { nth: 0 },
+                Action::MoveDir,
+                Action::JjRestoreFile { file: 2 },
+                Action::JjEditPrior { nth: 4 },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-13 F1: soak12's poison scenario plus deleting the poisoned
+    /// target. With the add gone, gix finds no records at the next diff and
+    /// the previously-dropped source delete resurfaces: jj shows
+    /// `dir/sub/d.txt | 1 -`; the worker saw nothing.
+    #[test]
+    fn soak13_poisoned_delete_resurfaces_when_target_deleted() {
+        replay(
+            &[
+                Action::RemoteCommit {
+                    file: 3,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Append {
+                    file: 0,
+                    lines: 1,
+                    seed: 244,
+                },
+                Action::Write {
+                    file: 5,
+                    lines: 5,
+                    seed: 61,
+                },
+                Action::JjGitFetch,
+                Action::JjNewOnRemote,
+                Action::WorkspaceAdd,
+                Action::JjNewMerge { nth: 0 },
+                Action::RenameFile { from: 3, to: 4 },
+                Action::Delete { file: 4 },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-13 F2: a conflicted file renamed onto another path, then
+    /// `ui.conflict-marker-style` flips to git before the next op. jj's
+    /// stat recomputes marker-text line counts with the CURRENT style;
+    /// base entries baked at rebuild time with the old style must be
+    /// re-derived (jj: `a.txt | 8 +++++++-` + `e.rs | 6 ------`).
+    #[test]
+    fn soak13_marker_style_change_rederives_base_entries() {
+        replay(
+            &[
+                Action::Write {
+                    file: 4,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::RemoteCommit {
+                    file: 4,
+                    lines: 1,
+                    seed: 1,
+                },
+                Action::JjGitFetch,
+                Action::JjNewMerge { nth: 0 },
+                Action::RenameFile { from: 4, to: 0 },
+                Action::SetMarkerStyle { style: 2 },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-12: merge with a freshly added workspace's WC as the second
+    /// parent, then a rename whose source exists in both parents. jj's
+    /// duplicate-record poisoning shows the target as a plain add with the
+    /// delete dropped (`e.rs | 1 +` only); the worker paired it as a
+    /// zero-line rename.
+    #[test]
+    fn soak12_rename_after_workspace_merge_poisons() {
+        replay(
+            &[
+                Action::RemoteCommit {
+                    file: 3,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Append {
+                    file: 0,
+                    lines: 1,
+                    seed: 122,
+                },
+                Action::Write {
+                    file: 5,
+                    lines: 5,
+                    seed: 61,
+                },
+                Action::JjGitFetch,
+                Action::JjNewOnRemote,
+                Action::WorkspaceAdd,
+                Action::JjNewMerge { nth: 0 },
+                Action::RenameFile { from: 3, to: 4 },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-11: heavy split/merge/rebase churn, then `rename b.txt -> x.log`
+    /// where the target path exists (conflicted) in the merged parent. jj
+    /// pairs `{b.txt => x.log} | 0`; the worker reported two unpaired files
+    /// with conflict-materialization-sized counts.
+    #[test]
+    fn soak11_rename_onto_conflicted_path_pairs() {
+        replay(
+            &[
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Write {
+                    file: 1,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::RemoteCommit {
+                    file: 2,
+                    lines: 1,
+                    seed: 1,
+                },
+                Action::JjNewMerge { nth: 0 },
+                Action::JjNewOnRemote,
+                Action::JjSplit { file: 2 },
+                Action::JjRebase { nth: 3 },
+                Action::RemoteCommit {
+                    file: 5,
+                    lines: 5,
+                    seed: 164,
+                },
+                Action::JjNewMerge { nth: 3 },
+                Action::JjSplit { file: 1 },
+                Action::JjSplit { file: 2 },
+                Action::JjSplit { file: 5 },
+                Action::Write {
+                    file: 2,
+                    lines: 5,
+                    seed: 92,
+                },
+                Action::JjNewOnRemote,
+                Action::JjEditPrior { nth: 0 },
+                Action::JjNew,
+                Action::JjNewMerge { nth: 1 },
+                Action::JjEditPrior { nth: 4 },
+                Action::JjUndo,
+                Action::Write {
+                    file: 5,
+                    lines: 9,
+                    seed: 250,
+                },
+                Action::Write {
+                    file: 0,
+                    lines: 3,
+                    seed: 43,
+                },
+                Action::JjGitFetch,
+                Action::RenameFile { from: 1, to: 3 },
+                Action::JjNew,
+                Action::Append {
+                    file: 5,
+                    lines: 1,
+                    seed: 230,
+                },
+                Action::Write {
+                    file: 0,
+                    lines: 8,
+                    seed: 105,
+                },
+                Action::JjRebase { nth: 1 },
+                Action::RemoteCommit {
+                    file: 5,
+                    lines: 2,
+                    seed: 82,
+                },
+                Action::JjEditPrior { nth: 5 },
+                Action::JjNewMerge { nth: 2 },
+                Action::JjGitFetch,
+                Action::Append {
+                    file: 1,
+                    lines: 4,
+                    seed: 50,
+                },
+                Action::JjNewMerge { nth: 3 },
+                Action::RenameFile { from: 1, to: 5 },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-10: triple-merge churn, then a touch inside a conflicted file.
+    /// jj shows only `dir/sub/d.txt | 2 +-`; the worker reported one extra
+    /// (phantom) file.
+    #[test]
+    fn soak10_touch_in_conflict_after_triple_merge_no_phantom() {
+        replay(
+            &[
+                Action::JjNew,
+                Action::Write {
+                    file: 3,
+                    lines: 3,
+                    seed: 0,
+                },
+                Action::JjEditPrior { nth: 0 },
+                Action::JjUndo,
+                Action::Write {
+                    file: 5,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::RemoteCommit {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjDescribe { seed: 167 },
+                Action::JjNew,
+                Action::Append {
+                    file: 5,
+                    lines: 1,
+                    seed: 230,
+                },
+                Action::JjRebase { nth: 1 },
+                Action::RemoteCommit {
+                    file: 5,
+                    lines: 2,
+                    seed: 82,
+                },
+                Action::JjEditPrior { nth: 5 },
+                Action::JjNewMerge { nth: 2 },
+                Action::JjGitFetch,
+                Action::JjNewMerge { nth: 2 },
+                Action::Write {
+                    file: 3,
+                    lines: 1,
+                    seed: 38,
+                },
+                Action::JjNewMerge { nth: 3 },
+                Action::Touch {
+                    file: 3,
+                    line: 51,
+                    seed: 78,
+                },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-9: double-merge/split churn leaves a.txt with a parent-vs-WC
+    /// *value* difference whose contents diff to zero lines; jj reports
+    /// `a.txt | 0` alongside the ordinary d.txt edit, the worker missed
+    /// the zero-line file.
+    #[test]
+    fn soak9_zero_line_file_alongside_edit_after_double_merge() {
+        replay(
+            &[
+                Action::RemoteCommit {
+                    file: 3,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Write {
+                    file: 3,
+                    lines: 1,
+                    seed: 1,
+                },
+                Action::JjGitFetch,
+                Action::JjNewMerge { nth: 0 },
+                Action::JjNewMerge { nth: 0 },
+                Action::JjSplit { file: 1 },
+                Action::JjSplit { file: 5 },
+                Action::Write {
+                    file: 0,
+                    lines: 3,
+                    seed: 43,
+                },
+                Action::JjGitFetch,
+                Action::Write {
+                    file: 0,
+                    lines: 8,
+                    seed: 105,
+                },
+                Action::JjNewMerge { nth: 2 },
+                Action::JjNewOnRemote,
+                Action::Write {
+                    file: 0,
+                    lines: 6,
+                    seed: 252,
+                },
+                Action::JjNewMerge { nth: 0 },
+                Action::Write {
+                    file: 3,
+                    lines: 3,
+                    seed: 244,
+                },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-8: `ui.conflict-marker-style` changed between snapshots creates
+    /// no op and no watcher event, but jj's very next `diff --stat`
+    /// materializes conflicted values with the NEW style — the incremental
+    /// path must re-resolve the style instead of using the one cached at
+    /// the last full refresh (off-by-one marker-text line: +1/-13 vs
+    /// jj's +1/-14).
+    #[test]
+    fn soak8_marker_style_change_between_snapshots() {
+        replay(
+            &[
+                Action::Write {
+                    file: 4,
+                    lines: 6,
+                    seed: 195,
+                },
+                Action::JjCommit,
+                Action::JjNew,
+                Action::SetMarkerStyle { style: 2 },
+                Action::Write {
+                    file: 4,
+                    lines: 3,
+                    seed: 105,
+                },
+                Action::JjNew,
+                Action::JjNew,
+                Action::JjEditPrior { nth: 2 },
+                Action::JjSquash,
+                Action::RenameFile { from: 4, to: 0 },
+                Action::JjSquash,
+                Action::JjEditPrior { nth: 0 },
+                Action::JjNew,
+                Action::JjCommit,
+                Action::JjNew,
+                Action::Write {
+                    file: 0,
+                    lines: 10,
+                    seed: 231,
+                },
+                Action::JjCommit,
+                Action::Write {
+                    file: 0,
+                    lines: 4,
+                    seed: 43,
+                },
+                Action::JjEditPrior { nth: 3 },
+                Action::Write {
+                    file: 4,
+                    lines: 9,
+                    seed: 133,
+                },
+                Action::SetMarkerStyle { style: 0 },
+                Action::Write {
+                    file: 4,
+                    lines: 1,
+                    seed: 73,
+                },
+                Action::Append {
+                    file: 4,
+                    lines: 1,
+                    seed: 212,
+                },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-8: a snapshotted rename target rewritten with content
+    /// dissimilar to the source voids the pairing — gix re-detects from
+    /// scratch on every diff, so jj shows a plain `a.txt | 1 +` AND the
+    /// previously-suppressed source delete resurfaces (`b.txt | 1 -`).
+    #[test]
+    fn soak8_rewritten_target_unpairs_and_resurrects_delete() {
+        replay(
+            &[
+                Action::Write {
+                    file: 1,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Delete { file: 1 },
+                Action::JjUndo,
+                Action::JjNew,
+                Action::RenameFile { from: 1, to: 0 },
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-7 (found during the synthetic-state refactor baseline): a
+    /// rename source re-created with *different* content is a modified
+    /// file, but gix matches copy targets against the source's NEW content
+    /// (`Change::id()` of a Modification is the post-image blob) — seed1 vs
+    /// the target's seed0 content is dissimilar, so jj shows a plain
+    /// `a.txt | 1 +` + `x.log | 1 +-`, not a copy pairing.
+    #[test]
+    fn soak7_recreated_source_different_content_plain_add() {
+        replay(
+            &[
+                Action::Write {
+                    file: 5,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjNew,
+                Action::RenameFile { from: 5, to: 0 },
+                Action::Write {
+                    file: 5,
+                    lines: 1,
+                    seed: 1,
+                },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-6: gix *copy* detection (CopySource::FromSetOfModifiedFiles):
+    /// after `jj restore` re-creates a rename source, appending to it makes
+    /// it a modified file — and gix then pairs the previously-plain-added
+    /// target as a COPY of it: jj shows `dir/c.txt | 2 ++` plus
+    /// `{dir => dir2}/c.txt | 0` (both files counted, copy target at zero).
+    #[test]
+    fn soak6_copy_detection_after_restore_and_append() {
+        replay(
+            &[
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Delete { file: 4 },
+                Action::JjSplit { file: 1 },
+                Action::RemoteCommit {
+                    file: 2,
+                    lines: 1,
+                    seed: 175,
+                },
+                Action::Write {
+                    file: 2,
+                    lines: 3,
+                    seed: 38,
+                },
+                Action::JjCommit,
+                Action::JjRebase { nth: 6 },
+                Action::JjNewMerge { nth: 2 },
+                Action::JjNew,
+                Action::JjGitFetch,
+                Action::JjSquash,
+                Action::MoveDir,
+                Action::JjRestoreFile { file: 2 },
+                Action::Append {
+                    file: 2,
+                    lines: 2,
+                    seed: 202,
+                },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-6: split/restore/rebase/merge churn, then a directory move that
+    /// jj reports as a plain delete + add (`dir/c.txt | 1 -` +
+    /// `dir2/c.txt | 1 +`), while the worker pairs it into one file.
+    #[test]
+    fn soak6_movedir_after_rebase_merge_not_paired() {
+        replay(
+            &[
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjNew,
+                Action::JjSplit { file: 0 },
+                Action::JjRestoreAll,
+                Action::Write {
+                    file: 2,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjNew,
+                Action::Write {
+                    file: 2,
+                    lines: 1,
+                    seed: 1,
+                },
+                Action::JjRebase { nth: 1 },
+                Action::JjNewMerge { nth: 0 },
+                Action::MoveDir,
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-6 (lossy): a rename source re-created as an *ignored untracked*
+    /// file is invisible to jj — the rename pairing must survive
+    /// (`{dir => dir2}/sub/d.txt | 0`), unlike a visible re-creation which
+    /// voids it (soak2_rename_then_recreate_source).
+    #[test]
+    fn soak6_ignored_source_recreation_keeps_rename() {
+        replay(
+            &[
+                Action::Write {
+                    file: 3,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjNew,
+                Action::WriteGitignore { variant: 1 },
+                Action::MoveDir,
+                Action::JjGitFetch,
+                Action::Write {
+                    file: 3,
+                    lines: 1,
+                    seed: 0,
+                },
+            ],
+            Delivery::Lossy,
+        );
+    }
+
+    /// Soak-5: directory move of a *conflicted* file (the merge sides wrote
+    /// 6-line vs 1-line content). gix's per-parent copy detection compares
+    /// each parent's plain side blob against the moved marker text — ~0%
+    /// similar — so jj pairs nothing: `dir/c.txt | 12 -` + `dir2/c.txt | 12 +`.
+    /// Pairing against the merged-parent materialization (the marker text
+    /// itself, 100% similar) is wrong.
+    #[test]
+    fn soak5_movedir_conflicted_file_not_paired() {
+        replay(
+            &[
+                Action::RemoteCommit {
+                    file: 2,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjGitFetch,
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Append {
+                    file: 0,
+                    lines: 1,
+                    seed: 173,
+                },
+                Action::Write {
+                    file: 2,
+                    lines: 6,
+                    seed: 168,
+                },
+                Action::JjNewMerge { nth: 2 },
+                Action::MoveDir,
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-5 companion: same shape with 1-line sides (seed1 vs seed0);
+    /// jj shows `dir/c.txt | 7 -` + `dir2/c.txt | 7 +` (marker-text lines),
+    /// no pairing.
+    #[test]
+    fn soak5_movedir_conflicted_file_not_paired_small() {
+        replay(
+            &[
+                Action::RemoteCommit {
+                    file: 2,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjGitFetch,
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Write {
+                    file: 2,
+                    lines: 1,
+                    seed: 1,
+                },
+                Action::JjNewMerge { nth: 0 },
+                Action::MoveDir,
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-4: after edit-prior/abandon/commit/merge/rebase churn, a file
+    /// whose parent and WC-commit *values* differ but whose contents diff
+    /// to zero lines (`dir/c.txt | 0` in jj) must survive the incremental
+    /// re-diff after the re-anchor — a disk event with content equal to the
+    /// parent materialization must not mask the standing zero-line entry.
+    #[test]
+    fn soak4_zero_line_entry_survives_incremental_rediff() {
+        replay(
+            &[
+                Action::RemoteCommit {
+                    file: 2,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjGitFetch,
+                Action::Write {
+                    file: 2,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjNew,
+                Action::Append {
+                    file: 2,
+                    lines: 1,
+                    seed: 3,
+                },
+                Action::JjEditPrior { nth: 4 },
+                Action::JjAbandon,
+                Action::JjNew,
+                Action::JjCommit,
+                Action::Write {
+                    file: 2,
+                    lines: 4,
+                    seed: 22,
+                },
+                Action::JjNewOnRemote,
+                Action::JjNewMerge { nth: 3 },
+                Action::Write {
+                    file: 5,
+                    lines: 9,
+                    seed: 66,
+                },
+                Action::JjCommit,
+                Action::JjNew,
+                Action::Touch {
+                    file: 5,
+                    line: 251,
+                    seed: 212,
+                },
+                Action::JjRebase { nth: 6 },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Soak-4: directory move under a merge where *both* parents contain
+    /// the source path. Each per-parent copy detection emits a record for
+    /// the same target; jj-lib discards duplicate records (CopyRecords
+    /// poisons them), so jj shows the target as a plain add and silently
+    /// drops the source's delete: `dir2/c.txt | 1 +` only.
+    #[test]
+    fn soak4_movedir_source_in_both_merge_parents() {
+        replay(
+            &[
+                Action::RemoteCommit {
+                    file: 2,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjGitFetch,
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::Write {
+                    file: 2,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjNewMerge { nth: 0 },
+                Action::MoveDir,
+            ],
+            Delivery::Perfect,
+        );
+    }
+
     /// Rename then edit the target across snapshots (perfect mode): the
     /// overlay must diff the target against the rename *source's* parent
     /// content, matching jj's `{a => b} | 2 +-` fuzzy-rename stat.
@@ -912,6 +2259,119 @@ mod regressions {
                     file: 1,
                     line: 5,
                     seed: 9,
+                },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Exec-bit-only change parity: chmod +x on a committed file is one
+    /// changed file with 0 line changes (`e.rs | 0`), chmod -x reverts it
+    /// to no change; a flip layered on a content edit keeps the line stats.
+    #[test]
+    fn exec_bit_only_change_parity() {
+        replay(
+            &[
+                Action::Write {
+                    file: 4, // e.rs
+                    lines: 3,
+                    seed: 1,
+                },
+                Action::JjCommit,
+                Action::SetExecBit { file: 4, on: true },
+                Action::SetExecBit { file: 4, on: false },
+                Action::SetExecBit { file: 4, on: true },
+                Action::Append {
+                    file: 4,
+                    lines: 2,
+                    seed: 7,
+                },
+                Action::JjNew,
+                Action::SetExecBit { file: 4, on: false },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Staleness contract: a second-workspace rewrite of the watched @'s
+    /// tree makes the watched workspace stale (oracle checks impossible —
+    /// `jj diff` errors); `jj workspace update-stale` rewrites disk files
+    /// with no user edit and parity MUST hold immediately after.
+    #[test]
+    fn stale_then_update_stale_restores_parity() {
+        replay(
+            &[
+                Action::Write {
+                    file: 0,
+                    lines: 3,
+                    seed: 1,
+                },
+                Action::JjCommit,
+                Action::WorkspaceAdd,
+                Action::Write {
+                    file: 0,
+                    lines: 2,
+                    seed: 9,
+                },
+                Action::WorkspaceOp {
+                    file: 1,
+                    lines: 2,
+                    seed: 3,
+                },
+                // second@ still holds the pre-commit a.txt content; restoring
+                // it into default@ changes the watched wc-commit tree.
+                Action::RewriteWatchedWsAncestor { file: 0, nth: 0 },
+                // Edits during the stale window still reach the worker.
+                Action::Append {
+                    file: 0,
+                    lines: 1,
+                    seed: 5,
+                },
+                Action::WorkspaceUpdateStale,
+                Action::Write {
+                    file: 2,
+                    lines: 1,
+                    seed: 4,
+                },
+            ],
+            Delivery::Perfect,
+        );
+    }
+
+    /// Workspace-entanglement staleness: once the watched @ is a merge
+    /// child of second@, a mere *snapshot* in the second workspace amends
+    /// second@ and auto-rebases the watched wc commit — staling the watched
+    /// workspace with no watched-side action at all. The harness must
+    /// detect it (probe after every second-workspace mutation) so
+    /// watched-dir precondition queries don't assert on the stale error,
+    /// and parity must return after update-stale.
+    #[test]
+    fn workspace_op_stales_entangled_watched_ws() {
+        replay(
+            &[
+                Action::Write {
+                    file: 0,
+                    lines: 1,
+                    seed: 0,
+                },
+                Action::JjCommit,
+                Action::WorkspaceAdd,
+                // heads(all()) ~ ::@ == {second@} → merge @ with second@.
+                Action::JjNewMerge { nth: 0 },
+                Action::WorkspaceOp {
+                    file: 1,
+                    lines: 2,
+                    seed: 7,
+                },
+                // Pre-fix this panicked in the jj_stdout conflict probe
+                // ("The working copy is stale"); post-fix it must be a
+                // graceful stale-skip.
+                Action::SetMarkerStyle { style: 0 },
+                Action::WorkspaceUpdateStale,
+                Action::Write {
+                    file: 2,
+                    lines: 1,
+                    seed: 3,
                 },
             ],
             Delivery::Perfect,
