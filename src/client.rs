@@ -98,28 +98,33 @@ fn start_daemon(socket_path: &Path, config_file: Option<&Path>) -> Result<()> {
 
     let mut child = cmd.spawn().context("failed to start daemon")?;
 
-    // Wait briefly to detect immediate crashes (e.g. missing build flags, bad config).
-    // If the daemon is still alive after this, detach and let it run.
-    std::thread::sleep(Duration::from_millis(200));
-    if let Some(status) = child.try_wait().context("failed to check daemon process")? {
-        let stderr = child
-            .stderr
-            .take()
-            .and_then(|mut s| {
-                let mut buf = String::new();
-                std::io::Read::read_to_string(&mut s, &mut buf).ok()?;
-                Some(buf)
-            })
-            .unwrap_or_default();
-        let stderr = stderr.trim();
-        if stderr.is_empty() {
-            anyhow::bail!("daemon exited immediately with {status}");
-        } else {
-            anyhow::bail!("daemon exited immediately with {status}:\n{stderr}");
+    // Poll briefly to detect immediate crashes (e.g. missing build flags, bad
+    // config). Returns as soon as the daemon is listening; if it's neither
+    // dead nor listening after the deadline, detach and let it run.
+    let deadline = std::time::Instant::now() + Duration::from_millis(200);
+    loop {
+        if let Some(status) = child.try_wait().context("failed to check daemon process")? {
+            let stderr = child
+                .stderr
+                .take()
+                .and_then(|mut s| {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut s, &mut buf).ok()?;
+                    Some(buf)
+                })
+                .unwrap_or_default();
+            let stderr = stderr.trim();
+            if stderr.is_empty() {
+                anyhow::bail!("daemon exited immediately with {status}");
+            } else {
+                anyhow::bail!("daemon exited immediately with {status}:\n{stderr}");
+            }
         }
+        if UnixStream::connect(socket_path).is_ok() || std::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
-
-    Ok(())
 }
 
 fn extract_status(response: Response) -> Result<String> {
@@ -134,6 +139,23 @@ fn extract_status(response: Response) -> Result<String> {
 /// Hardcoded fallback when the daemon isn't reachable within the timeout.
 const NOT_READY_FALLBACK: &str = "…";
 
+/// Read the daemon-published effective query timeout and derive the socket
+/// read timeout from it. The daemon writes this file at startup and on config
+/// reload, so the prompt hot path never has to load and parse the config.
+fn socket_read_timeout(socket_path: &Path) -> Duration {
+    let query_timeout_ms = socket_path
+        .parent()
+        .and_then(|dir| std::fs::read_to_string(dir.join("query-timeout-ms")).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if query_timeout_ms > 0 {
+        // Allow extra margin for daemon overhead
+        Duration::from_millis(query_timeout_ms + 200)
+    } else {
+        Duration::from_millis(100)
+    }
+}
+
 pub fn query(repo_path: &Path, config_file: Option<&Path>) -> Result<String> {
     let socket_path = config::socket_path()?;
     let request = Request::Query {
@@ -141,28 +163,18 @@ pub fn query(repo_path: &Path, config_file: Option<&Path>) -> Result<String> {
         timeout_override_ms: 0,
     };
 
-    // Resolve config file: explicit arg > VSD_CONFIG_FILE env var > default path
-    // Always resolve so the daemon gets an explicit path regardless of its environment.
-    let resolved_config_file = config_file
-        .map(|p| p.to_path_buf())
-        .or_else(config::config_path);
-
-    // Load config to get query_timeout_ms for socket read timeout
-    let query_timeout_ms = config::load_config_from(resolved_config_file.as_deref())
-        .map(|c| c.query_timeout_ms)
-        .unwrap_or(0);
-
-    let timeout = if query_timeout_ms > 0 {
-        // Allow extra margin for daemon overhead
-        Duration::from_millis(query_timeout_ms + 200)
-    } else {
-        Duration::from_millis(100)
-    };
+    let timeout = socket_read_timeout(&socket_path);
 
     match send_request_with_timeout(&socket_path, &request, timeout) {
         Ok(response) => extract_status(response),
         Err(_) => {
-            // Daemon not reachable — try to start it, return fallback
+            // Daemon not reachable — try to start it, return fallback.
+            // Resolve config file: explicit arg > VSD_CONFIG_FILE env var >
+            // default path, so the daemon gets an explicit path regardless of
+            // its environment.
+            let resolved_config_file = config_file
+                .map(|p| p.to_path_buf())
+                .or_else(config::config_path);
             if let Err(e) = start_daemon(&socket_path, resolved_config_file.as_deref()) {
                 eprintln!("vcs-status-daemon: {e}");
             }
