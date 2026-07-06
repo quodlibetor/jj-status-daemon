@@ -65,6 +65,17 @@ daemon, both VCS backends, and the client.
   conflict markers into structured conflicts before diffing, mirroring jj's
   own pipeline. Previously a touched conflict marker produced +1/-1 where jj
   reports the full materialized diff. Found by the same soak.
+- **rename pairing uses jj's actual similarity rule**: incremental rename
+  detection now scores parent-tree source content against on-disk target
+  content with gix's retained-bytes metric (>= 50%, empty files never pair,
+  per merge parent), replacing the exact-content heuristic. Fixes both
+  over-pairing (a dissimilar edit + directory move jj reports as delete +
+  add) and under-pairing (a rename onto a path that exists in the merged
+  parent, which jj reports as `{a => b} | 0`). Found by the same soak.
+- **zero-line-change entries count as changed files**: a tree-value change
+  whose materialized contents compare equal (e.g. a parent-side conflict
+  that hunk-merges to exactly the working copy's resolved text) now emits
+  jj's `file | 0` entry instead of being dropped. Found by the same soak.
 - **self-healing on every jj operation**: `ValidateAndRefresh` now compares the
   working-copy commit's tree (and the operation id) in addition to the parent
   tree. Same-parent checkouts (`jj abandon`, `jj edit` to a sibling,
