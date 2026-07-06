@@ -86,15 +86,26 @@ async fn materialized_content(
     labels: &jj_lib::conflict_labels::ConflictLabels,
     marker_style: ConflictMarkerStyle,
 ) -> Option<Vec<u8>> {
+    let materialized = jj_lib::conflicts::materialize_tree_value(store, path, value, labels)
+        .await
+        .ok()?;
+    materialized_bytes(store, path, materialized, marker_style).await
+}
+
+/// Convert an already-materialized tree value to bytes (see
+/// [`materialized_content`]).
+async fn materialized_bytes(
+    store: &Arc<jj_lib::store::Store>,
+    path: &jj_lib::repo_path::RepoPath,
+    materialized: jj_lib::conflicts::MaterializedTreeValue,
+    marker_style: ConflictMarkerStyle,
+) -> Option<Vec<u8>> {
     use jj_lib::conflicts::{
         ConflictMaterializeOptions, MaterializedTreeValue, choose_materialized_conflict_marker_len,
-        materialize_merge_result_to_bytes, materialize_tree_value,
+        materialize_merge_result_to_bytes,
     };
 
-    match materialize_tree_value(store, path, value, labels)
-        .await
-        .ok()?
-    {
+    match materialized {
         MaterializedTreeValue::Absent => None,
         MaterializedTreeValue::AccessDenied(_) => None,
         MaterializedTreeValue::File(mut file) => file.read_all(path).await.ok(),
@@ -539,6 +550,13 @@ async fn compute_per_file_diff_stats(
 ) -> HashMap<String, FileDiffStats> {
     let mut result = HashMap::new();
 
+    // Materialize with *unlabeled* conflict markers on both sides, exactly
+    // like jj's DiffStats::calculate — per-tree labels differ between
+    // parent and child commits, and label text must never count as changed
+    // lines.
+    let unlabeled = jj_lib::conflict_labels::ConflictLabels::unlabeled();
+    let unlabeled = &unlabeled;
+
     // Materialize both sides of each entry with buffered concurrency,
     // mirroring jj-lib's own materialized_diff_stream — serial awaits here
     // would bottleneck large diffs on backend read latency.
@@ -551,14 +569,14 @@ async fn compute_per_file_diff_stats(
                     store,
                     entry.path.source(),
                     values.before,
-                    from_tree.labels(),
+                    unlabeled,
                     marker_style,
                 ),
                 materialized_content(
                     store,
                     entry.path.target(),
                     values.after,
-                    to_tree.labels(),
+                    unlabeled,
                     marker_style,
                 ),
             );
@@ -676,19 +694,64 @@ async fn diff_single_file(
     disk_content: Option<&[u8]>,
     marker_style: ConflictMarkerStyle,
 ) -> Option<FileDiffStats> {
-    // Materialize the parent-side value the same way jj does (conflicted
-    // files become conflict-marker text, matching what jj writes to disk),
-    // so an untouched conflicted file diffs as unchanged.
-    let parent_value = parent_tree.path_value(repo_path).ok()?;
-    let parent_content = materialized_content(
-        store,
-        repo_path,
-        parent_value,
-        parent_tree.labels(),
-        marker_style,
-    )
-    .await;
+    use jj_lib::conflict_labels::ConflictLabels;
+    use jj_lib::conflicts::{
+        ConflictMaterializeOptions, MaterializedTreeValue, choose_materialized_conflict_marker_len,
+        materialize_merge_result_to_bytes, materialize_tree_value, parse_conflict,
+    };
 
+    let parent_value = parent_tree.path_value(repo_path).ok()?;
+    let materialized = materialize_tree_value(store, repo_path, parent_value, parent_tree.labels())
+        .await
+        .ok()?;
+
+    if let MaterializedTreeValue::FileConflict(file) = materialized {
+        // jj's `diff --stat` never diffs raw disk text against a conflicted
+        // parent: the snapshot first parses conflict markers back into a
+        // structured conflict (falling back to resolved bytes when parsing
+        // fails), and stats then materialize BOTH sides with *unlabeled*
+        // markers so label text never counts as changed lines (see jj's
+        // DiffStats::calculate). Mirror that pipeline here.
+        let marker_len = choose_materialized_conflict_marker_len(&file.contents);
+        let options = ConflictMaterializeOptions {
+            marker_style,
+            marker_len: Some(marker_len),
+            merge: store.merge_options().clone(),
+        };
+        let unlabeled = ConflictLabels::unlabeled();
+        let before: Vec<u8> =
+            materialize_merge_result_to_bytes(&file.contents, &unlabeled, &options).into();
+        let after: Option<Vec<u8>> = disk_content.map(|disk| {
+            match parse_conflict(disk, file.contents.num_sides(), marker_len) {
+                Some(hunks) => {
+                    // Reassemble per-side contents from the parsed hunks (as
+                    // jj's snapshot does) and rematerialize with the same
+                    // unlabeled markers, so an untouched or side-edited
+                    // conflict diffs by content, not by marker/label text.
+                    let mut sides: jj_lib::merge::Merge<Vec<u8>> =
+                        file.contents.map(|_| Vec::new());
+                    for hunk in hunks {
+                        if let Some(resolved) = hunk.as_resolved() {
+                            for side in sides.iter_mut() {
+                                side.extend_from_slice(resolved);
+                            }
+                        } else {
+                            for (side, piece) in std::iter::zip(sides.iter_mut(), hunk.iter()) {
+                                side.extend_from_slice(piece);
+                            }
+                        }
+                    }
+                    materialize_merge_result_to_bytes(&sides, &unlabeled, &options).into()
+                }
+                // No parseable markers: jj snapshots the raw bytes as
+                // resolved content.
+                None => disk.to_vec(),
+            }
+        });
+        return diff_stats_for_contents(Some(&before), after.as_deref());
+    }
+
+    let parent_content = materialized_bytes(store, repo_path, materialized, marker_style).await;
     diff_stats_for_contents(parent_content.as_deref(), disk_content)
 }
 
@@ -726,7 +789,11 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
         let renamed_from = state
             .base_file_stats
             .get(&rel_str)
-            .and_then(|s| s.renamed_from.clone());
+            .and_then(|s| s.renamed_from.clone())
+            // The rename premise holds only while the source is gone from
+            // disk — a re-created source turns the target back into a plain
+            // file (jj drops the copy pairing at the next snapshot).
+            .filter(|src| !state.repo_root.join(src).exists());
         let parent_lookup = renamed_from.as_deref().unwrap_or(&rel_str);
         let Ok(repo_path_buf) = jj_lib::repo_path::RepoPathBuf::from_relative_path(parent_lookup)
         else {
@@ -776,6 +843,55 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             }
             _ => {}
         }
+
+        // Events on a recorded rename *source* (some target maps back to
+        // this path via renamed_from, in the base or the overlay):
+        // - source still gone → its Deleted entry is subsumed by the rename
+        //   (jj's copies stream suppresses the source's delete);
+        // - source re-created → the rename premise is void: re-diff every
+        //   target as a plain file (jj shows a plain add — a rename needs
+        //   the source to be gone).
+        let rename_targets: Vec<String> = state
+            .base_file_stats
+            .iter()
+            .filter(|(_, s)| s.renamed_from.as_deref() == Some(rel_str.as_str()))
+            .map(|(target, _)| target.clone())
+            .chain(
+                state
+                    .overlay
+                    .iter()
+                    .filter(|(_, entry)| {
+                        entry
+                            .as_ref()
+                            .is_some_and(|s| s.renamed_from.as_deref() == Some(rel_str.as_str()))
+                    })
+                    .map(|(target, _)| target.clone()),
+            )
+            .collect();
+        if !rename_targets.is_empty() {
+            if disk_content.is_none() {
+                diff_result = None;
+            } else {
+                for target_rel in rename_targets {
+                    let Ok(target_path) =
+                        jj_lib::repo_path::RepoPathBuf::from_relative_path(&target_rel)
+                    else {
+                        continue;
+                    };
+                    let target_disk = std::fs::read(state.repo_root.join(&target_rel)).ok();
+                    let plain = diff_single_file(
+                        &state.store,
+                        &state.parent_tree,
+                        &target_path,
+                        target_disk.as_deref(),
+                        state.conflict_marker_style,
+                    )
+                    .await;
+                    staged.push((target_rel, plain));
+                }
+            }
+        }
+
         staged.push((rel_str, diff_result));
     }
 
