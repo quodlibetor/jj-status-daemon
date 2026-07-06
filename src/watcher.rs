@@ -21,7 +21,14 @@ pub enum VcsChangeHint {
     HeadMayHaveChanged,
 }
 
+#[derive(Debug)]
 pub enum WatchEvent {
+    /// A client query missed the cache — start a full refresh immediately
+    /// (no debounce) unless one is already in flight for the repo.
+    QueryMiss {
+        repo_path: PathBuf,
+        vcs_kind: VcsKind,
+    },
     Change {
         repo_path: PathBuf,
         vcs_kind: VcsKind,
@@ -482,7 +489,7 @@ mod tests {
             .expect("channel closed");
         match event {
             WatchEvent::Change { repo_path, .. } => assert_eq!(repo_path, dir.path()),
-            WatchEvent::Flush(_) => panic!("unexpected Flush event"),
+            other => panic!("unexpected event: {other:?}"),
         }
     }
 

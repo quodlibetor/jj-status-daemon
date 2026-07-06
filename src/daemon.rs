@@ -15,8 +15,8 @@ use tracing_subscriber::reload;
 pub type LogFilterHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
 use crate::config::Config;
-use crate::git::{GitWorkerRequest, query_git_status, spawn_git_worker};
-use crate::jj::{JjWorkerRequest, query_jj_status, spawn_jj_worker};
+use crate::git::{GitWorkerRequest, spawn_git_worker};
+use crate::jj::{JjWorkerRequest, spawn_jj_worker};
 use crate::protocol::{DaemonStats, Request, Response, VcsKind};
 use crate::template::RepoStatus;
 use crate::template::format_not_ready;
@@ -605,29 +605,12 @@ async fn handle_connection(
                     };
                     (rx, st.not_ready_formatted.clone())
                 };
-                let state_bg = state.clone();
-                let query_path_bg = query_path.clone();
-                let repo_path_bg = repo_path.clone();
-                let cd_bg = cd.clone();
-                tokio::spawn(async move {
-                    let result = match vcs_kind {
-                        VcsKind::Jj => query_jj_status(&repo_path_bg, &config).await,
-                        VcsKind::Git => query_git_status(&repo_path_bg, &config).await,
-                    };
-                    match result {
-                        Ok(status) => {
-                            let mut st = state_bg.lock().await;
-                            let formatted = st.format(&status);
-                            write_cache_file(&cd_bg, &repo_path_bg, &formatted);
-                            if query_path_bg != repo_path_bg {
-                                link_cache_file(&cd_bg, &repo_path_bg, &query_path_bg);
-                            }
-                            st.update_cache(&repo_path_bg, status, formatted);
-                        }
-                        Err(e) => {
-                            tracing::error!(repo = %repo_path_bg.display(), error = %e, "background status query failed");
-                        }
-                    }
+                // Populate via the refresh task: it deduplicates against
+                // in-flight refreshes and the workers retain the incremental
+                // diff state for later watcher events.
+                let _ = watch_tx.send(WatchEvent::QueryMiss {
+                    repo_path: repo_path.clone(),
+                    vcs_kind,
                 });
 
                 // If timeout configured, wait for background task to complete
@@ -1577,6 +1560,35 @@ async fn refresh_task(
                 let Some(event) = event else { return };
 
                 match event {
+                    WatchEvent::QueryMiss { repo_path, vcs_kind } => {
+                        // A client is waiting — skip the debounce. If a
+                        // refresh is already in flight or debouncing, it will
+                        // serve the same purpose; duplicate misses coalesce.
+                        let pending = match repo_state.remove(&repo_path) {
+                            None => PendingRefresh {
+                                vcs_kind,
+                                working_copy_changed: false,
+                                changed_paths: vec![],
+                                hint: None,
+                                rescan: false,
+                            },
+                            Some(RepoRefreshState::Debouncing(pending)) => pending,
+                            Some(other) => {
+                                // InFlight or Pending — put it back untouched.
+                                repo_state.insert(repo_path, other);
+                                continue;
+                            }
+                        };
+                        repo_state.insert(repo_path.clone(), RepoRefreshState::InFlight);
+                        tokio::spawn(refresh_repo(
+                            repo_path,
+                            pending,
+                            state.clone(),
+                            jj_worker.clone(),
+                            git_worker.clone(),
+                            msg_tx.clone(),
+                        ));
+                    }
                     WatchEvent::Flush(tx) => {
                         // Promote any debouncing repos immediately — a flush
                         // must not wait out debounce windows.
