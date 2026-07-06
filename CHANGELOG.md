@@ -76,6 +76,16 @@ daemon, both VCS backends, and the client.
   whose materialized contents compare equal (e.g. a parent-side conflict
   that hunk-merges to exactly the working copy's resolved text) now emits
   jj's `file | 0` entry instead of being dropped. Found by the same soak.
+- **incremental re-diffs keep standing `file | 0` entries**: an on-disk
+  touch of such a file no longer masks its zero-line entry — the overlay
+  only heals a file to "unchanged" when both the parent and working-copy
+  values are resolved (content-equal does not imply value-equal when a
+  conflict is involved). Found by the same soak.
+- **directory moves whose source exists in both merge parents match jj**:
+  jj-lib discards duplicate per-parent copy records, reporting the target
+  as a plain add and dropping the source's deletion from the stat; the
+  incremental engine now mirrors that outcome instead of pairing the
+  rename. Found by the same soak.
 - **self-healing on every jj operation**: `ValidateAndRefresh` now compares the
   working-copy commit's tree (and the operation id) in addition to the parent
   tree. Same-parent checkouts (`jj abandon`, `jj edit` to a sibling,
