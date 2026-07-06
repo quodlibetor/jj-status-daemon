@@ -610,24 +610,119 @@ pub enum GitWorkerRequest {
     QueryOverlayStatsVerbose {
         reply: tokio::sync::oneshot::Sender<crate::protocol::VerboseDirStats>,
     },
+    /// Drop retained state for a repo; its worker thread exits.
+    Forget { repo_path: PathBuf },
 }
 
-/// Spawn a dedicated blocking thread that owns git2 Repository state.
+/// Spawn the git worker router thread.
 ///
-/// Returns a sender for submitting requests. The worker exits when the sender is dropped.
+/// The router dispatches each repo's requests to a lazily spawned per-repo
+/// worker thread that owns that repo's `GitRepoState`, so a slow repo never
+/// blocks refreshes of other repos. Returns a sender for submitting requests.
+/// The router exits when the sender is dropped; per-repo workers exit when
+/// the router drops their senders.
 pub fn spawn_git_worker() -> mpsc::UnboundedSender<GitWorkerRequest> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    tokio::task::spawn_blocking(move || {
-        let mut states: HashMap<PathBuf, GitRepoState> = HashMap::new();
+    std::thread::spawn(move || {
+        let mut workers: HashMap<PathBuf, mpsc::UnboundedSender<GitWorkerRequest>> = HashMap::new();
 
-        // Blocking recv loop — runs on a dedicated OS thread
+        while let Some(req) = rx.blocking_recv() {
+            match req {
+                req @ (GitWorkerRequest::FullRefresh { .. }
+                | GitWorkerRequest::ValidateAndRefresh { .. }
+                | GitWorkerRequest::IncrementalUpdate { .. }) => {
+                    let repo_path = match &req {
+                        GitWorkerRequest::FullRefresh { repo_path, .. }
+                        | GitWorkerRequest::ValidateAndRefresh { repo_path, .. }
+                        | GitWorkerRequest::IncrementalUpdate { repo_path, .. } => {
+                            repo_path.clone()
+                        }
+                        _ => unreachable!(),
+                    };
+                    let sender = workers
+                        .entry(repo_path.clone())
+                        .or_insert_with(spawn_git_repo_worker);
+                    if let Err(mpsc::error::SendError(req)) = sender.send(req) {
+                        // Worker thread died — drop the stale sender and respawn
+                        tracing::warn!(
+                            repo = %repo_path.display(),
+                            "git repo worker died — respawning"
+                        );
+                        let fresh = spawn_git_repo_worker();
+                        let _ = fresh.send(req);
+                        workers.insert(repo_path, fresh);
+                    }
+                }
+                GitWorkerRequest::QueryOverlayStats { reply } => {
+                    // Gather from a snapshot of repo workers in an ephemeral
+                    // thread so a slow repo never blocks the router.
+                    let senders: Vec<_> = workers.values().cloned().collect();
+                    std::thread::spawn(move || {
+                        let replies: Vec<_> = senders
+                            .iter()
+                            .filter_map(|s| {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                s.send(GitWorkerRequest::QueryOverlayStats { reply: tx })
+                                    .ok()
+                                    .map(|_| rx)
+                            })
+                            .collect();
+                        let mut stats = Vec::new();
+                        for rx in replies {
+                            if let Ok(mut repo_stats) = rx.blocking_recv() {
+                                stats.append(&mut repo_stats);
+                            }
+                        }
+                        let _ = reply.send(stats);
+                    });
+                }
+                GitWorkerRequest::QueryOverlayStatsVerbose { reply } => {
+                    let senders: Vec<_> = workers.values().cloned().collect();
+                    std::thread::spawn(move || {
+                        let replies: Vec<_> = senders
+                            .iter()
+                            .filter_map(|s| {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                s.send(GitWorkerRequest::QueryOverlayStatsVerbose { reply: tx })
+                                    .ok()
+                                    .map(|_| rx)
+                            })
+                            .collect();
+                        let mut stats = Vec::new();
+                        for rx in replies {
+                            if let Ok(mut repo_stats) = rx.blocking_recv() {
+                                stats.append(&mut repo_stats);
+                            }
+                        }
+                        let _ = reply.send(stats);
+                    });
+                }
+                GitWorkerRequest::Forget { repo_path } => {
+                    // Dropping the sender closes the worker's channel; its
+                    // thread exits after draining any in-flight requests.
+                    workers.remove(&repo_path);
+                }
+            }
+        }
+    });
+    tx
+}
+
+/// Spawn a worker thread that owns the git2 state for a single repo.
+fn spawn_git_repo_worker() -> mpsc::UnboundedSender<GitWorkerRequest> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        // Retained state, plus the repo path key the daemon uses (which may
+        // differ from the canonicalized repo_root inside the state).
+        let mut retained: Option<(PathBuf, GitRepoState)> = None;
+
         while let Some(req) = rx.blocking_recv() {
             match req {
                 GitWorkerRequest::FullRefresh { repo_path, reply } => {
                     let result = query_git_status_blocking_with_state(&repo_path);
                     match result {
                         Ok((status, git_state)) => {
-                            states.insert(repo_path, git_state);
+                            retained = Some((repo_path, git_state));
                             let _ = reply.send(Ok(status));
                         }
                         Err(e) => {
@@ -641,12 +736,12 @@ pub fn spawn_git_worker() -> mpsc::UnboundedSender<GitWorkerRequest> {
                     hint,
                     reply,
                 } => {
-                    let Some(state) = states.get_mut(&repo_path) else {
+                    let Some((_, state)) = retained.as_mut() else {
                         // No retained state — fall through to full refresh
                         let result = query_git_status_blocking_with_state(&repo_path);
                         match result {
                             Ok((status, git_state)) => {
-                                states.insert(repo_path, git_state);
+                                retained = Some((repo_path, git_state));
                                 let _ = reply.send(Ok(status));
                             }
                             Err(e) => {
@@ -681,7 +776,7 @@ pub fn spawn_git_worker() -> mpsc::UnboundedSender<GitWorkerRequest> {
                         let result = query_git_status_blocking_with_state(&repo_path);
                         match result {
                             Ok((status, git_state)) => {
-                                states.insert(repo_path, git_state);
+                                retained = Some((repo_path, git_state));
                                 let _ = reply.send(Ok(status));
                             }
                             Err(e) => {
@@ -729,7 +824,7 @@ pub fn spawn_git_worker() -> mpsc::UnboundedSender<GitWorkerRequest> {
                     changed_paths,
                     reply,
                 } => {
-                    let Some(state) = states.get_mut(&repo_path) else {
+                    let Some((_, state)) = retained.as_mut() else {
                         let _ =
                             reply.send(Err(anyhow::anyhow!("no incremental state for git repo")));
                         continue;
@@ -745,7 +840,7 @@ pub fn spawn_git_worker() -> mpsc::UnboundedSender<GitWorkerRequest> {
                     let _ = reply.send(Ok(status));
                 }
                 GitWorkerRequest::QueryOverlayStats { reply } => {
-                    let stats: Vec<_> = states
+                    let stats: Vec<_> = retained
                         .iter()
                         .map(|(path, state)| {
                             let counts =
@@ -765,7 +860,7 @@ pub fn spawn_git_worker() -> mpsc::UnboundedSender<GitWorkerRequest> {
                     let _ = reply.send(stats);
                 }
                 GitWorkerRequest::QueryOverlayStatsVerbose { reply } => {
-                    let stats: Vec<_> = states
+                    let stats: Vec<_> = retained
                         .iter()
                         .map(|(path, state)| {
                             let dir_stats = aggregate_overlay_stats_by_dir(
@@ -777,6 +872,9 @@ pub fn spawn_git_worker() -> mpsc::UnboundedSender<GitWorkerRequest> {
                         .collect();
                     let _ = reply.send(stats);
                 }
+                // Forget is handled by the router (it drops this worker's
+                // sender); nothing to do here.
+                GitWorkerRequest::Forget { .. } => {}
             }
         }
     });

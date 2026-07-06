@@ -305,6 +305,17 @@ pub async fn run_daemon(
                 st.watchers.remove(path);
                 st.cache.remove(path);
                 st.dir_to_repo.retain(|_, (root, _)| root != path);
+                // Reclaim the per-repo worker thread and its diff state.
+                if let Some(ref jj) = st.jj_worker {
+                    let _ = jj.send(JjWorkerRequest::Forget {
+                        repo_path: path.clone(),
+                    });
+                }
+                if let Some(ref git) = st.git_worker {
+                    let _ = git.send(GitWorkerRequest::Forget {
+                        repo_path: path.clone(),
+                    });
+                }
             }
             if !stale.is_empty() {
                 st.persist_repos();
@@ -833,9 +844,7 @@ fn write_repos_file(runtime_dir: &Path, watchers: &HashMap<PathBuf, RepoWatcher>
     }
     let path = runtime_dir.join(REPOS_FILE);
     let tmp = runtime_dir.join(".tmp-repos");
-    if let Err(e) =
-        std::fs::write(&tmp, &contents).and_then(|()| std::fs::rename(&tmp, &path))
-    {
+    if let Err(e) = std::fs::write(&tmp, &contents).and_then(|()| std::fs::rename(&tmp, &path)) {
         tracing::warn!(path = %path.display(), error = %e, "failed to write repos file");
     }
 }
@@ -917,8 +926,8 @@ fn write_cache_file(cache_dir: &Path, repo_path: &Path, formatted: &str) {
         }
         None => return,
     };
-    if let Err(e) = std::fs::write(&tmp_path, formatted)
-        .and_then(|()| std::fs::rename(&tmp_path, &file_path))
+    if let Err(e) =
+        std::fs::write(&tmp_path, formatted).and_then(|()| std::fs::rename(&tmp_path, &file_path))
     {
         tracing::warn!(path = %file_path.display(), error = %e, "failed to write cache file");
     }

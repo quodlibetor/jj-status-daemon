@@ -1394,22 +1394,131 @@ pub enum JjWorkerRequest {
     QueryOverlayStatsVerbose {
         reply: tokio::sync::oneshot::Sender<crate::protocol::VerboseDirStats>,
     },
+    /// Drop the retained state and worker thread for a repo (e.g. the repo
+    /// was deleted). The worker thread exits once its channel closes.
+    Forget { repo_path: PathBuf },
 }
 
-/// Spawn a dedicated blocking thread that owns !Send jj-lib state.
+/// Spawn the jj worker router thread.
 ///
-/// Returns a sender for submitting requests. The worker exits when the sender is dropped.
+/// Returns a sender for submitting requests. The router forwards each
+/// request to a lazily spawned per-repo worker thread that owns that repo's
+/// !Send jj-lib state, so a long full refresh in one repo never blocks
+/// refreshes in another. The router and its workers exit when the returned
+/// sender is dropped.
 pub fn spawn_jj_worker() -> mpsc::UnboundedSender<JjWorkerRequest> {
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        handle.block_on(jj_worker_loop(rx));
+    std::thread::spawn(move || jj_router_loop(rx, handle));
+    tx
+}
+
+fn jj_router_loop(
+    mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>,
+    handle: tokio::runtime::Handle,
+) {
+    let mut workers: HashMap<PathBuf, mpsc::UnboundedSender<JjWorkerRequest>> = HashMap::new();
+
+    while let Some(req) = rx.blocking_recv() {
+        match req {
+            JjWorkerRequest::Forget { repo_path } => {
+                // Dropping the sender closes the worker's channel; the thread
+                // exits after finishing any in-flight request.
+                workers.remove(&repo_path);
+            }
+            // Stats requests fan out to every repo worker. The gathering runs
+            // on an ephemeral thread so a repo mid-refresh delays only its
+            // own entry, never the router.
+            JjWorkerRequest::QueryOverlayStats { reply } => {
+                let snapshot: Vec<_> = workers.values().cloned().collect();
+                std::thread::spawn(move || {
+                    let mut pending = Vec::new();
+                    for worker in snapshot {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        if worker
+                            .send(JjWorkerRequest::QueryOverlayStats { reply: tx })
+                            .is_ok()
+                        {
+                            pending.push(rx);
+                        }
+                    }
+                    let mut all = Vec::new();
+                    for rx in pending {
+                        if let Ok(stats) = rx.blocking_recv() {
+                            all.extend(stats);
+                        }
+                    }
+                    let _ = reply.send(all);
+                });
+            }
+            JjWorkerRequest::QueryOverlayStatsVerbose { reply } => {
+                let snapshot: Vec<_> = workers.values().cloned().collect();
+                std::thread::spawn(move || {
+                    let mut pending = Vec::new();
+                    for worker in snapshot {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        if worker
+                            .send(JjWorkerRequest::QueryOverlayStatsVerbose { reply: tx })
+                            .is_ok()
+                        {
+                            pending.push(rx);
+                        }
+                    }
+                    let mut all = Vec::new();
+                    for rx in pending {
+                        if let Ok(stats) = rx.blocking_recv() {
+                            all.extend(stats);
+                        }
+                    }
+                    let _ = reply.send(all);
+                });
+            }
+            req => {
+                let repo_path = match &req {
+                    JjWorkerRequest::FullRefresh { repo_path, .. }
+                    | JjWorkerRequest::ValidateAndRefresh { repo_path, .. }
+                    | JjWorkerRequest::IncrementalUpdate { repo_path, .. }
+                    | JjWorkerRequest::Resync { repo_path, .. } => repo_path.clone(),
+                    JjWorkerRequest::Forget { .. }
+                    | JjWorkerRequest::QueryOverlayStats { .. }
+                    | JjWorkerRequest::QueryOverlayStatsVerbose { .. } => {
+                        unreachable!("handled above")
+                    }
+                };
+                // A send fails only if the worker thread died (panicked);
+                // drop the stale sender and respawn for this repo.
+                let req = match workers.get(&repo_path) {
+                    Some(worker) => match worker.send(req) {
+                        Ok(()) => continue,
+                        Err(tokio::sync::mpsc::error::SendError(req)) => {
+                            workers.remove(&repo_path);
+                            req
+                        }
+                    },
+                    None => req,
+                };
+                let worker = spawn_repo_worker(handle.clone());
+                let _ = worker.send(req);
+                workers.insert(repo_path, worker);
+            }
+        }
+    }
+}
+
+/// Spawn a dedicated thread that owns a single repo's !Send jj-lib state.
+fn spawn_repo_worker(handle: tokio::runtime::Handle) -> mpsc::UnboundedSender<JjWorkerRequest> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        handle.block_on(repo_worker_loop(rx));
     });
     tx
 }
 
-async fn jj_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
-    let mut states: HashMap<PathBuf, JjRepoState> = HashMap::new();
+async fn repo_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
+    // The daemon-facing repo path (the router's map key), used to label
+    // overlay stats; `JjRepoState.repo_root` is canonicalized and may differ.
+    let mut worker_repo_path: Option<PathBuf> = None;
+    let mut repo_state: Option<JjRepoState> = None;
 
     while let Some(req) = rx.recv().await {
         match req {
@@ -1418,10 +1527,11 @@ async fn jj_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                 depth,
                 reply,
             } => {
+                worker_repo_path = Some(repo_path.clone());
                 let result = query_jj_lib(&repo_path, depth).await;
                 match result {
                     Ok((status, jj_state)) => {
-                        states.insert(repo_path, jj_state);
+                        repo_state = Some(jj_state);
                         let _ = reply.send(Ok(status));
                     }
                     Err(e) => {
@@ -1435,12 +1545,13 @@ async fn jj_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                 depth,
                 reply,
             } => {
-                let Some(state) = states.get_mut(&repo_path) else {
+                worker_repo_path = Some(repo_path.clone());
+                let Some(state) = repo_state.as_mut() else {
                     // No retained state — fall through to full refresh
                     let result = query_jj_lib(&repo_path, depth).await;
                     match result {
                         Ok((status, jj_state)) => {
-                            states.insert(repo_path, jj_state);
+                            repo_state = Some(jj_state);
                             let _ = reply.send(Ok(status));
                         }
                         Err(e) => {
@@ -1503,7 +1614,7 @@ async fn jj_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                         Ok((_, mut jj_state)) => {
                             apply_incremental_paths(&mut jj_state, &changed_paths).await;
                             let status = jj_state.current_status();
-                            states.insert(repo_path, jj_state);
+                            repo_state = Some(jj_state);
                             let _ = reply.send(Ok(status));
                         }
                         Err(e) => {
@@ -1517,7 +1628,8 @@ async fn jj_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                 changed_paths,
                 reply,
             } => {
-                let Some(state) = states.get_mut(&repo_path) else {
+                worker_repo_path = Some(repo_path.clone());
+                let Some(state) = repo_state.as_mut() else {
                     // No retained state — caller should do a full refresh instead
                     let _ = reply.send(Err(anyhow::anyhow!("no incremental state for repo")));
                     continue;
@@ -1542,15 +1654,16 @@ async fn jj_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                 // suspect. Rebuild from the store, then re-diff the files we
                 // previously knew were dirty (overlay keys); disk changes we
                 // never heard about at all can only be healed by the next op.
-                let prior_dirty: Vec<PathBuf> = states
-                    .get(&repo_path)
+                worker_repo_path = Some(repo_path.clone());
+                let prior_dirty: Vec<PathBuf> = repo_state
+                    .as_ref()
                     .map(|s| s.overlay.keys().map(|rel| s.repo_root.join(rel)).collect())
                     .unwrap_or_default();
                 match query_jj_lib(&repo_path, depth).await {
                     Ok((_, mut jj_state)) => {
                         apply_incremental_paths(&mut jj_state, &prior_dirty).await;
                         let status = jj_state.current_status();
-                        states.insert(repo_path, jj_state);
+                        repo_state = Some(jj_state);
                         let _ = reply.send(Ok(status));
                     }
                     Err(e) => {
@@ -1559,11 +1672,10 @@ async fn jj_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                 }
             }
             JjWorkerRequest::QueryOverlayStats { reply } => {
-                let stats: Vec<_> = states
-                    .iter()
-                    .map(|(path, state)| {
+                let stats = match (&worker_repo_path, &repo_state) {
+                    (Some(path), Some(state)) => {
                         let counts = state.aggregate_stats();
-                        (
+                        vec![(
                             path.to_string_lossy().to_string(),
                             crate::protocol::IncrementalDiffStats {
                                 base_files: state.base_file_stats.len() as u32,
@@ -1572,22 +1684,26 @@ async fn jj_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                                 lines_added: counts.lines_added,
                                 lines_removed: counts.lines_removed,
                             },
-                        )
-                    })
-                    .collect();
+                        )]
+                    }
+                    _ => Vec::new(),
+                };
                 let _ = reply.send(stats);
             }
             JjWorkerRequest::QueryOverlayStatsVerbose { reply } => {
-                let stats: Vec<_> = states
-                    .iter()
-                    .map(|(path, state)| {
+                let stats = match (&worker_repo_path, &repo_state) {
+                    (Some(path), Some(state)) => {
                         let dir_stats =
                             aggregate_overlay_stats_by_dir(&state.base_file_stats, &state.overlay);
-                        (path.to_string_lossy().to_string(), dir_stats)
-                    })
-                    .collect();
+                        vec![(path.to_string_lossy().to_string(), dir_stats)]
+                    }
+                    _ => Vec::new(),
+                };
                 let _ = reply.send(stats);
             }
+            // The router intercepts Forget; exit defensively if one slips
+            // through so the thread can't outlive its repo.
+            JjWorkerRequest::Forget { .. } => break,
         }
     }
 }
@@ -3393,6 +3509,94 @@ mod tests {
             (1, 2),
             "resync should re-diff known dirty files from disk"
         );
+    }
+
+    /// Router behavior: stats fan out across per-repo workers, Forget drops
+    /// a repo's state, and the next request respawns a fresh worker.
+    #[tokio::test]
+    async fn test_worker_router_forget_and_stats() {
+        let dir = create_jj_repo().await;
+        let config = Config {
+            color: false,
+            ..Default::default()
+        };
+        let jj_worker = spawn_jj_worker();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+
+        // Dirty a file so overlay stats have something to report
+        std::fs::write(dir.path().join("f.txt"), "a\n").unwrap();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::IncrementalUpdate {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![dir.path().join("f.txt")],
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(status.file_mad_count_working_tree, 1);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::QueryOverlayStats { reply: tx })
+            .unwrap();
+        let stats = rx.await.unwrap();
+        assert_eq!(stats.len(), 1, "fan-out should gather the repo's stats");
+        assert_eq!(stats[0].1.overlay_entries, 1);
+
+        // Forget drops the worker and its state (router handles requests in
+        // order, so the follow-up goes to a fresh worker with no state).
+        jj_worker
+            .send(JjWorkerRequest::Forget {
+                repo_path: dir.path().to_path_buf(),
+            })
+            .unwrap();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::IncrementalUpdate {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![dir.path().join("f.txt")],
+                reply: reply_tx,
+            })
+            .unwrap();
+        assert!(
+            reply_rx.await.unwrap().is_err(),
+            "incremental state should be gone after Forget"
+        );
+
+        // The respawned worker works normally: a full refresh rebuilds state
+        // (f.txt was never snapshotted, so the store-based diff is empty),
+        // after which incremental updates land again.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::FullRefresh {
+                repo_path: dir.path().to_path_buf(),
+                depth: config.bookmark_search_depth,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(status.file_mad_count_working_tree, 0);
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        jj_worker
+            .send(JjWorkerRequest::IncrementalUpdate {
+                repo_path: dir.path().to_path_buf(),
+                changed_paths: vec![dir.path().join("f.txt")],
+                reply: reply_tx,
+            })
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(status.file_mad_count_working_tree, 1);
     }
 
     /// A deleted file whose parent directories were also deleted must still
