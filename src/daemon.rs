@@ -36,7 +36,9 @@ struct DaemonState {
     /// Maps arbitrary directories to their repo root and VCS kind. Negatives are not cached.
     dir_to_repo: HashMap<PathBuf, (PathBuf, VcsKind)>,
     started_at: Instant,
-    config: Config,
+    /// Arc so per-query/per-refresh clones are a refcount bump, not a deep
+    /// copy of the template maps.
+    config: Arc<Config>,
     cache_dir: PathBuf,
     stats: DaemonStats,
     /// Repos currently being refreshed by watcher-triggered refresh_repo.
@@ -238,7 +240,7 @@ pub async fn run_daemon(
         watchers: HashMap::new(),
         dir_to_repo: HashMap::new(),
         started_at: Instant::now(),
-        config: config.clone(),
+        config: Arc::new(config.clone()),
         cache_dir: cache_dir.clone(),
         stats: DaemonStats::default(),
         refreshing: HashSet::new(),
@@ -1256,7 +1258,7 @@ async fn reload_config(config_path: &Path, state: &Arc<Mutex<DaemonState>>) {
         );
         st.not_ready_formatted =
             format_not_ready(&new_config.resolved_not_ready_format(), new_config.color);
-        st.config = new_config;
+        st.config = Arc::new(new_config);
         st.compiled_format = new_compiled;
     }
     st.config_error = config_err;
