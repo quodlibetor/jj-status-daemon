@@ -55,6 +55,16 @@ daemon, both VCS backends, and the client.
   produces jj's `{a => b} | N` stat. Previously the rename fingerprint used
   the parent-tree content instead of the last-snapshotted content, so the
   rename split into a bogus full delete + add. Found by the same soak.
+- **events on rename-source paths respect recorded pairings**: re-creating a
+  renamed file's source path cancels the rename (the target reverts to a
+  plain add, matching jj), and a source-path event after abandon/undo churn
+  no longer double-counts the delete that an existing `{a => b}` pairing
+  already represents. Found by the same soak.
+- **diffs against conflicted merge parents match jj**: incremental diffs now
+  materialize conflicted parent content unlabeled and re-parse on-disk
+  conflict markers into structured conflicts before diffing, mirroring jj's
+  own pipeline. Previously a touched conflict marker produced +1/-1 where jj
+  reports the full materialized diff. Found by the same soak.
 - **self-healing on every jj operation**: `ValidateAndRefresh` now compares the
   working-copy commit's tree (and the operation id) in addition to the parent
   tree. Same-parent checkouts (`jj abandon`, `jj edit` to a sibling,
