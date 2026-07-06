@@ -995,6 +995,23 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
         candidates.push((i, disk));
     }
     if !candidates.is_empty() {
+        // gix runs copy detection per parent: a record for (source, target)
+        // arises from parent P when the source is present in P, the target
+        // is absent in P, and source@P is >= 50% similar to target@wc.
+        // Crucially, the compared content is each parent's own side blob —
+        // NOT the merged-parent materialization: a conflicted source's
+        // marker text matches no parent-side blob, so jj pairs nothing and
+        // shows a plain delete + add. The number of record-producing
+        // parents decides the outcome: one → rename pairing; two or more →
+        // jj-lib's duplicate-record poisoning (`CopyRecords::add_records`
+        // discards duplicates: the target loses its origin and becomes a
+        // plain add, while the source's delete entry is still skipped by
+        // the stream's `has_source` check, silently vanishing).
+        let parent_trees: Vec<&jj_lib::merged_tree::MergedTree> = if state.parent_trees.is_empty() {
+            vec![&state.parent_tree]
+        } else {
+            state.parent_trees.iter().collect()
+        };
         for source_idx in 0..staged.len() {
             let source_deleted =
                 matches!(&staged[source_idx].1, Some(s) if s.kind == FileChangeKind::Deleted);
@@ -1006,54 +1023,69 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             else {
                 continue;
             };
-            let Ok(parent_value) = state.parent_tree.path_value(&source_path) else {
+
+            // Materialize the source's content in each parent that has it.
+            let mut parent_contents: Vec<(usize, Vec<u8>)> = Vec::new();
+            for (pi, tree) in parent_trees.iter().enumerate() {
+                let Ok(value) = tree.path_value(&source_path) else {
+                    continue;
+                };
+                if value.is_absent() {
+                    continue;
+                }
+                let Some(content) = materialized_content(
+                    &state.store,
+                    &source_path,
+                    value,
+                    tree.labels(),
+                    state.conflict_marker_style,
+                )
+                .await
+                else {
+                    continue;
+                };
+                if content.is_empty() {
+                    continue;
+                }
+                parent_contents.push((pi, content));
+            }
+            if parent_contents.is_empty() {
                 continue;
-            };
-            let Some(source_content) = materialized_content(
-                &state.store,
-                &source_path,
-                parent_value,
-                state.parent_tree.labels(),
-                state.conflict_marker_style,
-            )
-            .await
-            else {
-                continue;
-            };
-            let best = candidates
-                .iter()
-                .enumerate()
-                .map(|(ci, (_, disk))| (ci, content_similarity(&source_content, disk)))
-                .filter(|(_, score)| *score >= 0.5)
-                .max_by(|(_, a), (_, b)| a.total_cmp(b));
-            let Some((ci, _)) = best else {
+            }
+
+            // Best candidate by per-parent similarity, tracking how many
+            // parents produce a record for it.
+            let mut best: Option<(usize, f32, usize)> = None;
+            for (ci, (target_idx, disk)) in candidates.iter().enumerate() {
+                let Ok(target_path) =
+                    jj_lib::repo_path::RepoPathBuf::from_relative_path(&staged[*target_idx].0)
+                else {
+                    continue;
+                };
+                let mut records = 0usize;
+                let mut score = 0.0f32;
+                for (pi, content) in &parent_contents {
+                    let target_absent = parent_trees[*pi]
+                        .path_value(&target_path)
+                        .is_ok_and(|value| value.is_absent());
+                    if !target_absent {
+                        continue;
+                    }
+                    let similarity = content_similarity(content, disk);
+                    if similarity >= 0.5 {
+                        records += 1;
+                        score = score.max(similarity);
+                    }
+                }
+                if records > 0 && best.is_none_or(|(_, s, _)| score > s) {
+                    best = Some((ci, score, records));
+                }
+            }
+            let Some((ci, _, records)) = best else {
                 continue;
             };
             let (target_idx, target_disk) = candidates.swap_remove(ci);
-
-            // jj-lib discards duplicate copy records: when the source
-            // exists in multiple parents, each per-parent detection emits a
-            // record for the same target and `CopyRecords::add_records`
-            // poisons both maps (copies.rs). The target then loses its
-            // origin (plain add), while the source's delete entry is STILL
-            // skipped by the stream's `has_source` check — so the deletion
-            // silently vanishes from the stat. Mirror that quirk.
-            let record_parents = state
-                .parent_trees
-                .iter()
-                .filter(|tree| {
-                    let source_present = tree
-                        .path_value(&source_path)
-                        .is_ok_and(|value| !value.is_absent());
-                    let target_absent =
-                        jj_lib::repo_path::RepoPathBuf::from_relative_path(&staged[target_idx].0)
-                            .ok()
-                            .and_then(|path| tree.path_value(&path).ok())
-                            .is_none_or(|value| value.is_absent());
-                    source_present && target_absent
-                })
-                .count();
-            if record_parents >= 2 {
+            if records >= 2 {
                 staged[source_idx].1 = None;
                 continue;
             }
