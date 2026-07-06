@@ -766,6 +766,215 @@ async fn diff_single_file(
     diff_stats_for_contents(parent_content.as_deref(), disk_content)
 }
 
+/// A file's value at the snapshot level — the shape jj's working-copy
+/// snapshot records, abstracted from store ids to contents (content
+/// equality implies id equality, so structural equality of `WcValue`s
+/// matches jj's tree-value equality for everything the daemon tracks).
+#[derive(Clone, PartialEq, Eq)]
+enum WcValue {
+    Absent,
+    /// Resolved content bytes (plain file, symlink target as text).
+    Resolved(Vec<u8>),
+    /// Unresolved conflict: simplified per-side contents.
+    Conflict(jj_lib::merge::Merge<Vec<u8>>),
+}
+
+/// A [`WcValue`] plus, when it mirrors an existing tree value, the stored
+/// value itself. jj's diff emits an entry whenever the *stored* values
+/// differ — two conflicts with equal simplified contents but different
+/// shapes still show as `file | 0` — so equality compares raw values when
+/// both sides are tree-backed, contents otherwise (a value derived from
+/// disk gets ids from its content at snapshot time).
+struct WcEntry {
+    raw: Option<jj_lib::merge::MergedTreeValue>,
+    value: WcValue,
+}
+
+impl WcEntry {
+    fn derived(value: WcValue) -> Self {
+        WcEntry { raw: None, value }
+    }
+
+    fn same_value_as(&self, other: &WcEntry) -> bool {
+        match (&self.raw, &other.raw) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.value == other.value,
+        }
+    }
+}
+
+/// Normalize conflict sides: simplification may resolve the merge.
+fn normalize_conflict_sides(sides: jj_lib::merge::Merge<Vec<u8>>) -> WcValue {
+    let simplified = sides.simplify();
+    match simplified.as_resolved() {
+        Some(content) => WcValue::Resolved(content.clone()),
+        None => WcValue::Conflict(simplified),
+    }
+}
+
+/// Read a tree's value at `path` as a [`WcEntry`].
+async fn tree_wc_value(
+    store: &Arc<jj_lib::store::Store>,
+    tree: &jj_lib::merged_tree::MergedTree,
+    path: &jj_lib::repo_path::RepoPath,
+) -> WcEntry {
+    use jj_lib::conflicts::{MaterializedTreeValue, materialize_tree_value};
+
+    let Ok(raw) = tree.path_value(path) else {
+        return WcEntry::derived(WcValue::Absent);
+    };
+    let unlabeled = jj_lib::conflict_labels::ConflictLabels::unlabeled();
+    let Ok(materialized) = materialize_tree_value(store, path, raw.clone(), &unlabeled).await
+    else {
+        return WcEntry::derived(WcValue::Absent);
+    };
+    let value = match materialized {
+        MaterializedTreeValue::Absent
+        | MaterializedTreeValue::AccessDenied(_)
+        | MaterializedTreeValue::GitSubmodule(_)
+        | MaterializedTreeValue::Tree(_) => WcValue::Absent,
+        MaterializedTreeValue::File(mut file) => match file.read_all(path).await {
+            Ok(content) => WcValue::Resolved(content),
+            Err(_) => WcValue::Absent,
+        },
+        MaterializedTreeValue::Symlink { target, .. } => WcValue::Resolved(target.into_bytes()),
+        MaterializedTreeValue::FileConflict(file) => {
+            normalize_conflict_sides(file.contents.map(|side| side.to_vec()))
+        }
+        MaterializedTreeValue::OtherConflict { id, labels } => {
+            WcValue::Resolved(id.describe(&labels).into_bytes())
+        }
+    };
+    WcEntry {
+        raw: Some(raw),
+        value,
+    }
+}
+
+/// Synthesize the value jj's next snapshot would record for `path`, given
+/// the current disk content — the read-only mirror of jj-lib's
+/// `update_from_content` decision tree (conflicts.rs), built from the same
+/// primitives: `files::merge_hunks` classifies the existing conflict's
+/// hunks, `conflicts::parse_conflict` parses markers back from disk (with
+/// the WC value's simplified arity and the checkout's marker length via
+/// `choose_materialized_conflict_marker_len`), and the "unchanged" checks
+/// retain the WC value verbatim. (`update_from_content` itself writes
+/// blobs to the store, which the daemon must never do.)
+async fn synthetic_wc_value(
+    store: &Arc<jj_lib::store::Store>,
+    commit_tree: &jj_lib::merged_tree::MergedTree,
+    path: &jj_lib::repo_path::RepoPath,
+    disk_content: Option<&[u8]>,
+    visible_if_untracked: bool,
+) -> WcEntry {
+    use jj_lib::conflicts::{choose_materialized_conflict_marker_len, parse_conflict};
+    use jj_lib::files::MergeResult;
+
+    let Some(disk) = disk_content else {
+        return WcEntry::derived(WcValue::Absent);
+    };
+    let commit_entry = tree_wc_value(store, commit_tree, path).await;
+    match &commit_entry.value {
+        // Untracked: the snapshot starts tracking the file unless it is
+        // ignored — an ignored untracked file is invisible to jj.
+        WcValue::Absent => {
+            if visible_if_untracked {
+                WcEntry::derived(WcValue::Resolved(disk.to_vec()))
+            } else {
+                commit_entry
+            }
+        }
+        // Tracked resolved file: the snapshot stores the disk content.
+        WcValue::Resolved(_) => WcEntry::derived(WcValue::Resolved(disk.to_vec())),
+        // Tracked conflict: parse markers back, `update_from_content`-style.
+        WcValue::Conflict(sides) => {
+            let old_hunks = jj_lib::files::merge_hunks(sides, store.merge_options());
+            let marker_len = choose_materialized_conflict_marker_len(sides);
+            let new_hunks = parse_conflict(disk, sides.num_sides(), marker_len);
+            // "Unchanged" short-circuit: keep the WC value so unchanged
+            // conflicts aren't updated to partially-resolved contents.
+            let unchanged = match (&old_hunks, &new_hunks) {
+                (MergeResult::Resolved(old), None) => &old[..] == disk,
+                (MergeResult::Conflict(old), Some(new)) => old == new,
+                _ => false,
+            };
+            if unchanged {
+                return commit_entry;
+            }
+            match new_hunks {
+                // No parseable markers: resolved to the raw bytes.
+                None => WcEntry::derived(WcValue::Resolved(disk.to_vec())),
+                Some(hunks) => {
+                    let mut new_sides: jj_lib::merge::Merge<Vec<u8>> = sides.map(|_| Vec::new());
+                    for hunk in hunks {
+                        if let Some(resolved) = hunk.as_resolved() {
+                            for side in new_sides.iter_mut() {
+                                side.extend_from_slice(resolved);
+                            }
+                        } else {
+                            for (side, piece) in std::iter::zip(new_sides.iter_mut(), hunk.iter()) {
+                                side.extend_from_slice(piece);
+                            }
+                        }
+                    }
+                    WcEntry::derived(normalize_conflict_sides(new_sides))
+                }
+            }
+        }
+    }
+}
+
+/// Materialize a [`WcValue`] to the unlabeled text jj's `diff --stat`
+/// compares (conflicts render with unlabeled markers, DiffStats-style).
+fn wc_value_text(
+    store: &Arc<jj_lib::store::Store>,
+    value: &WcValue,
+    marker_style: ConflictMarkerStyle,
+) -> Option<Vec<u8>> {
+    use jj_lib::conflicts::{
+        ConflictMaterializeOptions, choose_materialized_conflict_marker_len,
+        materialize_merge_result_to_bytes,
+    };
+
+    match value {
+        WcValue::Absent => None,
+        WcValue::Resolved(content) => Some(content.clone()),
+        WcValue::Conflict(sides) => {
+            let options = ConflictMaterializeOptions {
+                marker_style,
+                marker_len: Some(choose_materialized_conflict_marker_len(sides)),
+                merge: store.merge_options().clone(),
+            };
+            let unlabeled = jj_lib::conflict_labels::ConflictLabels::unlabeled();
+            Some(materialize_merge_result_to_bytes(sides, &unlabeled, &options).into())
+        }
+    }
+}
+
+/// Diff two snapshot-level values jj-style: an entry exists iff the values
+/// differ; line stats come from the unlabeled texts, so a value change with
+/// identical text (conflict-shape change, hunk-resolvable conflict vs its
+/// resolution) yields a zero-line Modified entry (`file | 0`).
+fn diff_wc_values(
+    store: &Arc<jj_lib::store::Store>,
+    before: &WcEntry,
+    after: &WcEntry,
+    marker_style: ConflictMarkerStyle,
+) -> Option<FileDiffStats> {
+    if before.same_value_as(after) {
+        return None;
+    }
+    let before_text = wc_value_text(store, &before.value, marker_style);
+    let after_text = wc_value_text(store, &after.value, marker_style);
+    match diff_stats_for_contents(before_text.as_deref(), after_text.as_deref()) {
+        Some(stats) => Some(stats),
+        None => Some(FileDiffStats {
+            kind: FileChangeKind::Modified,
+            ..Default::default()
+        }),
+    }
+}
+
 /// Whether a rename/copy source path re-created on disk is *visible* to jj.
 /// A file that is untracked (absent from the WC commit tree) AND ignored is
 /// invisible to the snapshot, so its presence on disk does not void a
@@ -842,71 +1051,61 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
         };
         // Read file from disk (None if deleted/missing)
         let disk_content = std::fs::read(abs_path).ok();
-        let mut diff_result = diff_single_file(
-            &state.store,
-            &state.parent_tree,
-            &repo_path_buf,
-            disk_content.as_deref(),
-            state.conflict_marker_style,
-        )
-        .await;
-        match &mut diff_result {
-            // A rename target that now matches the source content is still
-            // one changed file (the rename itself), not "no change".
-            None if renamed_from.is_some() => {
-                diff_result = Some(FileDiffStats {
-                    kind: FileChangeKind::Modified,
-                    renamed_from,
-                    ..Default::default()
-                });
-            }
-            Some(stats) if renamed_from.is_some() && stats.kind == FileChangeKind::Modified => {
-                stats.renamed_from = renamed_from;
-                stats.content_hash = None;
-            }
-            // An Added result means the file is absent from the *parent*
-            // tree — but trackedness is membership in the *WC commit* tree
-            // (the last snapshot): a file snapshotted before a .gitignore
-            // started covering it stays tracked, and jj keeps diffing it.
-            // Only a file that is untracked (absent from the commit tree
-            // too) AND ignored is invisible to jj — record "no change" so
-            // stale entries heal. Tracked files stay in the diff regardless
-            // of ignore rules, matching jj.
-            Some(stats)
-                if stats.kind == FileChangeKind::Added
-                    && !not_ignored.contains(abs_path.as_path())
-                    && state
-                        .commit_tree
-                        .path_value(&repo_path_buf)
-                        .map_or(true, |v| v.is_absent()) =>
-            {
-                diff_result = None;
-            }
-            _ => {}
-        }
-
-        // A None result (disk content equal to the parent materialization)
-        // may still be a standing zero-line change: when the parent and
-        // WC-commit *values* differ with a conflict involved (conflict
-        // shape change, hunk-resolvable conflict vs resolved file), jj
-        // keeps reporting `file | 0` — equal *text* doesn't heal the value
-        // difference. With both values resolved, equal content means equal
-        // values, and None correctly heals the entry.
-        if diff_result.is_none()
-            && !had_renamed_from
-            && disk_content.is_some()
-            && let (Ok(parent_value), Ok(commit_value)) = (
-                state.parent_tree.path_value(&repo_path_buf),
-                state.commit_tree.path_value(&repo_path_buf),
+        let mut diff_result = if had_renamed_from {
+            // Copy-record redirect: diff disk content against the SOURCE's
+            // parent value (jj's resolve_copy_source), and keep the target
+            // classified as a rename/copy target.
+            let mut result = diff_single_file(
+                &state.store,
+                &state.parent_tree,
+                &repo_path_buf,
+                disk_content.as_deref(),
+                state.conflict_marker_style,
             )
-            && parent_value != commit_value
-            && (!parent_value.is_resolved() || !commit_value.is_resolved())
-        {
-            diff_result = Some(FileDiffStats {
-                kind: FileChangeKind::Modified,
-                ..Default::default()
-            });
-        }
+            .await;
+            match &mut result {
+                // A rename target that now matches the source content is
+                // still one changed file (the rename itself), not "no
+                // change".
+                None => {
+                    result = Some(FileDiffStats {
+                        kind: FileChangeKind::Modified,
+                        renamed_from,
+                        ..Default::default()
+                    });
+                }
+                Some(stats) if stats.kind == FileChangeKind::Modified => {
+                    stats.renamed_from = renamed_from;
+                    stats.content_hash = None;
+                }
+                _ => {}
+            }
+            result
+        } else {
+            // Snapshot-faithful path: synthesize the value jj's next
+            // snapshot would record for this path, and diff it against the
+            // parent value. An entry exists iff the values differ, which
+            // covers trackedness (a file snapshotted before a .gitignore
+            // covered it stays tracked), ignored-untracked invisibility,
+            // and standing zero-line value changes (`file | 0`) uniformly.
+            let visible_if_untracked = not_ignored.contains(abs_path.as_path());
+            let parent_value =
+                tree_wc_value(&state.store, &state.parent_tree, &repo_path_buf).await;
+            let synthetic = synthetic_wc_value(
+                &state.store,
+                &state.commit_tree,
+                &repo_path_buf,
+                disk_content.as_deref(),
+                visible_if_untracked,
+            )
+            .await;
+            diff_wc_values(
+                &state.store,
+                &parent_value,
+                &synthetic,
+                state.conflict_marker_style,
+            )
+        };
 
         // Events on a recorded rename *source* (some target maps back to
         // this path via renamed_from, in the base or the overlay):
@@ -1134,14 +1333,17 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
 
     // Copy detection, mirroring gix's `CopySource::FromSetOfModifiedFiles`
     // (jj's GitBackend::get_copy_records enables `copies` at 50%): an Added
-    // entry whose content is >= 50% similar to a *modified* file's
-    // parent-side content becomes a COPY target — `{src => dst} | N` with
-    // stats against the source's parent content — while the source keeps
-    // its own modified entry. This can fire retroactively: modifying a file
-    // converts an existing plain add into a copy of it, and reverting the
-    // file dissolves the copy (handled by the invalidation pass above plus
-    // this re-pairing). Duplicate records (source qualifying via multiple
-    // parents) are discarded by jj-lib, leaving the plain add.
+    // entry >= 50% similar to a *modified* file becomes a COPY target —
+    // `{src => dst} | N` with stats against the source's parent content —
+    // while the source keeps its own modified entry. The similarity match
+    // uses the source's NEW content (a gix Modification's `Change::id()` is
+    // the post-image blob), while the resulting stats diff against the
+    // source's parent value (resolve_copy_source). This can fire
+    // retroactively: modifying a file converts an existing plain add into a
+    // copy of it, and reverting the file dissolves the copy (handled by the
+    // invalidation pass above plus this re-pairing). Duplicate records
+    // (source qualifying via multiple parents) are discarded by jj-lib,
+    // leaving the plain add.
     let mut modified_sources: Vec<String> = Vec::new();
     let mut added_targets: Vec<String> = Vec::new();
     for path in &all_paths {
@@ -1178,40 +1380,29 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                 else {
                     continue;
                 };
-                let mut records = 0usize;
-                let mut score = 0.0f32;
-                for tree in &parent_trees {
-                    let Ok(value) = tree.path_value(&source_path) else {
-                        continue;
-                    };
-                    if value.is_absent() {
-                        continue;
-                    }
-                    let target_absent = tree
-                        .path_value(&target_path)
-                        .is_ok_and(|value| value.is_absent());
-                    if !target_absent {
-                        continue;
-                    }
-                    let Some(content) = materialized_content(
-                        &state.store,
-                        &source_path,
-                        value,
-                        tree.labels(),
-                        state.conflict_marker_style,
-                    )
-                    .await
-                    else {
-                        continue;
-                    };
-                    let similarity = content_similarity(&content, &target_disk);
-                    if similarity >= 0.5 {
-                        records += 1;
-                        score = score.max(similarity);
-                    }
+                // The copy-source content gix matches against is the
+                // modified file's NEW (working-copy) content.
+                let Ok(source_new) = std::fs::read(state.repo_root.join(source_rel)) else {
+                    continue;
+                };
+                let similarity = content_similarity(&source_new, &target_disk);
+                if similarity < 0.5 {
+                    continue;
                 }
-                if records > 0 && best.is_none_or(|(_, s, _)| score > s) {
-                    best = Some((source_rel, score, records));
+                let records = parent_trees
+                    .iter()
+                    .filter(|tree| {
+                        let source_present = tree
+                            .path_value(&source_path)
+                            .is_ok_and(|value| !value.is_absent());
+                        let target_absent = tree
+                            .path_value(&target_path)
+                            .is_ok_and(|value| value.is_absent());
+                        source_present && target_absent
+                    })
+                    .count();
+                if records > 0 && best.is_none_or(|(_, s, _)| similarity > s) {
+                    best = Some((source_rel, similarity, records));
                 }
             }
             let Some((source_rel, _, records)) = best else {
