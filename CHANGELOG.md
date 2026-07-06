@@ -94,6 +94,16 @@ daemon, both VCS backends, and the client.
   latent conflict parse-arity bug (markers are now parsed with the
   working-copy value's arity, not the parent's). No performance change:
   the path stays O(touched files).
+- **repo-level marker-style changes apply to in-flight incremental state**:
+  `jj config set --repo ui.conflict-marker-style` creates no operation and
+  no watcher event, so the engine's cached style could go stale;
+  incremental batches now re-resolve it (cheap, mtime-cached). Found by
+  the same soak.
+- **rewriting a rename target dissolves the pairing**: gix re-detects
+  copies from scratch on every diff, so overwriting a paired target with
+  dissimilar content makes jj report a plain add and resurfaces the
+  source's suppressed delete; recorded pairings are now re-validated with
+  the same per-parent record predicate. Found by the same soak.
 - **copy targets match on current content**: gix matches a copy target
   against a modified source's post-image, not its parent content — a
   rename source re-created with different content no longer re-pairs.

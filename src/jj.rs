@@ -356,9 +356,10 @@ pub struct JjRepoState {
     /// started, but the op rewrote the working copy on disk). When the op
     /// advanced with unchanged trees, overlay entries must be re-diffed.
     op_id: jj_lib::op_store::OperationId,
-    /// The user's `ui.conflict-marker-style` at the time of the last full
-    /// refresh; conflicted parent values must materialize with the same
-    /// markers jj wrote to disk or unchanged files diff as modified.
+    /// The user's current `ui.conflict-marker-style`. Set at full refresh
+    /// and re-resolved on every incremental batch: a config change creates
+    /// no op and no watcher event, yet jj's very next `diff --stat`
+    /// materializes conflicted values with the new style.
     conflict_marker_style: ConflictMarkerStyle,
     /// Ignore rules for this repo. Files that are untracked AND ignored
     /// are invisible to `jj diff` (jj never auto-tracks them), so they
@@ -975,6 +976,69 @@ fn diff_wc_values(
     }
 }
 
+/// Count parents that would produce a gix copy/rename record for
+/// (source → target-with-this-content): the source present in that
+/// parent's gix-visible tree, the target absent there, and the source's
+/// content >= 50% similar to the target's. gix re-detects on every diff,
+/// so a recorded pairing is only as durable as the current similarity.
+async fn rename_record_parents(
+    state: &JjRepoState,
+    source_rel: &str,
+    target_rel: &str,
+    target_disk: Option<&[u8]>,
+) -> usize {
+    let Some(disk) = target_disk else {
+        return 0;
+    };
+    if disk.is_empty() {
+        return 0;
+    }
+    let Ok(source_path) = jj_lib::repo_path::RepoPathBuf::from_relative_path(source_rel) else {
+        return 0;
+    };
+    let Ok(target_path) = jj_lib::repo_path::RepoPathBuf::from_relative_path(target_rel) else {
+        return 0;
+    };
+    let parent_trees: Vec<&jj_lib::merged_tree::MergedTree> = if state.parent_trees.is_empty() {
+        vec![&state.parent_tree]
+    } else {
+        state.parent_trees.iter().collect()
+    };
+    let mut records = 0;
+    for tree in parent_trees {
+        let Ok(value) = tree.path_value(&source_path) else {
+            continue;
+        };
+        if value.is_absent() {
+            continue;
+        }
+        let target_absent = tree
+            .path_value(&target_path)
+            .is_ok_and(|value| value.is_absent());
+        if !target_absent {
+            continue;
+        }
+        let Some(content) = materialized_content(
+            &state.store,
+            &source_path,
+            value,
+            tree.labels(),
+            state.conflict_marker_style,
+        )
+        .await
+        else {
+            continue;
+        };
+        if content.is_empty() {
+            continue;
+        }
+        if content_similarity(&content, disk) >= 0.5 {
+            records += 1;
+        }
+    }
+    records
+}
+
 /// Whether a rename/copy source path re-created on disk is *visible* to jj.
 /// A file that is untracked (absent from the WC commit tree) AND ignored is
 /// invisible to the snapshot, so its presence on disk does not void a
@@ -1007,6 +1071,11 @@ fn source_visible_on_disk(state: &JjRepoState, source_rel: &str) -> bool {
 /// results in the overlay. Paths are deduplicated — each is re-read from
 /// disk at processing time, so duplicates are pure wasted work.
 async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathBuf]) {
+    // ui.conflict-marker-style can change between snapshots without any op
+    // or watcher event, and jj's next `diff --stat` uses the current value —
+    // re-resolve per batch (cheap: config reads are mtime-cached).
+    state.conflict_marker_style = conflict_marker_style_for_repo(&state.repo_root);
+
     // Classify paths through the ignore rules (this also lazily ingests any
     // .gitignore/.jjignore files present in the batch).
     let vcs_dir = state.repo_root.join(".jj");
@@ -1031,26 +1100,64 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
         let Some(rel_str) = abs_to_repo_relative(&state.repo_root, abs_path) else {
             continue;
         };
+        // Read file from disk (None if deleted/missing)
+        let disk_content = std::fs::read(abs_path).ok();
+
         // If the base recorded this path as a rename target, diff the disk
         // content against the *source's* parent content, as jj's copy-aware
-        // diff does — otherwise the target looks like a fresh Add.
-        let renamed_from = state
+        // diff does — otherwise the target looks like a fresh Add. The
+        // premise must be re-validated against the CURRENT state: gix
+        // re-detects on every diff, so the pairing holds only while
+        // - the source stays invisible to jj (a visibly re-created source
+        //   turns the target back into a plain file; an ignored untracked
+        //   re-creation does not), and
+        // - exactly one parent still produces a record for the target's
+        //   new content. Zero records (target rewritten dissimilarly) void
+        //   the pairing AND resurface the source's suppressed delete;
+        //   two or more hit jj-lib's duplicate-record poisoning (plain-add
+        //   target, delete stays dropped).
+        let base_renamed_from = state
             .base_file_stats
             .get(&rel_str)
-            .and_then(|s| s.renamed_from.clone())
-            // The rename premise holds only while the source is invisible
-            // to jj — a visibly re-created source turns the target back
-            // into a plain file (jj drops the pairing at the next
-            // snapshot), but an ignored untracked re-creation does not.
-            .filter(|src| !source_visible_on_disk(state, src));
+            .and_then(|s| s.renamed_from.clone());
+        let mut resurrect_source: Option<String> = None;
+        let renamed_from = match base_renamed_from {
+            Some(src) if !source_visible_on_disk(state, &src) => {
+                match rename_record_parents(state, &src, &rel_str, disk_content.as_deref()).await {
+                    1 => Some(src),
+                    0 => {
+                        resurrect_source = Some(src);
+                        None
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         let had_renamed_from = renamed_from.is_some();
         let parent_lookup = renamed_from.as_deref().unwrap_or(&rel_str);
         let Ok(repo_path_buf) = jj_lib::repo_path::RepoPathBuf::from_relative_path(parent_lookup)
         else {
             continue;
         };
-        // Read file from disk (None if deleted/missing)
-        let disk_content = std::fs::read(abs_path).ok();
+        if let Some(src_rel) = resurrect_source
+            && let Ok(src_path) = jj_lib::repo_path::RepoPathBuf::from_relative_path(&src_rel)
+        {
+            // The base suppressed the source's delete on behalf of the
+            // now-void pairing; recompute its plain entry. Disk content is
+            // passed as None deliberately: the source is invisible to the
+            // snapshot (absent, or ignored and untracked).
+            let parent_value = tree_wc_value(&state.store, &state.parent_tree, &src_path).await;
+            let synthetic =
+                synthetic_wc_value(&state.store, &state.commit_tree, &src_path, None, false).await;
+            let plain = diff_wc_values(
+                &state.store,
+                &parent_value,
+                &synthetic,
+                state.conflict_marker_style,
+            );
+            staged.push((src_rel, plain));
+        }
         let mut diff_result = if had_renamed_from {
             // Copy-record redirect: diff disk content against the SOURCE's
             // parent value (jj's resolve_copy_source), and keep the target
