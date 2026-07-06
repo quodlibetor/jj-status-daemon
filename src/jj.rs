@@ -340,12 +340,15 @@ pub struct JjRepoState {
     /// stats must then be rebuilt from the store — watcher events alone
     /// cannot be relied on to repair them.
     commit_tree: jj_lib::merged_tree::MergedTree,
-    /// The individual parent trees (not the merged tree). jj's copy
-    /// detection runs per parent: under a merge a path that exists in the
-    /// *merged* parent tree can still be a rename target (an addition
-    /// relative to the parent that owned the source), and a source present
-    /// in multiple parents produces duplicate copy records that jj-lib
-    /// discards — both outcomes depend on which parents contain a path.
+    /// The individual parent trees as gix sees them: the FIRST term of each
+    /// parent's root-tree merge (`GitBackend::read_tree_for_commit` uses
+    /// `tree.first()`), so a conflicted parent contributes that term's
+    /// blobs, never marker text or the merged view. jj's copy detection
+    /// runs per parent: under a merge a path that exists in the *merged*
+    /// parent tree can still be a rename target (an addition relative to
+    /// the parent that owned the source), and a source present in multiple
+    /// parents produces duplicate copy records that jj-lib discards — all
+    /// of it depends on which parents contain a path.
     parent_trees: Vec<jj_lib::merged_tree::MergedTree>,
     /// Operation ID at the time this state was built. Tree ID comparison
     /// alone misses A→B→A sequences (e.g. `jj abandon` snapshots a dirty
@@ -406,38 +409,17 @@ pub fn aggregate_overlay_stats(
         }
     }
 
-    // Track Added/Deleted entries by content fingerprint for rename pairing.
-    let mut adds_by_hash: HashMap<u64, (u32, u32)> = HashMap::new(); // hash -> (count, lines)
-    let mut dels_by_hash: HashMap<u64, (u32, u32)> = HashMap::new();
-    let mut note = |stats: &FileDiffStats| {
-        if let Some(hash) = stats.content_hash {
-            match stats.kind {
-                FileChangeKind::Added => {
-                    let e = adds_by_hash.entry(hash).or_insert((0, stats.lines_added));
-                    e.0 += 1;
-                }
-                FileChangeKind::Deleted => {
-                    let e = dels_by_hash.entry(hash).or_insert((0, stats.lines_removed));
-                    e.0 += 1;
-                }
-                _ => {}
-            }
-        }
-    };
-
     // Process base entries, checking for overlay overrides
     for (path, stats) in base {
         match overlay.get(path) {
             Some(Some(overlay_stats)) => {
                 tally(&mut counts, overlay_stats);
-                note(overlay_stats);
             }
             Some(None) => {
                 // File reverted to parent — excluded from diff
             }
             None => {
                 tally(&mut counts, stats);
-                note(stats);
             }
         }
     }
@@ -449,27 +431,14 @@ pub fn aggregate_overlay_stats(
         }
         if let Some(stats) = entry {
             tally(&mut counts, stats);
-            note(stats);
         }
     }
 
-    // Exact-rename pairing: an Added and a Deleted entry with identical
-    // content are one renamed file to git/jj (`{a => b} | 0`), not two
-    // changes. Pair them up and reclassify, subtracting the phantom lines.
-    // (Fuzzy renames — moved AND edited within one snapshot window — are
-    // resolved by jj's copy records at the next full refresh instead.)
-    for (hash, (add_count, add_lines)) in &adds_by_hash {
-        let Some((del_count, del_lines)) = dels_by_hash.get(hash) else {
-            continue;
-        };
-        let pairs = (*add_count).min(*del_count);
-        counts.file_mad_count -= pairs;
-        counts.lines_added -= pairs * add_lines;
-        counts.lines_removed -= pairs * del_lines;
-        counts.files_added -= pairs;
-        counts.files_deleted -= pairs;
-        counts.files_modified += pairs;
-    }
+    // Rename/copy pairing is NOT done here: jj's verdict depends on
+    // per-parent tree contents (gix copy detection), which plain
+    // Added/Deleted hash equality cannot reproduce — it both misses fuzzy
+    // renames and pairs cases jj splits. Pairing is resolved into the
+    // overlay entries themselves by `apply_incremental_paths`.
 
     counts
 }
@@ -797,6 +766,34 @@ async fn diff_single_file(
     diff_stats_for_contents(parent_content.as_deref(), disk_content)
 }
 
+/// Whether a rename/copy source path re-created on disk is *visible* to jj.
+/// A file that is untracked (absent from the WC commit tree) AND ignored is
+/// invisible to the snapshot, so its presence on disk does not void a
+/// rename premise — jj keeps pairing `{dir => dir2}/f` while the re-created
+/// source is ignored.
+fn source_visible_on_disk(state: &JjRepoState, source_rel: &str) -> bool {
+    let abs = state.repo_root.join(source_rel);
+    if !abs.exists() {
+        return false;
+    }
+    let tracked = jj_lib::repo_path::RepoPathBuf::from_relative_path(source_rel)
+        .ok()
+        .and_then(|path| state.commit_tree.path_value(&path).ok())
+        .is_some_and(|value| !value.is_absent());
+    if tracked {
+        return true;
+    }
+    let vcs_dir = state.repo_root.join(".jj");
+    let git_dir = state.repo_root.join(".git");
+    let colocated_git_dir = git_dir.exists().then_some(git_dir);
+    let verdict = state.ignore_filter.process_event(
+        &vcs_dir,
+        colocated_git_dir.as_deref(),
+        std::slice::from_ref(&abs),
+    );
+    !verdict.changed_paths.is_empty()
+}
+
 /// Diff each changed path on disk against the parent tree and record the
 /// results in the overlay. Paths are deduplicated — each is re-read from
 /// disk at processing time, so duplicates are pure wasted work.
@@ -832,10 +829,11 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             .base_file_stats
             .get(&rel_str)
             .and_then(|s| s.renamed_from.clone())
-            // The rename premise holds only while the source is gone from
-            // disk — a re-created source turns the target back into a plain
-            // file (jj drops the copy pairing at the next snapshot).
-            .filter(|src| !state.repo_root.join(src).exists());
+            // The rename premise holds only while the source is invisible
+            // to jj — a visibly re-created source turns the target back
+            // into a plain file (jj drops the pairing at the next
+            // snapshot), but an ignored untracked re-creation does not.
+            .filter(|src| !source_visible_on_disk(state, src));
         let had_renamed_from = renamed_from.is_some();
         let parent_lookup = renamed_from.as_deref().unwrap_or(&rel_str);
         let Ok(repo_path_buf) = jj_lib::repo_path::RepoPathBuf::from_relative_path(parent_lookup)
@@ -912,11 +910,12 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
 
         // Events on a recorded rename *source* (some target maps back to
         // this path via renamed_from, in the base or the overlay):
-        // - source still gone → its Deleted entry is subsumed by the rename
-        //   (jj's copies stream suppresses the source's delete);
-        // - source re-created → the rename premise is void: re-diff every
-        //   target as a plain file (jj shows a plain add — a rename needs
-        //   the source to be gone).
+        // - source still invisible to jj (gone, or re-created but ignored
+        //   and untracked) → its entry is subsumed by the rename (jj's
+        //   copies stream suppresses the source's delete);
+        // - source visibly re-created → the rename premise is void:
+        //   re-diff every target as a plain file (jj shows a plain add —
+        //   a rename needs the source to be gone).
         let rename_targets: Vec<String> = state
             .base_file_stats
             .iter()
@@ -935,7 +934,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             )
             .collect();
         if !rename_targets.is_empty() {
-            if disk_content.is_none() {
+            if !source_visible_on_disk(state, &rel_str) {
                 diff_result = None;
             } else {
                 for target_rel in rename_targets {
@@ -970,55 +969,79 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
     // the source's parent content (jj's `{a => b} | N` fuzzy stat) and the
     // source's delete entry is suppressed, as jj's copies stream does.
     //
-    // Candidate targets are staged Adds; under a merge parent, staged
-    // Modifies qualify too — gix pairs additions per parent, so a path that
-    // arrived from the *other* merge side (present in the merged parent
-    // tree) is still an addition relative to the source-owning parent, and
-    // the old target baseline vanishes (`{e.rs => d.txt} | 0`).
-    let mut candidates: Vec<(usize, Vec<u8>)> = Vec::new();
-    for (i, (rel, result)) in staged.iter().enumerate() {
-        let Some(stats) = result else { continue };
+    // Pairing operates on the *composite* diff state (staged over overlay
+    // over base), not just this batch: jj's copy detection at the next
+    // snapshot sees the whole diff, so a delete recorded batches ago pairs
+    // with an add arriving now.
+    let effective = |path: &str, staged: &[(String, Option<FileDiffStats>)]| {
+        if let Some((_, result)) = staged.iter().rev().find(|(p, _)| p == path) {
+            return result.clone();
+        }
+        if let Some(entry) = state.overlay.get(path) {
+            return entry.clone();
+        }
+        state.base_file_stats.get(path).cloned()
+    };
+    let all_paths: HashSet<String> = state
+        .base_file_stats
+        .keys()
+        .chain(state.overlay.keys())
+        .cloned()
+        .chain(staged.iter().map(|(path, _)| path.clone()))
+        .collect();
+    let parent_trees: Vec<&jj_lib::merged_tree::MergedTree> = if state.parent_trees.is_empty() {
+        vec![&state.parent_tree]
+    } else {
+        state.parent_trees.iter().collect()
+    };
+
+    // Candidate rename targets: effective Adds; under a merge parent,
+    // effective Modifies qualify too — gix pairs additions per parent, so a
+    // path that arrived from the *other* merge side (present in the merged
+    // parent tree) is still an addition relative to the source-owning
+    // parent, and the old target baseline vanishes (`{e.rs => d.txt} | 0`).
+    let mut candidates: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut sources: Vec<String> = Vec::new();
+    for path in &all_paths {
+        let Some(stats) = effective(path, &staged) else {
+            continue;
+        };
         if stats.renamed_from.is_some() {
             continue;
         }
-        let eligible = stats.kind == FileChangeKind::Added
-            || (stats.kind == FileChangeKind::Modified && state.parent_trees.len() > 1);
-        if !eligible {
-            continue;
+        match stats.kind {
+            FileChangeKind::Deleted => sources.push(path.clone()),
+            FileChangeKind::Added => {}
+            FileChangeKind::Modified if state.parent_trees.len() > 1 => {}
+            _ => continue,
         }
-        let Ok(disk) = std::fs::read(state.repo_root.join(rel)) else {
-            continue;
-        };
-        if disk.is_empty() {
-            continue;
+        if stats.kind != FileChangeKind::Deleted {
+            let Ok(disk) = std::fs::read(state.repo_root.join(path)) else {
+                continue;
+            };
+            if disk.is_empty() {
+                continue;
+            }
+            candidates.push((path.clone(), disk));
         }
-        candidates.push((i, disk));
     }
+    sources.sort();
+    candidates.sort_by(|(a, _), (b, _)| a.cmp(b));
     if !candidates.is_empty() {
         // gix runs copy detection per parent: a record for (source, target)
         // arises from parent P when the source is present in P, the target
         // is absent in P, and source@P is >= 50% similar to target@wc.
-        // Crucially, the compared content is each parent's own side blob —
-        // NOT the merged-parent materialization: a conflicted source's
-        // marker text matches no parent-side blob, so jj pairs nothing and
-        // shows a plain delete + add. The number of record-producing
-        // parents decides the outcome: one → rename pairing; two or more →
-        // jj-lib's duplicate-record poisoning (`CopyRecords::add_records`
-        // discards duplicates: the target loses its origin and becomes a
-        // plain add, while the source's delete entry is still skipped by
-        // the stream's `has_source` check, silently vanishing).
-        let parent_trees: Vec<&jj_lib::merged_tree::MergedTree> = if state.parent_trees.is_empty() {
-            vec![&state.parent_tree]
-        } else {
-            state.parent_trees.iter().collect()
-        };
-        for source_idx in 0..staged.len() {
-            let source_deleted =
-                matches!(&staged[source_idx].1, Some(s) if s.kind == FileChangeKind::Deleted);
-            if !source_deleted {
-                continue;
-            }
-            let source_rel = staged[source_idx].0.clone();
+        // Crucially, the compared content is each parent's own gix-visible
+        // blob — NOT the merged-parent materialization: a conflicted
+        // source's marker text matches no parent-side blob, so jj pairs
+        // nothing and shows a plain delete + add. The number of
+        // record-producing parents decides the outcome: one → rename
+        // pairing; two or more → jj-lib's duplicate-record poisoning
+        // (`CopyRecords::add_records` discards duplicates: the target loses
+        // its origin and becomes a plain add, while the source's delete
+        // entry is still skipped by the stream's `has_source` check,
+        // silently vanishing).
+        for source_rel in sources {
             let Ok(source_path) = jj_lib::repo_path::RepoPathBuf::from_relative_path(&source_rel)
             else {
                 continue;
@@ -1056,9 +1079,9 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             // Best candidate by per-parent similarity, tracking how many
             // parents produce a record for it.
             let mut best: Option<(usize, f32, usize)> = None;
-            for (ci, (target_idx, disk)) in candidates.iter().enumerate() {
+            for (ci, (target_rel, disk)) in candidates.iter().enumerate() {
                 let Ok(target_path) =
-                    jj_lib::repo_path::RepoPathBuf::from_relative_path(&staged[*target_idx].0)
+                    jj_lib::repo_path::RepoPathBuf::from_relative_path(target_rel)
                 else {
                     continue;
                 };
@@ -1084,9 +1107,9 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             let Some((ci, _, records)) = best else {
                 continue;
             };
-            let (target_idx, target_disk) = candidates.swap_remove(ci);
+            let (target_rel, target_disk) = candidates.swap_remove(ci);
             if records >= 2 {
-                staged[source_idx].1 = None;
+                staged.push((source_rel, None));
                 continue;
             }
 
@@ -1103,9 +1126,117 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             .unwrap_or_default();
             stats.kind = FileChangeKind::Modified;
             stats.content_hash = None;
-            stats.renamed_from = Some(source_rel);
-            staged[target_idx].1 = Some(stats);
-            staged[source_idx].1 = None;
+            stats.renamed_from = Some(source_rel.clone());
+            staged.push((target_rel, Some(stats)));
+            staged.push((source_rel, None));
+        }
+    }
+
+    // Copy detection, mirroring gix's `CopySource::FromSetOfModifiedFiles`
+    // (jj's GitBackend::get_copy_records enables `copies` at 50%): an Added
+    // entry whose content is >= 50% similar to a *modified* file's
+    // parent-side content becomes a COPY target — `{src => dst} | N` with
+    // stats against the source's parent content — while the source keeps
+    // its own modified entry. This can fire retroactively: modifying a file
+    // converts an existing plain add into a copy of it, and reverting the
+    // file dissolves the copy (handled by the invalidation pass above plus
+    // this re-pairing). Duplicate records (source qualifying via multiple
+    // parents) are discarded by jj-lib, leaving the plain add.
+    let mut modified_sources: Vec<String> = Vec::new();
+    let mut added_targets: Vec<String> = Vec::new();
+    for path in &all_paths {
+        let Some(stats) = effective(path, &staged) else {
+            continue;
+        };
+        if stats.renamed_from.is_some() {
+            continue;
+        }
+        match stats.kind {
+            FileChangeKind::Modified => modified_sources.push(path.clone()),
+            FileChangeKind::Added => added_targets.push(path.clone()),
+            _ => {}
+        }
+    }
+    if !modified_sources.is_empty() && !added_targets.is_empty() {
+        modified_sources.sort();
+        added_targets.sort();
+        for target_rel in &added_targets {
+            let Ok(target_path) = jj_lib::repo_path::RepoPathBuf::from_relative_path(target_rel)
+            else {
+                continue;
+            };
+            let Ok(target_disk) = std::fs::read(state.repo_root.join(target_rel)) else {
+                continue;
+            };
+            if target_disk.is_empty() {
+                continue;
+            }
+            let mut best: Option<(&String, f32, usize)> = None;
+            for source_rel in &modified_sources {
+                let Ok(source_path) =
+                    jj_lib::repo_path::RepoPathBuf::from_relative_path(source_rel)
+                else {
+                    continue;
+                };
+                let mut records = 0usize;
+                let mut score = 0.0f32;
+                for tree in &parent_trees {
+                    let Ok(value) = tree.path_value(&source_path) else {
+                        continue;
+                    };
+                    if value.is_absent() {
+                        continue;
+                    }
+                    let target_absent = tree
+                        .path_value(&target_path)
+                        .is_ok_and(|value| value.is_absent());
+                    if !target_absent {
+                        continue;
+                    }
+                    let Some(content) = materialized_content(
+                        &state.store,
+                        &source_path,
+                        value,
+                        tree.labels(),
+                        state.conflict_marker_style,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    let similarity = content_similarity(&content, &target_disk);
+                    if similarity >= 0.5 {
+                        records += 1;
+                        score = score.max(similarity);
+                    }
+                }
+                if records > 0 && best.is_none_or(|(_, s, _)| score > s) {
+                    best = Some((source_rel, score, records));
+                }
+            }
+            let Some((source_rel, _, records)) = best else {
+                continue;
+            };
+            if records >= 2 {
+                continue;
+            }
+            let Ok(source_path) = jj_lib::repo_path::RepoPathBuf::from_relative_path(source_rel)
+            else {
+                continue;
+            };
+            let mut stats = diff_single_file(
+                &state.store,
+                &state.parent_tree,
+                &source_path,
+                Some(&target_disk),
+                state.conflict_marker_style,
+            )
+            .await
+            .unwrap_or_default();
+            stats.kind = FileChangeKind::Modified;
+            stats.content_hash = None;
+            stats.renamed_from = Some(source_rel.clone());
+            staged.push((target_rel.clone(), Some(stats)));
         }
     }
 
@@ -1663,11 +1794,21 @@ async fn compute_jj_full_status(
 
     let commit_tree = current_tree.clone();
     let retained_parent_tree = parent_tree.unwrap_or(current_tree);
-    // Individual parent trees for per-parent copy-detection decisions
-    // (Commit::tree() is a cheap lazy constructor). Failures degrade to
-    // "no per-parent knowledge" — single-parent behavior.
+    // Individual parent trees for per-parent copy-detection decisions,
+    // projected to the first term of each root-tree merge — the tree gix
+    // actually reads (GitBackend::read_tree_for_commit). Failures degrade
+    // to "no per-parent knowledge" — single-parent behavior.
     let parent_trees = match loaded.commit.parents().await {
-        Ok(parents) => parents.iter().map(|p| p.tree()).collect(),
+        Ok(parents) => parents
+            .iter()
+            .map(|parent| {
+                jj_lib::merged_tree::MergedTree::new(
+                    loaded.repo.store().clone(),
+                    jj_lib::merge::Merge::resolved(parent.tree_ids().first().clone()),
+                    jj_lib::conflict_labels::ConflictLabels::unlabeled(),
+                )
+            })
+            .collect(),
         Err(_) => Vec::new(),
     };
 
