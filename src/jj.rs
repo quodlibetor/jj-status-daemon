@@ -285,6 +285,33 @@ fn content_fingerprint(content: &[u8]) -> Option<u64> {
     Some(hash)
 }
 
+/// Similarity score in [0, 1] between two contents, approximating gix's
+/// rename-tracking metric (gix-diff `rewrites/tracker.rs`:
+/// `(old_len - removed_bytes) / max(old_len, new_len)` — the fraction of
+/// the larger side covered by source bytes retained across the diff).
+/// jj's git backend pairs delete+add as a rename at >= 50% similarity
+/// (`GitBackend::get_copy_records` configures
+/// `gix::diff::Rewrites { percentage: Some(0.5), .. }`).
+fn content_similarity(before: &[u8], after: &[u8]) -> f32 {
+    if before.is_empty() || after.is_empty() {
+        // gix sets track_empty: false — empty files never pair.
+        return 0.0;
+    }
+    if before == after {
+        return 1.0;
+    }
+    if is_binary(before) || is_binary(after) {
+        return 0.0;
+    }
+    let diff = diff_by_line([before, after], &LineCompareMode::Exact);
+    let removed: usize = diff
+        .hunks()
+        .filter(|hunk| hunk.kind == DiffHunkKind::Different)
+        .map(|hunk| hunk.contents[0].len())
+        .sum();
+    (before.len() - removed) as f32 / before.len().max(after.len()) as f32
+}
+
 /// Aggregated diff statistics including per-category file counts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DiffCounts {
@@ -313,6 +340,11 @@ pub struct JjRepoState {
     /// stats must then be rebuilt from the store — watcher events alone
     /// cannot be relied on to repair them.
     commit_tree: jj_lib::merged_tree::MergedTree,
+    /// Whether the WC commit has multiple parents. jj's copy detection runs
+    /// per parent, so under a merge a path that exists in the *merged*
+    /// parent tree can still be a rename target (it is an addition relative
+    /// to the parent that owned the rename source).
+    parent_is_merge: bool,
     /// Operation ID at the time this state was built. Tree ID comparison
     /// alone misses A→B→A sequences (e.g. `jj abandon` snapshots a dirty
     /// file into @ and then discards it — both trees end up as they
@@ -608,6 +640,14 @@ async fn compute_per_file_diff_stats(
                 renamed_from,
                 ..Default::default()
             },
+            // The stream yields entries only when tree values differ, so
+            // equal materialized contents (conflict-shape change resolving
+            // to the same text, exec-bit flip) still count as one changed
+            // file with zero lines — jj shows `file | 0`.
+            None if before.is_some() => FileDiffStats {
+                kind: FileChangeKind::Modified,
+                ..Default::default()
+            },
             None => continue,
         };
 
@@ -895,25 +935,40 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
         staged.push((rel_str, diff_result));
     }
 
-    // Same-batch exact-rename pairing: an OS rename delivers a Deleted for
-    // the source and an Added for the target in one batch. The content that
-    // identifies the pair is the source's *last-snapshotted* content (the WC
-    // commit tree) — not its parent-tree content: snapshotted-but-uncommitted
-    // edits travel with the file. A pair becomes one rename target diffed
-    // against the source's parent content (jj's `{a => b} | N` fuzzy stat),
-    // and the source's delete entry is suppressed, mirroring what jj's copy
-    // records produce at the next full refresh.
-    let mut added_by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, (_, result)) in staged.iter().enumerate() {
-        if let Some(stats) = result
-            && stats.kind == FileChangeKind::Added
-            && stats.renamed_from.is_none()
-            && let Some(hash) = stats.content_hash
-        {
-            added_by_hash.entry(hash).or_default().push(i);
+    // Same-batch rename pairing, mirroring jj's copy detection. jj computes
+    // copy records at diff time via gix rename tracking between the *diff
+    // endpoints* — source content in the parent tree vs target content in
+    // the working copy — pairing at >= 50% similarity
+    // (`GitBackend::get_copy_records`: `gix::diff::Rewrites { percentage:
+    // Some(0.5), .. }`). A pair becomes one rename target diffed against
+    // the source's parent content (jj's `{a => b} | N` fuzzy stat) and the
+    // source's delete entry is suppressed, as jj's copies stream does.
+    //
+    // Candidate targets are staged Adds; under a merge parent, staged
+    // Modifies qualify too — gix pairs additions per parent, so a path that
+    // arrived from the *other* merge side (present in the merged parent
+    // tree) is still an addition relative to the source-owning parent, and
+    // the old target baseline vanishes (`{e.rs => d.txt} | 0`).
+    let mut candidates: Vec<(usize, Vec<u8>)> = Vec::new();
+    for (i, (rel, result)) in staged.iter().enumerate() {
+        let Some(stats) = result else { continue };
+        if stats.renamed_from.is_some() {
+            continue;
         }
+        let eligible = stats.kind == FileChangeKind::Added
+            || (stats.kind == FileChangeKind::Modified && state.parent_is_merge);
+        if !eligible {
+            continue;
+        }
+        let Ok(disk) = std::fs::read(state.repo_root.join(rel)) else {
+            continue;
+        };
+        if disk.is_empty() {
+            continue;
+        }
+        candidates.push((i, disk));
     }
-    if !added_by_hash.is_empty() {
+    if !candidates.is_empty() {
         for source_idx in 0..staged.len() {
             let source_deleted =
                 matches!(&staged[source_idx].1, Some(s) if s.kind == FileChangeKind::Deleted);
@@ -925,35 +980,35 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             else {
                 continue;
             };
-            let Ok(value) = state.commit_tree.path_value(&source_path) else {
+            let Ok(parent_value) = state.parent_tree.path_value(&source_path) else {
                 continue;
             };
-            if value.is_absent() {
-                continue;
-            }
-            let Some(content) = materialized_content(
+            let Some(source_content) = materialized_content(
                 &state.store,
                 &source_path,
-                value,
-                state.commit_tree.labels(),
+                parent_value,
+                state.parent_tree.labels(),
                 state.conflict_marker_style,
             )
             .await
             else {
                 continue;
             };
-            let Some(hash) = content_fingerprint(&content) else {
+            let best = candidates
+                .iter()
+                .enumerate()
+                .map(|(ci, (_, disk))| (ci, content_similarity(&source_content, disk)))
+                .filter(|(_, score)| *score >= 0.5)
+                .max_by(|(_, a), (_, b)| a.total_cmp(b));
+            let Some((ci, _)) = best else {
                 continue;
             };
-            let Some(target_idx) = added_by_hash.get_mut(&hash).and_then(|v| v.pop()) else {
-                continue;
-            };
-            let target_disk = std::fs::read(state.repo_root.join(&staged[target_idx].0)).ok();
+            let (target_idx, target_disk) = candidates.swap_remove(ci);
             let mut stats = diff_single_file(
                 &state.store,
                 &state.parent_tree,
                 &source_path,
-                target_disk.as_deref(),
+                Some(&target_disk),
                 state.conflict_marker_style,
             )
             .await
@@ -1522,12 +1577,14 @@ async fn compute_jj_full_status(
 
     let commit_tree = current_tree.clone();
     let retained_parent_tree = parent_tree.unwrap_or(current_tree);
+    let parent_is_merge = loaded.commit.parent_ids().len() > 1;
 
     let jj_state = JjRepoState {
         store: loaded.repo.store().clone(),
         parent_tree_ids: retained_parent_tree.tree_ids().clone(),
         parent_tree: retained_parent_tree,
         commit_tree,
+        parent_is_merge,
         op_id: loaded.repo.op_id().clone(),
         conflict_marker_style,
         ignore_filter: crate::watcher::IgnoreFilter::new(&repo_root, crate::protocol::VcsKind::Jj),
