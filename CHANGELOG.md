@@ -94,6 +94,12 @@ daemon, both VCS backends, and the client.
   latent conflict parse-arity bug (markers are now parsed with the
   working-copy value's arity, not the parent's). No performance change:
   the path stays O(touched files).
+- **snapshot-induced conflict re-simplification is modeled**: a jj snapshot
+  that writes anything re-simplifies the stored shape of every conflicted
+  path in the tree (jj-lib MergedTree::resolve), surfacing `file | 0`
+  entries for conflicted files nothing touched. The engine now tracks
+  conflicted paths (O(conflicts), free when conflict-free) and restages
+  them with simplified values on writing batches. Found by the same soak.
 - **repo-level marker-style changes apply to in-flight incremental state**:
   `jj config set --repo ui.conflict-marker-style` creates no operation and
   no watcher event, so the engine's cached style could go stale;

@@ -366,6 +366,14 @@ pub struct JjRepoState {
     /// must not produce overlay entries — otherwise a file written before
     /// a `.gitignore` started covering it leaves a permanent phantom Add.
     ignore_filter: crate::watcher::IgnoreFilter,
+    /// Paths conflicted in the WC commit tree, collected once per full
+    /// refresh (O(conflicts): `MergedTree::conflicts` recurses only into
+    /// conflicted subtrees). A snapshot that actually *writes* re-resolves
+    /// the whole tree merge (`MergedTree::resolve` simplifies every
+    /// conflict's shape), so conflicted paths WITHOUT their own disk
+    /// changes still get new stored values — content-identical,
+    /// shape-different: jj reports `file | 0`.
+    conflicted_paths: Vec<jj_lib::repo_path::RepoPathBuf>,
     /// Per-file stats from the last full jj-lib diff (parent_tree vs commit.tree()).
     base_file_stats: HashMap<String, FileDiffStats>,
     /// Overlay: per-file stats computed from disk reads for working copy files.
@@ -861,10 +869,9 @@ async fn tree_wc_value(
 /// `choose_materialized_conflict_marker_len`), and the "unchanged" checks
 /// retain the WC value verbatim. (`update_from_content` itself writes
 /// blobs to the store, which the daemon must never do.)
-async fn synthetic_wc_value(
+fn synthetic_wc_value(
     store: &Arc<jj_lib::store::Store>,
-    commit_tree: &jj_lib::merged_tree::MergedTree,
-    path: &jj_lib::repo_path::RepoPath,
+    commit_entry: WcEntry,
     disk_content: Option<&[u8]>,
     visible_if_untracked: bool,
 ) -> WcEntry {
@@ -874,7 +881,6 @@ async fn synthetic_wc_value(
     let Some(disk) = disk_content else {
         return WcEntry::derived(WcValue::Absent);
     };
-    let commit_entry = tree_wc_value(store, commit_tree, path).await;
     match &commit_entry.value {
         // Untracked: the snapshot starts tracking the file unless it is
         // ignored — an ignored untracked file is invisible to jj.
@@ -1093,6 +1099,11 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
     // delete+add before committing anything to the overlay.
     let mut staged: Vec<(String, Option<FileDiffStats>)> = Vec::new();
     let mut seen = HashSet::new();
+    // Does this batch make the next snapshot actually write a new tree?
+    let mut snapshot_writes = false;
+    // Paths whose staged value was derived from disk this batch (must not
+    // be overridden by the conflict-simplification post-pass).
+    let mut derived_this_batch: HashSet<String> = HashSet::new();
     for abs_path in changed_paths {
         if !seen.insert(abs_path) {
             continue;
@@ -1148,8 +1159,8 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             // passed as None deliberately: the source is invisible to the
             // snapshot (absent, or ignored and untracked).
             let parent_value = tree_wc_value(&state.store, &state.parent_tree, &src_path).await;
-            let synthetic =
-                synthetic_wc_value(&state.store, &state.commit_tree, &src_path, None, false).await;
+            let commit_entry = tree_wc_value(&state.store, &state.commit_tree, &src_path).await;
+            let synthetic = synthetic_wc_value(&state.store, commit_entry, None, false);
             let plain = diff_wc_values(
                 &state.store,
                 &parent_value,
@@ -1158,10 +1169,36 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             );
             staged.push((src_rel, plain));
         }
+
+        // Whether jj's next snapshot would WRITE for this path (its stored
+        // value changes). Any write triggers the tree-wide conflict
+        // simplification mirrored after this loop.
+        let target_path_buf = jj_lib::repo_path::RepoPathBuf::from_relative_path(&rel_str).ok();
+        if let Some(target_path) = &target_path_buf {
+            let commit_entry = tree_wc_value(&state.store, &state.commit_tree, target_path).await;
+            let visible_if_untracked = had_renamed_from || not_ignored.contains(abs_path.as_path());
+            let synthetic = synthetic_wc_value(
+                &state.store,
+                WcEntry {
+                    raw: commit_entry.raw.clone(),
+                    value: commit_entry.value.clone(),
+                },
+                disk_content.as_deref(),
+                visible_if_untracked,
+            );
+            if !synthetic.same_value_as(&commit_entry) {
+                snapshot_writes = true;
+            }
+            if synthetic.raw.is_none() {
+                derived_this_batch.insert(rel_str.clone());
+            }
+        }
+
         let mut diff_result = if had_renamed_from {
             // Copy-record redirect: diff disk content against the SOURCE's
             // parent value (jj's resolve_copy_source), and keep the target
             // classified as a rename/copy target.
+            derived_this_batch.insert(rel_str.clone());
             let mut result = diff_single_file(
                 &state.store,
                 &state.parent_tree,
@@ -1198,14 +1235,14 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             let visible_if_untracked = not_ignored.contains(abs_path.as_path());
             let parent_value =
                 tree_wc_value(&state.store, &state.parent_tree, &repo_path_buf).await;
+            let commit_entry =
+                tree_wc_value(&state.store, &state.commit_tree, &repo_path_buf).await;
             let synthetic = synthetic_wc_value(
                 &state.store,
-                &state.commit_tree,
-                &repo_path_buf,
+                commit_entry,
                 disk_content.as_deref(),
                 visible_if_untracked,
-            )
-            .await;
+            );
             diff_wc_values(
                 &state.store,
                 &parent_value,
@@ -1275,6 +1312,38 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
     // the source's parent content (jj's `{a => b} | N` fuzzy stat) and the
     // source's delete entry is suppressed, as jj's copies stream does.
     //
+    // A snapshot that actually writes re-resolves the whole working-copy
+    // tree merge (`MergedTree::resolve` simplifies every conflict's shape),
+    // so conflicted paths WITHOUT their own disk changes still get new
+    // stored values — content-identical but shape-different, which jj
+    // reports as `file | 0`. Mirror it: when this batch changes any value,
+    // restage every conflicted path against the simplified form of its
+    // stored value. Bounded by the number of conflicts, never O(repo).
+    if snapshot_writes {
+        for path in &state.conflicted_paths {
+            let rel = path.as_internal_file_string().to_string();
+            if derived_this_batch.contains(&rel) {
+                continue;
+            }
+            let Ok(stored_raw) = state.commit_tree.path_value(path) else {
+                continue;
+            };
+            let commit_entry = tree_wc_value(&state.store, &state.commit_tree, path).await;
+            let simplified = WcEntry {
+                raw: Some(stored_raw.simplify()),
+                value: commit_entry.value,
+            };
+            let parent_entry = tree_wc_value(&state.store, &state.parent_tree, path).await;
+            let entry = diff_wc_values(
+                &state.store,
+                &parent_entry,
+                &simplified,
+                state.conflict_marker_style,
+            );
+            staged.push((rel, entry));
+        }
+    }
+
     // Pairing operates on the *composite* diff state (staged over overlay
     // over base), not just this batch: jj's copy detection at the next
     // snapshot sees the whole diff, so a delete recorded batches ago pairs
@@ -2091,6 +2160,13 @@ async fn compute_jj_full_status(
         .unwrap_or_else(|_| repo_path.to_path_buf());
 
     let commit_tree = current_tree.clone();
+    // Conflicted paths in the WC commit, for the writing-snapshot
+    // simplification mirror (see `JjRepoState::conflicted_paths`).
+    let conflicted_paths: Vec<jj_lib::repo_path::RepoPathBuf> = if commit_tree.has_conflict() {
+        commit_tree.conflicts().map(|(path, _)| path).collect()
+    } else {
+        Vec::new()
+    };
     let retained_parent_tree = parent_tree.unwrap_or(current_tree);
     // Individual parent trees for per-parent copy-detection decisions,
     // projected to the first term of each root-tree merge — the tree gix
@@ -2119,6 +2195,7 @@ async fn compute_jj_full_status(
         op_id: loaded.repo.op_id().clone(),
         conflict_marker_style,
         ignore_filter: crate::watcher::IgnoreFilter::new(&repo_root, crate::protocol::VcsKind::Jj),
+        conflicted_paths,
         base_file_stats,
         overlay: HashMap::new(),
         repo_root,
