@@ -369,9 +369,8 @@ pub struct JjRepoState {
     /// Paths conflicted in the WC commit tree, collected once per full
     /// refresh (O(conflicts): `MergedTree::conflicts` recurses only into
     /// conflicted subtrees). A snapshot that actually *writes* re-resolves
-    /// the whole tree merge (`MergedTree::resolve` simplifies every
-    /// conflict's shape), so conflicted paths WITHOUT their own disk
-    /// changes still get new stored values — content-identical,
+    /// the whole tree merge, so conflicted paths WITHOUT their own disk
+    /// changes can still get new stored values — content-identical but
     /// shape-different: jj reports `file | 0`.
     conflicted_paths: Vec<jj_lib::repo_path::RepoPathBuf>,
     /// Per-file stats from the last full jj-lib diff (parent_tree vs commit.tree()).
@@ -827,11 +826,20 @@ async fn tree_wc_value(
     tree: &jj_lib::merged_tree::MergedTree,
     path: &jj_lib::repo_path::RepoPath,
 ) -> WcEntry {
-    use jj_lib::conflicts::{MaterializedTreeValue, materialize_tree_value};
-
     let Ok(raw) = tree.path_value(path) else {
         return WcEntry::derived(WcValue::Absent);
     };
+    raw_wc_value(store, path, raw).await
+}
+
+/// Build a [`WcEntry`] from a raw tree value.
+async fn raw_wc_value(
+    store: &Arc<jj_lib::store::Store>,
+    path: &jj_lib::repo_path::RepoPath,
+    raw: jj_lib::merge::MergedTreeValue,
+) -> WcEntry {
+    use jj_lib::conflicts::{MaterializedTreeValue, materialize_tree_value};
+
     let unlabeled = jj_lib::conflict_labels::ConflictLabels::unlabeled();
     let Ok(materialized) = materialize_tree_value(store, path, raw.clone(), &unlabeled).await
     else {
@@ -982,6 +990,71 @@ fn diff_wc_values(
     }
 }
 
+/// `Merge::get_simplified_mapping`'s algorithm with a caller-supplied
+/// equality predicate over ORIGINAL term indices: cancel (remove, add)
+/// pairs whose terms compare equal, returning the surviving original
+/// indices (interleaved add/remove order preserved).
+fn simplified_mapping_by(len: usize, eq: &dyn Fn(usize, usize) -> bool) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..len).collect();
+    let mut add_index = 0;
+    while add_index < indices.len() {
+        let add_original = indices[add_index];
+        let found = indices
+            .iter()
+            .enumerate()
+            .skip(1)
+            .step_by(2)
+            .find(|(_, original_remove)| eq(**original_remove, add_original))
+            .map(|(remove_index, _)| remove_index);
+        if let Some(remove_index) = found {
+            indices.swap(remove_index + 1, add_index);
+            indices.drain(remove_index..remove_index + 2);
+        } else {
+            add_index += 2;
+        }
+    }
+    indices
+}
+
+/// Whether two root-tree terms become equal after this batch's overrides:
+/// either the tree ids already match, or every differing path is one the
+/// batch overwrote with a RESOLVED value (a resolved override is applied
+/// identically to every term, erasing the difference). Walks only the
+/// subtrees where the two terms differ.
+async fn terms_equal_after_overrides(
+    store: &Arc<jj_lib::store::Store>,
+    a: &jj_lib::backend::TreeId,
+    b: &jj_lib::backend::TreeId,
+    collapsed_paths: &HashSet<String>,
+) -> bool {
+    use futures::StreamExt as _;
+
+    if a == b {
+        return true;
+    }
+    if collapsed_paths.is_empty() {
+        return false;
+    }
+    let unlabeled = jj_lib::conflict_labels::ConflictLabels::unlabeled();
+    let tree_a = jj_lib::merged_tree::MergedTree::new(
+        store.clone(),
+        jj_lib::merge::Merge::resolved(a.clone()),
+        unlabeled.clone(),
+    );
+    let tree_b = jj_lib::merged_tree::MergedTree::new(
+        store.clone(),
+        jj_lib::merge::Merge::resolved(b.clone()),
+        unlabeled,
+    );
+    let mut stream = tree_a.diff_stream(&tree_b, &EverythingMatcher);
+    while let Some(entry) = stream.next().await {
+        if !collapsed_paths.contains(entry.path.as_internal_file_string()) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Count parents that would produce a gix copy/rename record for
 /// (source → target-with-this-content): the source present in that
 /// parent's gix-visible tree, the target absent there, and the source's
@@ -1104,6 +1177,10 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
     // Paths whose staged value was derived from disk this batch (must not
     // be overridden by the conflict-simplification post-pass).
     let mut derived_this_batch: HashSet<String> = HashSet::new();
+    // Batch paths whose new value is RESOLVED (or absent): the snapshot's
+    // tree builder applies these identically to every root-tree term,
+    // erasing inter-term differences at that path.
+    let mut resolved_override_paths: HashSet<String> = HashSet::new();
     for abs_path in changed_paths {
         if !seen.insert(abs_path) {
             continue;
@@ -1188,6 +1265,9 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             );
             if !synthetic.same_value_as(&commit_entry) {
                 snapshot_writes = true;
+                if matches!(synthetic.value, WcValue::Resolved(_) | WcValue::Absent) {
+                    resolved_override_paths.insert(rel_str.clone());
+                }
             }
             if synthetic.raw.is_none() {
                 derived_this_batch.insert(rel_str.clone());
@@ -1312,35 +1392,73 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
     // the source's parent content (jj's `{a => b} | N` fuzzy stat) and the
     // source's delete entry is suppressed, as jj's copies stream does.
     //
-    // A snapshot that actually writes re-resolves the whole working-copy
-    // tree merge (`MergedTree::resolve` simplifies every conflict's shape),
-    // so conflicted paths WITHOUT their own disk changes still get new
-    // stored values — content-identical but shape-different, which jj
-    // reports as `file | 0`. Mirror it: when this batch changes any value,
-    // restage every conflicted path against the simplified form of its
-    // stored value. Bounded by the number of conflicts, never O(repo).
-    if snapshot_writes {
-        for path in &state.conflicted_paths {
-            let rel = path.as_internal_file_string().to_string();
-            if derived_this_batch.contains(&rel) {
-                continue;
+    // A snapshot that actually writes re-simplifies the root tree merge
+    // (`MergedTreeBuilder::write_tree`: overrides per term, then root-level
+    // `simplify_with` + `resolve()`). A (remove, add) TERM pair cancels
+    // when the two whole trees become equal after the batch's overrides —
+    // a resolved override is applied identically to every term, so term
+    // pairs whose differences are confined to resolved-override paths
+    // cancel, dropping those terms from EVERY path's stored value.
+    // Untouched conflicted paths then differ from the parent by shape with
+    // identical contents: jj reports `file | 0`. (A conflicted override
+    // keeps terms distinct — no cancellation, no phantom entries.)
+    // Bounded by the number of conflicts, never O(repo).
+    if snapshot_writes && !state.conflicted_paths.is_empty() {
+        let term_ids: Vec<jj_lib::backend::TreeId> =
+            state.commit_tree.tree_ids().iter().cloned().collect();
+        let len = term_ids.len();
+        let mut eq = vec![vec![false; len]; len];
+        for i in 0..len {
+            eq[i][i] = true;
+            for j in (i + 1)..len {
+                let equal = terms_equal_after_overrides(
+                    &state.store,
+                    &term_ids[i],
+                    &term_ids[j],
+                    &resolved_override_paths,
+                )
+                .await;
+                eq[i][j] = equal;
+                eq[j][i] = equal;
             }
-            let Ok(stored_raw) = state.commit_tree.path_value(path) else {
-                continue;
-            };
-            let commit_entry = tree_wc_value(&state.store, &state.commit_tree, path).await;
-            let simplified = WcEntry {
-                raw: Some(stored_raw.simplify()),
-                value: commit_entry.value,
-            };
-            let parent_entry = tree_wc_value(&state.store, &state.parent_tree, path).await;
-            let entry = diff_wc_values(
-                &state.store,
-                &parent_entry,
-                &simplified,
-                state.conflict_marker_style,
-            );
-            staged.push((rel, entry));
+        }
+        let mapping = simplified_mapping_by(len, &|a, b| eq[a][b]);
+        if mapping.len() != len {
+            let same_change = state.store.merge_options().same_change;
+            for path in &state.conflicted_paths {
+                let rel = path.as_internal_file_string().to_string();
+                if derived_this_batch.contains(&rel) {
+                    continue;
+                }
+                let Ok(stored) = state.commit_tree.path_value(path) else {
+                    continue;
+                };
+                let values: Vec<_> = stored.iter().cloned().collect();
+                if values.len() != len {
+                    continue;
+                }
+                let projected = jj_lib::merge::Merge::from_vec(
+                    mapping
+                        .iter()
+                        .map(|&i| values[i].clone())
+                        .collect::<Vec<_>>(),
+                );
+                // jj's subsequent resolve() preserves arity except for
+                // trivial per-path resolution.
+                let projected = match projected.resolve_trivial(same_change) {
+                    Some(value) => jj_lib::merge::Merge::resolved(value.clone()),
+                    None => projected,
+                };
+                let new_entry = raw_wc_value(&state.store, path, projected).await;
+                let parent_entry = tree_wc_value(&state.store, &state.parent_tree, path).await;
+                let entry = diff_wc_values(
+                    &state.store,
+                    &parent_entry,
+                    &new_entry,
+                    state.conflict_marker_style,
+                );
+                staged.push((rel, entry));
+            }
         }
     }
 
