@@ -350,6 +350,12 @@ pub struct JjRepoState {
     /// parents produces duplicate copy records that jj-lib discards — all
     /// of it depends on which parents contain a path.
     parent_trees: Vec<jj_lib::merged_tree::MergedTree>,
+    /// The WC commit's parent commit ids. An op can change the parent SET
+    /// without changing either tree id (e.g. merging with an empty change
+    /// on the same tree — a freshly added workspace's WC), which flips
+    /// per-parent copy-detection outcomes; the metadata-only fast path must
+    /// not retain per-parent state across such ops.
+    parent_commit_ids: Vec<CommitId>,
     /// Operation ID at the time this state was built. Tree ID comparison
     /// alone misses A→B→A sequences (e.g. `jj abandon` snapshots a dirty
     /// file into @ and then discards it — both trees end up as they
@@ -2408,6 +2414,7 @@ async fn compute_jj_full_status(
         parent_tree: retained_parent_tree,
         commit_tree,
         parent_trees,
+        parent_commit_ids: loaded.commit.parent_ids().to_vec(),
         op_id: loaded.repo.op_id().clone(),
         conflict_marker_style,
         ignore_filter: crate::watcher::IgnoreFilter::new(&repo_root, crate::protocol::VcsKind::Jj),
@@ -2742,12 +2749,18 @@ async fn repo_worker_loop(mut rx: mpsc::UnboundedReceiver<JjWorkerRequest>) {
                         }
                     };
 
+                // Parent commit IDs are part of the check: an op can change
+                // the parent SET without changing either tree (merging with
+                // an empty same-tree change, e.g. a fresh workspace's WC),
+                // and per-parent copy-detection state would go stale.
                 let trees_unchanged = loaded.parent_tree_ids == state.parent_tree_ids
-                    && loaded.commit.tree_ids() == state.commit_tree.tree_ids();
+                    && loaded.commit.tree_ids() == state.commit_tree.tree_ids()
+                    && loaded.commit.parent_ids() == state.parent_commit_ids;
 
                 if trees_unchanged {
-                    // Neither the parent tree nor the WC commit tree changed —
-                    // metadata-only update. Keep base_file_stats and overlay.
+                    // Neither the parent tree, the WC commit tree, nor the
+                    // parent set changed — metadata-only update. Keep
+                    // base_file_stats and overlay.
                     tracing::debug!(
                         repo = %repo_path.display(),
                         "parent and commit trees unchanged — metadata-only refresh"
