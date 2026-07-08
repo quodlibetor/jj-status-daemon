@@ -119,8 +119,16 @@ daemon, both VCS backends, and the client.
 - **repo-level marker-style changes apply to in-flight incremental state**:
   `jj config set --repo ui.conflict-marker-style` creates no operation and
   no watcher event, so the engine's cached style could go stale;
-  incremental batches now re-resolve it (cheap, mtime-cached). Found by
-  the same soak.
+  incremental batches now re-resolve it (cheap, mtime-cached), and a
+  detected change re-derives every base/overlay entry that could embed
+  marker-text line counts, not just newly evented paths. Found by the
+  same soak, completed over two rounds.
+- **deletes suppressed by duplicate copy records resurface when their
+  target disappears**: jj-lib silently drops a delete whose source
+  poisoned copy detection; the engine now tracks such dropped sources at
+  each rebuild and re-derives them per batch, so deleting the poisoned
+  target lets the suppressed `file | 1 -` reappear exactly as jj reports
+  it. Found by the same soak.
 - **rewriting a rename target dissolves the pairing**: gix re-detects
   copies from scratch on every diff, so overwriting a paired target with
   dissimilar content makes jj report a plain add and resurfaces the
