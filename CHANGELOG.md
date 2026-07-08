@@ -94,6 +94,13 @@ daemon, both VCS backends, and the client.
   latent conflict parse-arity bug (markers are now parsed with the
   working-copy value's arity, not the parent's). No performance change:
   the path stays O(touched files).
+- **same-tree parent changes re-anchor incremental state**: merging with an
+  empty same-tree change (e.g. a freshly added workspace's working copy)
+  changed the parent set without changing any tree ID, so the
+  trees-unchanged fast-path kept stale per-parent state — miscounting
+  rename records against the old single parent. The fast-path now also
+  requires the parent commit set to be unchanged. Found by the workspace
+  actions on their first soak.
 - **exec-bit-only changes are visible to incremental diffs**: chmod +x/-x
   on a tracked file now produces jj's `file | 0` entry; the synthetic
   value layer models executability (with jj's own asymmetry: exec flips
