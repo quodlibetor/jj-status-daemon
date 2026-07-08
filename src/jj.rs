@@ -1088,11 +1088,32 @@ async fn terms_equal_after_overrides(
     true
 }
 
+/// The content gix's copy detection sees for a working-copy path: the
+/// FIRST TERM of its post-snapshot value (`read_tree_for_commit` projects
+/// conflicted trees to their first term). For resolved values this is the
+/// disk content itself; for a conflicted value — e.g. a moved conflicted
+/// file whose marker text parses back into the target's conflict shape —
+/// it is the first side's content, never the marker text.
+async fn gix_visible_content(state: &JjRepoState, rel: &str, disk: Vec<u8>) -> Option<Vec<u8>> {
+    let Ok(path) = jj_lib::repo_path::RepoPathBuf::from_relative_path(rel) else {
+        return Some(disk);
+    };
+    let commit_entry = tree_wc_value(&state.store, &state.commit_tree, &path).await;
+    // The exec bit doesn't affect which content gix compares.
+    let synthetic = synthetic_wc_value(&state.store, commit_entry, Some(&disk), false, true);
+    match synthetic.value {
+        WcValue::Absent => None,
+        WcValue::Resolved { content, .. } => Some(content),
+        WcValue::Conflict(sides) => Some(sides.first().clone()),
+    }
+}
+
 /// Count parents that would produce a gix copy/rename record for
 /// (source → target-with-this-content): the source present in that
 /// parent's gix-visible tree, the target absent there, and the source's
-/// content >= 50% similar to the target's. gix re-detects on every diff,
-/// so a recorded pairing is only as durable as the current similarity.
+/// content >= 50% similar to the target's gix-visible content. gix
+/// re-detects on every diff, so a recorded pairing is only as durable as
+/// the current similarity.
 async fn rename_record_parents(
     state: &JjRepoState,
     source_rel: &str,
@@ -1102,6 +1123,13 @@ async fn rename_record_parents(
     let Some(disk) = target_disk else {
         return 0;
     };
+    if disk.is_empty() {
+        return 0;
+    }
+    let Some(disk) = gix_visible_content(state, target_rel, disk.to_vec()).await else {
+        return 0;
+    };
+    let disk = &disk[..];
     if disk.is_empty() {
         return 0;
     }
@@ -1542,7 +1570,9 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
     // path that arrived from the *other* merge side (present in the merged
     // parent tree) is still an addition relative to the source-owning
     // parent, and the old target baseline vanishes (`{e.rs => d.txt} | 0`).
-    let mut candidates: Vec<(String, Vec<u8>)> = Vec::new();
+    // Each candidate carries the raw disk bytes (for the paired stat) and
+    // the gix-visible content used for similarity matching.
+    let mut candidates: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
     let mut sources: Vec<String> = Vec::new();
     for path in &all_paths {
         let Some(stats) = effective(path, &staged) else {
@@ -1564,11 +1594,17 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             if disk.is_empty() {
                 continue;
             }
-            candidates.push((path.clone(), disk));
+            let Some(gix_content) = gix_visible_content(state, path, disk.clone()).await else {
+                continue;
+            };
+            if gix_content.is_empty() {
+                continue;
+            }
+            candidates.push((path.clone(), disk, gix_content));
         }
     }
     sources.sort();
-    candidates.sort_by(|(a, _), (b, _)| a.cmp(b));
+    candidates.sort_by(|(a, _, _), (b, _, _)| a.cmp(b));
     if !candidates.is_empty() {
         // gix runs copy detection per parent: a record for (source, target)
         // arises from parent P when the source is present in P, the target
@@ -1621,7 +1657,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             // Best candidate by per-parent similarity, tracking how many
             // parents produce a record for it.
             let mut best: Option<(usize, f32, usize)> = None;
-            for (ci, (target_rel, disk)) in candidates.iter().enumerate() {
+            for (ci, (target_rel, _disk, gix_content)) in candidates.iter().enumerate() {
                 let Ok(target_path) =
                     jj_lib::repo_path::RepoPathBuf::from_relative_path(target_rel)
                 else {
@@ -1636,7 +1672,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                     if !target_absent {
                         continue;
                     }
-                    let similarity = content_similarity(content, disk);
+                    let similarity = content_similarity(content, gix_content);
                     if similarity >= 0.5 {
                         records += 1;
                         score = score.max(similarity);
@@ -1649,7 +1685,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             let Some((ci, _, records)) = best else {
                 continue;
             };
-            let (target_rel, target_disk) = candidates.swap_remove(ci);
+            let (target_rel, target_disk, _gix_content) = candidates.swap_remove(ci);
             if records >= 2 {
                 staged.push((source_rel, None));
                 continue;
@@ -1716,6 +1752,14 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             if target_disk.is_empty() {
                 continue;
             }
+            let Some(target_gix) =
+                gix_visible_content(state, target_rel, target_disk.clone()).await
+            else {
+                continue;
+            };
+            if target_gix.is_empty() {
+                continue;
+            }
             let mut best: Option<(&String, f32, usize)> = None;
             for source_rel in &modified_sources {
                 let Ok(source_path) =
@@ -1724,11 +1768,16 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                     continue;
                 };
                 // The copy-source content gix matches against is the
-                // modified file's NEW (working-copy) content.
+                // modified file's NEW (working-copy) content, projected to
+                // its gix-visible first term.
                 let Ok(source_new) = std::fs::read(state.repo_root.join(source_rel)) else {
                     continue;
                 };
-                let similarity = content_similarity(&source_new, &target_disk);
+                let Some(source_gix) = gix_visible_content(state, source_rel, source_new).await
+                else {
+                    continue;
+                };
+                let similarity = content_similarity(&source_gix, &target_gix);
                 if similarity < 0.5 {
                     continue;
                 }

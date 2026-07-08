@@ -137,6 +137,12 @@ daemon, both VCS backends, and the client.
 - **an ignored re-created rename source keeps the rename**: rename-premise
   invalidation now checks visibility (tracked or not ignored), matching
   what jj's snapshot can see, instead of mere on-disk existence.
+- **moving a conflicted file onto a conflicted path pairs like jj**: the
+  similarity operand for rename/copy targets is now the content gix's
+  tree projection would see post-snapshot (first conflict term for
+  conflicted values, via the synthetic value layer) rather than raw disk
+  bytes — completing the first-term projection rule for the target side.
+  Found by the same soak.
 - **moving a conflicted file is not a rename**: rename pairing now scores
   similarity per merge parent against each parent's own side content,
   exactly as gix produces copy records — a moved file whose content is
