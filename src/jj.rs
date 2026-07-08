@@ -379,6 +379,13 @@ pub struct JjRepoState {
     /// changes can still get new stored values — content-identical but
     /// shape-different: jj reports `file | 0`.
     conflicted_paths: Vec<jj_lib::repo_path::RepoPathBuf>,
+    /// Copy-record sources whose delete entry the copies stream dropped at
+    /// the last rebuild WITHOUT leaving a paired target behind (jj-lib's
+    /// duplicate-record poisoning: the target became a plain add while
+    /// `has_source` still suppressed the source's delete). gix re-runs
+    /// detection on every diff, so these deletes resurface the moment no
+    /// candidate absorbs them — re-derived every batch by the pairing pass.
+    dropped_delete_sources: Vec<String>,
     /// Per-file stats from the last full jj-lib diff (parent_tree vs commit.tree()).
     base_file_stats: HashMap<String, FileDiffStats>,
     /// Overlay: per-file stats computed from disk reads for working copy files.
@@ -1220,7 +1227,32 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
     // ui.conflict-marker-style can change between snapshots without any op
     // or watcher event, and jj's next `diff --stat` uses the current value —
     // re-resolve per batch (cheap: config reads are mtime-cached).
-    state.conflict_marker_style = conflict_marker_style_for_repo(&state.repo_root);
+    let current_style = conflict_marker_style_for_repo(&state.repo_root);
+    let style_changed = current_style != state.conflict_marker_style;
+    state.conflict_marker_style = current_style;
+
+    // Marker-text line counts depend on the style, and BASE entries bake in
+    // the style used at the last rebuild — on a style change, re-derive
+    // every entry that may involve a conflict materialization by extending
+    // this batch with all known diff/conflict paths (bounded by the current
+    // diff size, never O(repo)).
+    let extended_paths: Vec<PathBuf>;
+    let changed_paths: &[PathBuf] = if style_changed {
+        let mut rediff: HashSet<String> = state.base_file_stats.keys().cloned().collect();
+        rediff.extend(state.overlay.keys().cloned());
+        rediff.extend(
+            state
+                .conflicted_paths
+                .iter()
+                .map(|path| path.as_internal_file_string().to_string()),
+        );
+        let mut all = changed_paths.to_vec();
+        all.extend(rediff.into_iter().map(|rel| state.repo_root.join(rel)));
+        extended_paths = all;
+        &extended_paths
+    } else {
+        changed_paths
+    };
 
     // Classify paths through the ignore rules (this also lazily ingests any
     // .gitignore/.jjignore files present in the batch).
@@ -1609,9 +1641,18 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             candidates.push((path.clone(), disk, gix_content));
         }
     }
+    // Deletes dropped by the base rebuild (duplicate-record poisoning) are
+    // re-derived every batch: gix re-runs detection per diff, so they
+    // resurface as plain deletes the moment no candidate absorbs them.
+    let dropped: HashSet<&String> = state.dropped_delete_sources.iter().collect();
+    for source in &state.dropped_delete_sources {
+        if !sources.contains(source) {
+            sources.push(source.clone());
+        }
+    }
     sources.sort();
     candidates.sort_by(|(a, _, _), (b, _, _)| a.cmp(b));
-    if !candidates.is_empty() {
+    if !candidates.is_empty() || !sources.is_empty() {
         // gix runs copy detection per parent: a record for (source, target)
         // arises from parent P when the source is present in P, the target
         // is absent in P, and source@P is >= 50% similar to target@wc.
@@ -1689,6 +1730,48 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                 }
             }
             let Some((ci, _, records)) = best else {
+                if dropped.contains(&source_rel) {
+                    // No candidate absorbs this dropped delete any more —
+                    // it resurfaces as a plain entry (jj re-runs copy
+                    // detection on every diff).
+                    let (disk, disk_exec) = if source_visible_on_disk(state, &source_rel) {
+                        let abs = state.repo_root.join(&source_rel);
+                        let exec = {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt as _;
+                                std::fs::metadata(&abs)
+                                    .map(|m| m.permissions().mode() & 0o111 != 0)
+                                    .unwrap_or(false)
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                false
+                            }
+                        };
+                        (std::fs::read(&abs).ok(), exec)
+                    } else {
+                        (None, false)
+                    };
+                    let parent_entry =
+                        tree_wc_value(&state.store, &state.parent_tree, &source_path).await;
+                    let commit_entry =
+                        tree_wc_value(&state.store, &state.commit_tree, &source_path).await;
+                    let synthetic = synthetic_wc_value(
+                        &state.store,
+                        commit_entry,
+                        disk.as_deref(),
+                        disk_exec,
+                        true,
+                    );
+                    let plain = diff_wc_values(
+                        &state.store,
+                        &parent_entry,
+                        &synthetic,
+                        state.conflict_marker_style,
+                    );
+                    staged.push((source_rel, plain));
+                }
                 continue;
             };
             let (target_rel, target_disk, _gix_content) = candidates.swap_remove(ci);
@@ -2347,6 +2430,7 @@ async fn compute_jj_full_status(
 
     let parent_tree = loaded.parent_tree;
     let current_tree = loaded.commit.tree();
+    let mut dropped_delete_sources: Vec<String> = Vec::new();
     let base_file_stats = if let Some(ref parent_tree) = parent_tree {
         let copy_records = gather_copy_records(loaded.repo.store(), &loaded.commit).await;
         let per_file = compute_per_file_diff_stats(
@@ -2357,6 +2441,21 @@ async fn compute_jj_full_status(
             &copy_records,
         )
         .await;
+        // Record-source deletes the copies stream dropped without a paired
+        // target (duplicate-record poisoning) — see the field docs.
+        let mut dropped: Vec<String> = copy_records
+            .iter()
+            .map(|record| record.source.as_internal_file_string().to_string())
+            .filter(|source| {
+                !per_file
+                    .values()
+                    .any(|stats| stats.renamed_from.as_deref() == Some(source.as_str()))
+                    && !per_file.contains_key(source)
+            })
+            .collect();
+        dropped.sort();
+        dropped.dedup();
+        dropped_delete_sources = dropped;
         let c = aggregate_file_stats(&per_file);
         status.file_mad_count_working_tree = c.file_mad_count;
         status.lines_added_working_tree = c.lines_added;
@@ -2419,6 +2518,7 @@ async fn compute_jj_full_status(
         conflict_marker_style,
         ignore_filter: crate::watcher::IgnoreFilter::new(&repo_root, crate::protocol::VcsKind::Jj),
         conflicted_paths,
+        dropped_delete_sources,
         base_file_stats,
         overlay: HashMap::new(),
         repo_root,
