@@ -781,9 +781,19 @@ async fn diff_single_file(
 #[derive(Clone, PartialEq, Eq)]
 enum WcValue {
     Absent,
-    /// Resolved content bytes (plain file, symlink target as text).
-    Resolved(Vec<u8>),
-    /// Unresolved conflict: simplified per-side contents.
+    /// Resolved content bytes (plain file, symlink target as text) plus the
+    /// executable bit: jj's snapshot records the disk exec bit in the tree
+    /// value, so an exec-only flip is a value change (`jj diff --stat` shows
+    /// `file | 0`). Symlinks and other non-file values use `false`.
+    Resolved {
+        content: Vec<u8>,
+        executable: bool,
+    },
+    /// Unresolved conflict: simplified per-side contents. Exec bits are NOT
+    /// modeled here: while a file stays conflicted, jj's snapshot returns the
+    /// current tree values unchanged for exec-only disk flips
+    /// (`write_path_to_store` keeps `current_tree_values` when the parsed
+    /// file ids are unchanged), so the flip is invisible to `jj diff`.
     Conflict(jj_lib::merge::Merge<Vec<u8>>),
 }
 
@@ -812,10 +822,16 @@ impl WcEntry {
 }
 
 /// Normalize conflict sides: simplification may resolve the merge.
-fn normalize_conflict_sides(sides: jj_lib::merge::Merge<Vec<u8>>) -> WcValue {
+/// `resolved_exec` is the executable bit to use if the merge resolves
+/// (jj takes it from the disk file when a conflict resolves at snapshot,
+/// from the merged tree values when reading stored values).
+fn normalize_conflict_sides(sides: jj_lib::merge::Merge<Vec<u8>>, resolved_exec: bool) -> WcValue {
     let simplified = sides.simplify();
     match simplified.as_resolved() {
-        Some(content) => WcValue::Resolved(content.clone()),
+        Some(content) => WcValue::Resolved {
+            content: content.clone(),
+            executable: resolved_exec,
+        },
         None => WcValue::Conflict(simplified),
     }
 }
@@ -851,16 +867,24 @@ async fn raw_wc_value(
         | MaterializedTreeValue::GitSubmodule(_)
         | MaterializedTreeValue::Tree(_) => WcValue::Absent,
         MaterializedTreeValue::File(mut file) => match file.read_all(path).await {
-            Ok(content) => WcValue::Resolved(content),
+            Ok(content) => WcValue::Resolved {
+                content,
+                executable: file.executable,
+            },
             Err(_) => WcValue::Absent,
         },
-        MaterializedTreeValue::Symlink { target, .. } => WcValue::Resolved(target.into_bytes()),
+        MaterializedTreeValue::Symlink { target, .. } => WcValue::Resolved {
+            content: target.into_bytes(),
+            executable: false,
+        },
         MaterializedTreeValue::FileConflict(file) => {
-            normalize_conflict_sides(file.contents.map(|side| side.to_vec()))
+            let resolved_exec = file.executable.unwrap_or(false);
+            normalize_conflict_sides(file.contents.map(|side| side.to_vec()), resolved_exec)
         }
-        MaterializedTreeValue::OtherConflict { id, labels } => {
-            WcValue::Resolved(id.describe(&labels).into_bytes())
-        }
+        MaterializedTreeValue::OtherConflict { id, labels } => WcValue::Resolved {
+            content: id.describe(&labels).into_bytes(),
+            executable: false,
+        },
     };
     WcEntry {
         raw: Some(raw),
@@ -881,6 +905,7 @@ fn synthetic_wc_value(
     store: &Arc<jj_lib::store::Store>,
     commit_entry: WcEntry,
     disk_content: Option<&[u8]>,
+    disk_exec: bool,
     visible_if_untracked: bool,
 ) -> WcEntry {
     use jj_lib::conflicts::{choose_materialized_conflict_marker_len, parse_conflict};
@@ -889,18 +914,25 @@ fn synthetic_wc_value(
     let Some(disk) = disk_content else {
         return WcEntry::derived(WcValue::Absent);
     };
+    let resolved_from_disk = || {
+        WcEntry::derived(WcValue::Resolved {
+            content: disk.to_vec(),
+            executable: disk_exec,
+        })
+    };
     match &commit_entry.value {
         // Untracked: the snapshot starts tracking the file unless it is
         // ignored — an ignored untracked file is invisible to jj.
         WcValue::Absent => {
             if visible_if_untracked {
-                WcEntry::derived(WcValue::Resolved(disk.to_vec()))
+                resolved_from_disk()
             } else {
                 commit_entry
             }
         }
-        // Tracked resolved file: the snapshot stores the disk content.
-        WcValue::Resolved(_) => WcEntry::derived(WcValue::Resolved(disk.to_vec())),
+        // Tracked resolved file: the snapshot stores the disk content and
+        // the disk exec bit (`ExecBit::new_from_disk` → `for_tree_value`).
+        WcValue::Resolved { .. } => resolved_from_disk(),
         // Tracked conflict: parse markers back, `update_from_content`-style.
         WcValue::Conflict(sides) => {
             let old_hunks = jj_lib::files::merge_hunks(sides, store.merge_options());
@@ -917,8 +949,9 @@ fn synthetic_wc_value(
                 return commit_entry;
             }
             match new_hunks {
-                // No parseable markers: resolved to the raw bytes.
-                None => WcEntry::derived(WcValue::Resolved(disk.to_vec())),
+                // No parseable markers: resolved to the raw bytes (a conflict
+                // resolving at snapshot takes the exec bit from disk).
+                None => resolved_from_disk(),
                 Some(hunks) => {
                     let mut new_sides: jj_lib::merge::Merge<Vec<u8>> = sides.map(|_| Vec::new());
                     for hunk in hunks {
@@ -932,7 +965,7 @@ fn synthetic_wc_value(
                             }
                         }
                     }
-                    WcEntry::derived(normalize_conflict_sides(new_sides))
+                    WcEntry::derived(normalize_conflict_sides(new_sides, disk_exec))
                 }
             }
         }
@@ -953,7 +986,7 @@ fn wc_value_text(
 
     match value {
         WcValue::Absent => None,
-        WcValue::Resolved(content) => Some(content.clone()),
+        WcValue::Resolved { content, .. } => Some(content.clone()),
         WcValue::Conflict(sides) => {
             let options = ConflictMaterializeOptions {
                 marker_style,
@@ -1188,8 +1221,22 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
         let Some(rel_str) = abs_to_repo_relative(&state.repo_root, abs_path) else {
             continue;
         };
-        // Read file from disk (None if deleted/missing)
+        // Read file from disk (None if deleted/missing), plus the exec bit
+        // jj's snapshot would record (`mode & 0o111`, like ExecBit::new_from_disk).
         let disk_content = std::fs::read(abs_path).ok();
+        let disk_exec = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::metadata(abs_path)
+                    .map(|m| m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
 
         // If the base recorded this path as a rename target, diff the disk
         // content against the *source's* parent content, as jj's copy-aware
@@ -1237,7 +1284,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             // snapshot (absent, or ignored and untracked).
             let parent_value = tree_wc_value(&state.store, &state.parent_tree, &src_path).await;
             let commit_entry = tree_wc_value(&state.store, &state.commit_tree, &src_path).await;
-            let synthetic = synthetic_wc_value(&state.store, commit_entry, None, false);
+            let synthetic = synthetic_wc_value(&state.store, commit_entry, None, false, false);
             let plain = diff_wc_values(
                 &state.store,
                 &parent_value,
@@ -1261,11 +1308,12 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                     value: commit_entry.value.clone(),
                 },
                 disk_content.as_deref(),
+                disk_exec,
                 visible_if_untracked,
             );
             if !synthetic.same_value_as(&commit_entry) {
                 snapshot_writes = true;
-                if matches!(synthetic.value, WcValue::Resolved(_) | WcValue::Absent) {
+                if matches!(synthetic.value, WcValue::Resolved { .. } | WcValue::Absent) {
                     resolved_override_paths.insert(rel_str.clone());
                 }
             }
@@ -1321,6 +1369,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                 &state.store,
                 commit_entry,
                 disk_content.as_deref(),
+                disk_exec,
                 visible_if_untracked,
             );
             diff_wc_values(

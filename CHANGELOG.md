@@ -94,6 +94,11 @@ daemon, both VCS backends, and the client.
   latent conflict parse-arity bug (markers are now parsed with the
   working-copy value's arity, not the parent's). No performance change:
   the path stays O(touched files).
+- **exec-bit-only changes are visible to incremental diffs**: chmod +x/-x
+  on a tracked file now produces jj's `file | 0` entry; the synthetic
+  value layer models executability (with jj's own asymmetry: exec flips
+  on still-conflicted files are ignored, matching the snapshot). Found by
+  extending the property harness with an exec-bit action.
 - **snapshot-induced conflict reshaping is modeled**: a jj snapshot that
   writes can cancel equal root-tree term pairs (jj-lib
   MergedTreeBuilder::write_tree + simplify_with), changing the stored
@@ -202,8 +207,15 @@ daemon, both VCS backends, and the client.
   to scale the campaign. The action set covers file writes/appends/edits/
   deletes/renames, directory moves, `jj new/commit/describe/abandon/squash/
   undo/edit/restore/split/rebase`, merge creation, conflicts, marker-style
-  config changes, `.gitignore` mutations, and git-remote interaction
-  (commits to a side repo, `jj git fetch`, `jj new main@origin`).
+  config changes, `.gitignore` mutations, git-remote interaction
+  (commits to a side repo, `jj git fetch`, `jj new main@origin`),
+  exec-bit flips, and multi-workspace operations (second-workspace ops,
+  cross-workspace ancestor rewrites that stale a workspace,
+  `jj workspace update-stale`, forget) with a staleness model: no oracle
+  is asserted while the watched workspace is stale — jj itself refuses —
+  and parity is required to hold again once `update-stale` resolves.
+  Two dozen shrunk failure sequences from soak campaigns are pinned as
+  deterministic replay regressions in `diff_props::regressions`.
 
 # v0.0.13
 
