@@ -134,6 +134,12 @@ daemon, both VCS backends, and the client.
   dissimilar content makes jj report a plain add and resurfaces the
   source's suppressed delete; recorded pairings are now re-validated with
   the same per-parent record predicate. Found by the same soak.
+- **restoring a rename source keeps the pairing as a copy**: gix sustains
+  a pairing via a copy record when the re-created source is unmodified vs
+  the merged parent but a modification vs an individual parent; rename
+  and copy records are now modeled uniformly per parent, so source
+  re-creation no longer voids a pairing that jj keeps (previously the
+  target re-diffed as a plain add). Found by the same soak.
 - **copy targets match on current content**: gix matches a copy target
   against a modified source's post-image, not its parent content — a
   rename source re-created with different content no longer re-pairs.

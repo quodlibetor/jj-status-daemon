@@ -1121,13 +1121,19 @@ async fn gix_visible_content(state: &JjRepoState, rel: &str, disk: Vec<u8>) -> O
     }
 }
 
-/// Count parents that would produce a gix copy/rename record for
-/// (source → target-with-this-content): the source present in that
-/// parent's gix-visible tree, the target absent there, and the source's
-/// content >= 50% similar to the target's gix-visible content. gix
-/// re-detects on every diff, so a recorded pairing is only as durable as
-/// the current similarity.
-async fn rename_record_parents(
+/// Count parents that would produce a gix record for (source →
+/// target-with-this-content). gix re-detects on every diff, so a recorded
+/// pairing is only as durable as the current record count:
+/// - source invisible to jj → RENAME records: source present in the
+///   parent's gix-visible tree, target absent there, source@parent content
+///   >= 50% similar to the target's gix-visible content;
+/// - source visibly present → COPY records (`CopySource::
+///   FromSetOfModifiedFiles`): source present in the parent, target absent
+///   there, the source a Modification vs that parent (its gix-visible HEAD
+///   content differs from source@parent), and the HEAD content >= 50%
+///   similar to the target — e.g. a restored move source keeps its pairing
+///   as `{dir => dir2}/c.txt | 0`.
+async fn pairing_record_parents(
     state: &JjRepoState,
     source_rel: &str,
     target_rel: &str,
@@ -1151,6 +1157,18 @@ async fn rename_record_parents(
     };
     let Ok(target_path) = jj_lib::repo_path::RepoPathBuf::from_relative_path(target_rel) else {
         return 0;
+    };
+    // A visible source can only pair as a copy, matched by its HEAD content.
+    let source_head: Option<Vec<u8>> = if source_visible_on_disk(state, source_rel) {
+        let Ok(head_disk) = std::fs::read(state.repo_root.join(source_rel)) else {
+            return 0;
+        };
+        match gix_visible_content(state, source_rel, head_disk).await {
+            Some(content) if !content.is_empty() => Some(content),
+            _ => return 0,
+        }
+    } else {
+        None
     };
     let parent_trees: Vec<&jj_lib::merged_tree::MergedTree> = if state.parent_trees.is_empty() {
         vec![&state.parent_tree]
@@ -1182,6 +1200,13 @@ async fn rename_record_parents(
         else {
             continue;
         };
+        if let Some(head) = &source_head {
+            // Copy record: source must be a Modification vs this parent.
+            if content != *head && content_similarity(head, disk) >= 0.5 {
+                records += 1;
+            }
+            continue;
+        }
         if content.is_empty() {
             continue;
         }
@@ -1304,36 +1329,34 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             }
         };
 
-        // If the base recorded this path as a rename target, diff the disk
-        // content against the *source's* parent content, as jj's copy-aware
-        // diff does — otherwise the target looks like a fresh Add. The
-        // premise must be re-validated against the CURRENT state: gix
-        // re-detects on every diff, so the pairing holds only while
-        // - the source stays invisible to jj (a visibly re-created source
-        //   turns the target back into a plain file; an ignored untracked
-        //   re-creation does not), and
-        // - exactly one parent still produces a record for the target's
-        //   new content. Zero records (target rewritten dissimilarly) void
-        //   the pairing AND resurface the source's suppressed delete;
-        //   two or more hit jj-lib's duplicate-record poisoning (plain-add
-        //   target, delete stays dropped).
+        // If the base recorded this path as a rename/copy target, diff the
+        // disk content against the *source's* parent content, as jj's
+        // copy-aware diff does — otherwise the target looks like a fresh
+        // Add. The premise must be re-validated against the CURRENT state:
+        // gix re-detects on every diff (rename records for invisible
+        // sources, copy records for visibly-modified ones). Exactly one
+        // record → the pairing holds; zero → void (resurfacing the
+        // suppressed delete if the source is gone); two or more → jj-lib's
+        // duplicate-record poisoning (plain-add target, delete dropped).
         let base_renamed_from = state
             .base_file_stats
             .get(&rel_str)
             .and_then(|s| s.renamed_from.clone());
         let mut resurrect_source: Option<String> = None;
         let renamed_from = match base_renamed_from {
-            Some(src) if !source_visible_on_disk(state, &src) => {
-                match rename_record_parents(state, &src, &rel_str, disk_content.as_deref()).await {
+            Some(src) => {
+                match pairing_record_parents(state, &src, &rel_str, disk_content.as_deref()).await {
                     1 => Some(src),
                     0 => {
-                        resurrect_source = Some(src);
+                        if !source_visible_on_disk(state, &src) {
+                            resurrect_source = Some(src);
+                        }
                         None
                     }
                     _ => None,
                 }
             }
-            _ => None,
+            None => None,
         };
         let had_renamed_from = renamed_from.is_some();
         let parent_lookup = renamed_from.as_deref().unwrap_or(&rel_str);
@@ -1482,6 +1505,18 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                         continue;
                     };
                     let target_disk = std::fs::read(state.repo_root.join(&target_rel)).ok();
+                    // The pairing may survive the source's visible
+                    // re-creation as a COPY record (e.g. `jj restore` of a
+                    // moved source: unmodified vs the merged parent, but a
+                    // Modification vs an individual parent whose head
+                    // content matches the target). Only a record count
+                    // other than one voids the target.
+                    if pairing_record_parents(state, &rel_str, &target_rel, target_disk.as_deref())
+                        .await
+                        == 1
+                    {
+                        continue;
+                    }
                     let plain = diff_single_file(
                         &state.store,
                         &state.parent_tree,
