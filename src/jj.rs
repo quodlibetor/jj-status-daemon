@@ -661,7 +661,22 @@ async fn gather_copy_records(
             continue;
         };
         let collected: Vec<_> = stream.collect().await;
-        if let Err(e) = records.add_records(collected) {
+        // `add_records` takes infallible items, so unwrap the stream here.
+        // Mirror jj's own semantics on a mid-stream backend error: keep the
+        // records that preceded it and drop the rest of this parent's stream.
+        let mut failure = None;
+        let mut good = Vec::with_capacity(collected.len());
+        for record in collected {
+            match record {
+                Ok(record) => good.push(record),
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        records.add_records(good);
+        if let Some(e) = failure {
             tracing::debug!(error = %e, "failed to add copy records");
         }
     }
@@ -732,7 +747,7 @@ async fn diff_single_file(
         materialize_merge_result_to_bytes, materialize_tree_value, parse_conflict,
     };
 
-    let parent_value = parent_tree.path_value(repo_path).ok()?;
+    let parent_value = parent_tree.path_value(repo_path).await.ok()?;
     let materialized = materialize_tree_value(store, repo_path, parent_value, parent_tree.labels())
         .await
         .ok()?;
@@ -855,7 +870,7 @@ async fn tree_wc_value(
     tree: &jj_lib::merged_tree::MergedTree,
     path: &jj_lib::repo_path::RepoPath,
 ) -> WcEntry {
-    let Ok(raw) = tree.path_value(path) else {
+    let Ok(raw) = tree.path_value(path).await else {
         return WcEntry::derived(WcValue::Absent);
     };
     raw_wc_value(store, path, raw).await
@@ -1159,7 +1174,7 @@ async fn pairing_record_parents(
         return 0;
     };
     // A visible source can only pair as a copy, matched by its HEAD content.
-    let source_head: Option<Vec<u8>> = if source_visible_on_disk(state, source_rel) {
+    let source_head: Option<Vec<u8>> = if source_visible_on_disk(state, source_rel).await {
         let Ok(head_disk) = std::fs::read(state.repo_root.join(source_rel)) else {
             return 0;
         };
@@ -1177,7 +1192,7 @@ async fn pairing_record_parents(
     };
     let mut records = 0;
     for tree in parent_trees {
-        let Ok(value) = tree.path_value(&source_path) else {
+        let Ok(value) = tree.path_value(&source_path).await else {
             continue;
         };
         if value.is_absent() {
@@ -1185,6 +1200,7 @@ async fn pairing_record_parents(
         }
         let target_absent = tree
             .path_value(&target_path)
+            .await
             .is_ok_and(|value| value.is_absent());
         if !target_absent {
             continue;
@@ -1222,15 +1238,19 @@ async fn pairing_record_parents(
 /// invisible to the snapshot, so its presence on disk does not void a
 /// rename premise — jj keeps pairing `{dir => dir2}/f` while the re-created
 /// source is ignored.
-fn source_visible_on_disk(state: &JjRepoState, source_rel: &str) -> bool {
+async fn source_visible_on_disk(state: &JjRepoState, source_rel: &str) -> bool {
     let abs = state.repo_root.join(source_rel);
     if !abs.exists() {
         return false;
     }
-    let tracked = jj_lib::repo_path::RepoPathBuf::from_relative_path(source_rel)
-        .ok()
-        .and_then(|path| state.commit_tree.path_value(&path).ok())
-        .is_some_and(|value| !value.is_absent());
+    let tracked = match jj_lib::repo_path::RepoPathBuf::from_relative_path(source_rel) {
+        Ok(path) => state
+            .commit_tree
+            .path_value(&path)
+            .await
+            .is_ok_and(|value| !value.is_absent()),
+        Err(_) => false,
+    };
     if tracked {
         return true;
     }
@@ -1348,7 +1368,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                 match pairing_record_parents(state, &src, &rel_str, disk_content.as_deref()).await {
                     1 => Some(src),
                     0 => {
-                        if !source_visible_on_disk(state, &src) {
+                        if !source_visible_on_disk(state, &src).await {
                             resurrect_source = Some(src);
                         }
                         None
@@ -1495,7 +1515,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             )
             .collect();
         if !rename_targets.is_empty() {
-            if !source_visible_on_disk(state, &rel_str) {
+            if !source_visible_on_disk(state, &rel_str).await {
                 diff_result = None;
             } else {
                 for target_rel in rename_targets {
@@ -1580,7 +1600,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                 if derived_this_batch.contains(&rel) {
                     continue;
                 }
-                let Ok(stored) = state.commit_tree.path_value(path) else {
+                let Ok(stored) = state.commit_tree.path_value(path).await else {
                     continue;
                 };
                 let values: Vec<_> = stored.iter().cloned().collect();
@@ -1710,7 +1730,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
             // Materialize the source's content in each parent that has it.
             let mut parent_contents: Vec<(usize, Vec<u8>)> = Vec::new();
             for (pi, tree) in parent_trees.iter().enumerate() {
-                let Ok(value) = tree.path_value(&source_path) else {
+                let Ok(value) = tree.path_value(&source_path).await else {
                     continue;
                 };
                 if value.is_absent() {
@@ -1750,6 +1770,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                 for (pi, content) in &parent_contents {
                     let target_absent = parent_trees[*pi]
                         .path_value(&target_path)
+                        .await
                         .is_ok_and(|value| value.is_absent());
                     if !target_absent {
                         continue;
@@ -1769,7 +1790,7 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                     // No candidate absorbs this dropped delete any more —
                     // it resurfaces as a plain entry (jj re-runs copy
                     // detection on every diff).
-                    let (disk, disk_exec) = if source_visible_on_disk(state, &source_rel) {
+                    let (disk, disk_exec) = if source_visible_on_disk(state, &source_rel).await {
                         let abs = state.repo_root.join(&source_rel);
                         let exec = {
                             #[cfg(unix)]
@@ -1905,18 +1926,20 @@ async fn apply_incremental_paths(state: &mut JjRepoState, changed_paths: &[PathB
                 if similarity < 0.5 {
                     continue;
                 }
-                let records = parent_trees
-                    .iter()
-                    .filter(|tree| {
-                        let source_present = tree
-                            .path_value(&source_path)
-                            .is_ok_and(|value| !value.is_absent());
-                        let target_absent = tree
-                            .path_value(&target_path)
-                            .is_ok_and(|value| value.is_absent());
-                        source_present && target_absent
-                    })
-                    .count();
+                let mut records = 0usize;
+                for tree in parent_trees.iter() {
+                    let source_present = tree
+                        .path_value(&source_path)
+                        .await
+                        .is_ok_and(|value| !value.is_absent());
+                    let target_absent = tree
+                        .path_value(&target_path)
+                        .await
+                        .is_ok_and(|value| value.is_absent());
+                    if source_present && target_absent {
+                        records += 1;
+                    }
+                }
                 if records > 0 && best.is_none_or(|(_, s, _)| similarity > s) {
                     best = Some((source_rel, similarity, records));
                 }
@@ -2022,7 +2045,7 @@ fn load_user_revset_aliases(aliases_map: &mut RevsetAliasesMap) {
         };
         for (key, value) in aliases {
             if let Some(defn) = value.as_str() {
-                let _ = aliases_map.insert(key, defn);
+                let _ = aliases_map.insert(key, defn, None);
             }
         }
     }
@@ -2040,12 +2063,13 @@ fn with_evaluated_revset<R>(
 ) -> Option<R> {
     // Build aliases map with defaults from jj-cli
     let mut aliases_map = RevsetAliasesMap::new();
-    let _ = aliases_map.insert("trunk()", DEFAULT_TRUNK_ALIAS);
+    let _ = aliases_map.insert("trunk()", DEFAULT_TRUNK_ALIAS, None);
     let _ = aliases_map.insert(
         "builtin_immutable_heads()",
         DEFAULT_BUILTIN_IMMUTABLE_HEADS_ALIAS,
+        None,
     );
-    let _ = aliases_map.insert("immutable_heads()", DEFAULT_IMMUTABLE_HEADS_ALIAS);
+    let _ = aliases_map.insert("immutable_heads()", DEFAULT_IMMUTABLE_HEADS_ALIAS, None);
 
     // Load user overrides (e.g. custom trunk() or immutable_heads())
     load_user_revset_aliases(&mut aliases_map);
@@ -2068,7 +2092,6 @@ fn with_evaluated_revset<R>(
         date_pattern_context: DatePatternContext::from(chrono::Local::now()),
         default_ignored_remote: Some(RemoteName::new("git")),
         fileset_aliases_map: &fileset_aliases,
-        use_glob_by_default: false,
         extensions: &extensions,
         workspace: Some(ws_context),
     };
