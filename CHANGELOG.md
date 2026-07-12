@@ -1,4 +1,4 @@
-# Unreleased
+# v0.0.14
 
 jj incremental diff engine overhaul: exact `jj diff --stat` parity and
 self-healing after watcher event loss. Plus a performance sweep across the
