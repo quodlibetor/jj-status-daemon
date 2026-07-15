@@ -1,5 +1,7 @@
 # Unreleased
 
+# v0.0.15
+
 - **nested-workspace files no longer leak into a repo's diff stats after
   watcher event loss**: the watcher's lazy ignore-file discovery kept a
   permanent "already probed, no ignore file here" cache per directory. If a
@@ -10,6 +12,8 @@
   nested jj workspaces) were counted as additions against the parent repo's
   tree, showing bogus stats like `+4 files/+931 lines` on an empty commit. An
   overflow now resets that discovery cache so the ignore file is re-probed.
+- fix Cargo.lock changes resulting in official binaries looking like they're
+  from a dirty build.
 
 # v0.0.14
 
