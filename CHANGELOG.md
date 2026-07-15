@@ -1,3 +1,16 @@
+# Unreleased
+
+- **nested-workspace files no longer leak into a repo's diff stats after
+  watcher event loss**: the watcher's lazy ignore-file discovery kept a
+  permanent "already probed, no ignore file here" cache per directory. If a
+  nested `.gitignore`/`.jjignore` was created *after* its directory was first
+  probed and its creation event was dropped by an OS event-queue overflow
+  (`need_rescan`), the matcher stayed blind to it forever — so files under a
+  freshly-guarded directory (e.g. a `.workspaces/.gitignore` of `*` shielding
+  nested jj workspaces) were counted as additions against the parent repo's
+  tree, showing bogus stats like `+4 files/+931 lines` on an empty commit. An
+  overflow now resets that discovery cache so the ignore file is re-probed.
+
 # v0.0.14
 
 jj incremental diff engine overhaul: exact `jj diff --stat` parity and

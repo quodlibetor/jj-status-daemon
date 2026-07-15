@@ -226,6 +226,30 @@ impl IgnoreFilter {
         }
     }
 
+    /// Drop the negative discovery cache and re-validate loaded ignore files.
+    ///
+    /// `discover_ignore_files` records every ancestor directory it probes in
+    /// `checked_dirs` and never re-probes it — so a nested `.gitignore`/`.jjignore`
+    /// created *after* its directory was first probed is only picked up if an
+    /// event names that ignore file directly. When the OS event queue overflows
+    /// (`need_rescan`), that creation event can be among the lost ones, leaving
+    /// the matcher permanently blind to the new ignore file (e.g. a
+    /// `.workspaces/.gitignore` of `*` guarding nested workspaces, whose files
+    /// would then leak into the parent repo's incremental diff). Overflow means
+    /// "trust nothing": clear `checked_dirs` so ancestors are re-probed, and drop
+    /// any loaded ignore file that no longer exists on disk, then rebuild.
+    pub fn reset_discovery(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.checked_dirs.clear();
+        inner.checked_dirs.insert(PathBuf::new()); // root stays checked
+        inner.loaded_files.retain(|f| f.exists());
+        inner.matcher = Self::build_matcher(
+            &inner.canonical_root,
+            &inner.loaded_files,
+            inner.global_ignore.as_deref(),
+        );
+    }
+
     /// Build a `Gitignore` matcher from all loaded files plus the global ignore.
     fn build_matcher(
         canonical_root: &Path,
@@ -389,6 +413,9 @@ pub fn watch_repo(
             // untrustworthy. Signal a rescan BEFORE the kind filter — these
             // events have kind Other and would be dropped by it.
             if event.need_rescan() {
+                // Lost events may include a nested ignore-file creation, which
+                // would otherwise leave the matcher permanently blind to it.
+                filter.reset_discovery();
                 let _ = tx.send(WatchEvent::Change {
                     repo_path: repo_path_owned.clone(),
                     vcs_kind,
@@ -467,6 +494,80 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     use crate::test_util::create_jj_repo_async as create_jj_repo;
+
+    #[test]
+    fn cold_nested_gitignore_star_ignores_descendants() {
+        use std::fs;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // Mimic travel-planner: .workspaces/.gitignore = "*" ignores everything
+        // under .workspaces/ (nested jj workspaces live there).
+        fs::create_dir_all(root.join(".jj")).unwrap();
+        fs::create_dir_all(root.join(".workspaces/onb-flake/demos")).unwrap();
+        fs::write(root.join(".workspaces/.gitignore"), "*\n").unwrap();
+        let foo = root.join(".workspaces/onb-flake/demos/foo.txt");
+        fs::write(&foo, "hi").unwrap();
+
+        let filter = IgnoreFilter::new(&root, VcsKind::Jj);
+        let vcs_dir = root.join(".jj");
+
+        // A deep event under .workspaces/ is ignored: lazy discovery finds
+        // .workspaces/.gitignore on the ancestor walk.
+        let verdict = filter.process_event(&vcs_dir, None, std::slice::from_ref(&foo));
+        assert!(
+            verdict.all_ignored,
+            "file under .workspaces/ (star-ignored) must be ignored"
+        );
+    }
+
+    // Regression: a nested `.gitignore` whose creation event is lost to an OS
+    // event-queue overflow must not permanently leak descendants into the
+    // parent repo's diff. This is the travel-planner "+4 files/+931 lines on an
+    // empty commit" bug — nested-workspace files under a `.workspaces/.gitignore`
+    // of `*` slipped past the poisoned negative discovery cache. `reset_discovery`
+    // (called on `need_rescan`) must re-probe and pick up the ignore file.
+    #[test]
+    fn overflow_reset_rediscovers_nested_gitignore() {
+        use std::fs;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(".jj")).unwrap();
+        fs::create_dir_all(root.join(".workspaces/onb-flake/demos")).unwrap();
+        // NOTE: .workspaces/.gitignore does NOT exist yet.
+        let foo = root.join(".workspaces/onb-flake/demos/foo.txt");
+        fs::write(&foo, "hi").unwrap();
+
+        let filter = IgnoreFilter::new(&root, VcsKind::Jj);
+        let vcs_dir = root.join(".jj");
+
+        // Event 1: deep path arrives before the ignore file exists. This probes
+        // and permanently marks .workspaces / onb-flake / demos as "checked".
+        let v1 = filter.process_event(&vcs_dir, None, std::slice::from_ref(&foo));
+        assert!(!v1.all_ignored, "before .gitignore exists, not ignored");
+
+        // Workspace tooling writes .workspaces/.gitignore = "*", but its creation
+        // event is dropped by an OS queue overflow — never named in an event.
+        fs::write(root.join(".workspaces/.gitignore"), "*\n").unwrap();
+
+        // Without a reset the negative cache stays poisoned: a fresh deep path is
+        // still (wrongly) reported as not-ignored.
+        let bar = root.join(".workspaces/onb-flake/demos/bar.txt");
+        fs::write(&bar, "hi").unwrap();
+        let poisoned = filter.process_event(&vcs_dir, None, std::slice::from_ref(&bar));
+        assert!(
+            !poisoned.all_ignored,
+            "sanity: poisoned cache still leaks the file until reset"
+        );
+
+        // The overflow signals a rescan, which resets discovery.
+        filter.reset_discovery();
+
+        let healed = filter.process_event(&vcs_dir, None, std::slice::from_ref(&bar));
+        assert!(
+            healed.all_ignored,
+            "after overflow reset, deep paths under .workspaces/ must be ignored"
+        );
+    }
 
     #[tokio::test]
     async fn test_watcher_detects_jj_op() {
